@@ -1,0 +1,65 @@
+# Swift
+.build/
+.swiftpm/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+.DS_Store
+
+# Kotlin/Maven/Android
+target/
+.gradle/
+.idea/
+*.iml
+*.jar
+*.aar
+build/
+local.properties
+*.apk
+*.aab
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment/Credentials
+.env
+.env.local
+.env.*.local
+secrets/
+credentials/
+
+# Build artifacts
+dist/
+out/
+bin/
+
+# Test reports
+test-results/
+coverage/
+*.lcov
+
+*.tsbuildinfo
+*.log
+playwright-report/
+
+# Temporary files
+tmp_*
+*.tmp
+.tmp/
+
+# Preview folder (separate agent)
+preview/node_modules/
+preview/.next/
+preview/dist/
+preview/build/
+
+# Do NOT commit:
+# - Generated builds (APK, AAB, IPA, etc.)
+# - Local SDK paths or credentials
+# - Third-party provider secrets or API keys
+# - Package.json or Docker files (root-level)

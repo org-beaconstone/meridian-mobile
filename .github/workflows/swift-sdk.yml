@@ -1,0 +1,13 @@
+name: Swift SDK and desktop build
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  swift:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build
+        working-directory: ios
+      - run: swift run MeridianSDKChecks
+        working-directory: ios

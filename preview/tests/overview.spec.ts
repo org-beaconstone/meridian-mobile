@@ -1,0 +1,21 @@
+import { test, expect } from '@playwright/test';
+test('connected mobile renders actual ledger and validates payments', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.goto('/');
+  await expect(page.getByTestId('mobile-balance')).toBeVisible();
+  await expect(page.getByText('Connected API', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Pay', exact: true }).click();
+  await page.getByLabel('Amount (GBP)').fill('1.999');
+  await page.getByRole('button', { name: 'Review payment' }).click();
+  await expect(page.getByRole('alert')).toContainText('two decimals');
+  await page.getByRole('button', { name: 'History', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByLabel('Shared room')).toHaveValue('meridian-rehearsal');
+  await page.getByRole('button', { name: 'Apply room' }).click();
+  await page.getByRole('button', { name: 'Home', exact: true }).click();
+  await expect(page.getByTestId('mobile-balance')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(errors).toEqual([]);
+});

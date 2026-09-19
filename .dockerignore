@@ -1,0 +1,45 @@
+# Build artifacts
+dist/
+node_modules/
+.npm
+.cache
+
+# Native builds (not used in Docker)
+ios/.build/
+android/target/
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Development
+.next
+.nuxt
+.cache/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Documentation
+docs/

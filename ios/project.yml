@@ -1,0 +1,22 @@
+name: MeridianMobile
+options:
+  bundleIdPrefix: com.beaconstone
+  deploymentTarget:
+    iOS: '16.0'
+packages:
+  MeridianSDK:
+    path: .
+targets:
+  MeridianMobile:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      base:
+        SWIFT_VERSION: '5.0'
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Meridian
+        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+    dependencies:
+      - package: MeridianSDK
+        product: MeridianSDK
