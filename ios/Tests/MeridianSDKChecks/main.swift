@@ -341,10 +341,118 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: FeatureFlags default is off
+    print("21. FeatureFlags.authSessionBannerEnabled default is false...")
+    if !FeatureFlags.authSessionBannerEnabled {
+      print("  ✓ FeatureFlags.authSessionBannerEnabled defaults to false")
+      passed += 1
+    } else {
+      print("  ✗ Feature flag should default to false (off by default for production)")
+      failed += 1
+    }
+
+    // CHECK 22: FeatureFlags can be enabled
+    print("22. FeatureFlags.authSessionBannerEnabled can be toggled on...")
+    FeatureFlags.authSessionBannerEnabled = true
+    if FeatureFlags.authSessionBannerEnabled {
+      print("  ✓ FeatureFlags.authSessionBannerEnabled toggled to true")
+      passed += 1
+    } else {
+      print("  ✗ Feature flag toggle failed")
+      failed += 1
+    }
+    FeatureFlags.authSessionBannerEnabled = false // restore default
+
+    // CHECK 23: SessionState.signedOut bannerCopy
+    print("23. SessionState.signedOut bannerCopy...")
+    if SessionState.signedOut.bannerCopy == "You're signed out" {
+      print("  ✓ signedOut bannerCopy correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected signedOut bannerCopy: \(SessionState.signedOut.bannerCopy)")
+      failed += 1
+    }
+
+    // CHECK 24: SessionState.expiring bannerCopy
+    print("24. SessionState.expiring bannerCopy...")
+    if SessionState.expiring.bannerCopy == "Your session is expiring soon" {
+      print("  ✓ expiring bannerCopy correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected expiring bannerCopy: \(SessionState.expiring.bannerCopy)")
+      failed += 1
+    }
+
+    // CHECK 25: SessionState.active bannerCopy
+    print("25. SessionState.active bannerCopy...")
+    if SessionState.active.bannerCopy == "You're signed in" {
+      print("  ✓ active bannerCopy correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected active bannerCopy: \(SessionState.active.bannerCopy)")
+      failed += 1
+    }
+
+    // CHECK 26: SessionState.reAuthenticating bannerCopy contains "Re-authenticating"
+    print("26. SessionState.reAuthenticating bannerCopy...")
+    if SessionState.reAuthenticating.bannerCopy.hasPrefix("Re-authenticating") {
+      print("  ✓ reAuthenticating bannerCopy correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected reAuthenticating bannerCopy: \(SessionState.reAuthenticating.bannerCopy)")
+      failed += 1
+    }
+
+    // CHECK 27: SessionState accessibilityLabel for each state
+    print("27. SessionState accessibilityLabels...")
+    let labelChecks: [(SessionState, String)] = [
+      (.active, "Session active"),
+      (.expiring, "Session expiring soon"),
+      (.signedOut, "Signed out"),
+      (.reAuthenticating, "Re-authenticating"),
+    ]
+    var allLabelsOk = true
+    for (s, expected) in labelChecks {
+      if s.accessibilityLabel != expected {
+        print("  ✗ \(s) accessibilityLabel: expected '\(expected)', got '\(s.accessibilityLabel)'")
+        allLabelsOk = false
+      }
+    }
+    if allLabelsOk {
+      print("  ✓ All SessionState accessibilityLabels correct")
+      passed += 1
+    } else {
+      failed += 1
+    }
+
+    // CHECK 28: SessionState equality
+    print("28. SessionState equality (Equatable)...")
+    if SessionState.active == SessionState.active
+       && SessionState.signedOut != SessionState.active
+       && SessionState.expiring != SessionState.reAuthenticating {
+      print("  ✓ SessionState Equatable conformance correct")
+      passed += 1
+    } else {
+      print("  ✗ SessionState Equatable conformance incorrect")
+      failed += 1
+    }
+
+    // CHECK 29: SessionState symbolName non-empty for all cases
+    print("29. SessionState symbolName non-empty...")
+    let allSymbolsOk = SessionState.allCases.allSatisfy { !$0.symbolName.isEmpty }
+    if allSymbolsOk {
+      print("  ✓ All SessionState symbolNames are non-empty")
+      passed += 1
+    } else {
+      print("  ✗ One or more SessionState symbolNames are empty")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
