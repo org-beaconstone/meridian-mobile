@@ -1,19 +1,36 @@
 import Foundation
 
+// MARK: - URLSession abstraction (enables injection in tests)
+
+public protocol URLSessionProtocol {
+  func data(for request: URLRequest) async throws -> (Data, URLResponse)
+}
+
+extension URLSession: URLSessionProtocol {}
+
+// MARK: - Client
+
 public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
-  private let session: URLSession
+  private let session: URLSessionProtocol
+
+  /// Client-side metrics for catalog fetch operations.
+  public private(set) var metrics = CatalogMetrics()
+
+  /// The most recently successfully fetched catalog.
+  /// Retained across fetch failures so callers can present stale data with an inline error.
+  public private(set) var lastKnownCatalog: CatalogResponse?
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
-  ///   - urlSession: Optional URLSession for testing
+  ///   - urlSession: Optional URLSession (or URLSessionProtocol) for testing
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSessionProtocol = URLSession.shared
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -95,9 +112,31 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
-  /// GET /catalog - Fetch recipients and providers
+  /// GET /catalog - Fetch recipients and providers.
+  ///
+  /// On success the response is cached in `lastKnownCatalog` and metrics are updated.
+  /// On failure, `lastKnownCatalog` is preserved so callers can present stale data
+  /// alongside an inline error and a retry affordance.
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    do {
+      let catalog: CatalogResponse = try await request(method: "GET", path: "/catalog")
+
+      // Emit metrics and update the cache on success.
+      metrics.recordFetchSuccess(sessionId: sessionId)
+
+      // Detect and log any provider identifiers not recognised by this client build.
+      for provider in catalog.providers where !provider.id.isKnown {
+        metrics.recordUnrecognizedProvider(id: provider.id.rawValue, sessionId: sessionId)
+      }
+
+      lastKnownCatalog = catalog
+      return catalog
+    } catch {
+      metrics.recordFetchFailure(sessionId: sessionId, error: error)
+      // Re-throw so the caller can display an inline error and offer retry.
+      // lastKnownCatalog is intentionally not cleared — callers may present stale data.
+      throw error
+    }
   }
 
   /// GET /state - Fetch current bank state

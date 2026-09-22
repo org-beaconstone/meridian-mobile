@@ -15,9 +15,41 @@ public enum PaymentMethod: String, Codable, Hashable {
   case bank
 }
 
-public enum ProviderId: String, Codable, Hashable {
+public enum ProviderId: Hashable {
   case adyen
   case worldpay
+  case unknown(String)
+
+  public var rawValue: String {
+    switch self {
+    case .adyen: return "adyen"
+    case .worldpay: return "worldpay"
+    case .unknown(let id): return id
+    }
+  }
+
+  /// True for known, contracted providers; false for unrecognized identifiers.
+  public var isKnown: Bool {
+    if case .unknown = self { return false }
+    return true
+  }
+}
+
+extension ProviderId: Codable {
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    let raw = try container.decode(String.self)
+    switch raw {
+    case "adyen": self = .adyen
+    case "worldpay": self = .worldpay
+    default: self = .unknown(raw)
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.singleValueContainer()
+    try container.encode(rawValue)
+  }
 }
 
 public enum Scenario: String, Codable {
