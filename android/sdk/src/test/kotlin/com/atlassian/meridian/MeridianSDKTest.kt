@@ -9,6 +9,71 @@ import org.junit.Test
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
 
+  // MARK: - Design Token Contrast (WCAG 2.1 AA)
+
+  private fun channel(c: Double): Double =
+    if (c <= 0.03928) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4)
+
+  private fun relativeLuminance(argb: Long): Double {
+    val r = ((argb shr 16) and 0xFF).toDouble() / 255.0
+    val g = ((argb shr 8) and 0xFF).toDouble() / 255.0
+    val b = (argb and 0xFF).toDouble() / 255.0
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+  }
+
+  private fun contrast(a: Long, b: Long): Double {
+    val la = relativeLuminance(a)
+    val lb = relativeLuminance(b)
+    val lighter = maxOf(la, lb)
+    val darker = minOf(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+  }
+
+  private fun assertAaText(fg: TokenPalette.Pair, bg: TokenPalette.Pair, name: String) {
+    assertTrue("$name light contrast below AA", contrast(fg.light, bg.light) >= 4.5)
+    assertTrue("$name dark contrast below AA", contrast(fg.dark, bg.dark) >= 4.5)
+  }
+
+  @Test
+  fun testSessionBannerTokensMeetWcagAa() {
+    // The banner status states must be legible in both themes.
+    assertAaText(TokenPalette.onInfoContainer, TokenPalette.infoContainer, "info")
+    assertAaText(TokenPalette.onWarningContainer, TokenPalette.warningContainer, "warning")
+    assertAaText(TokenPalette.onErrorContainer, TokenPalette.errorContainer, "error")
+    assertAaText(TokenPalette.onProgressContainer, TokenPalette.progressContainer, "progress")
+  }
+
+  @Test
+  fun testSurfaceAndProviderTokensMeetWcagAa() {
+    assertAaText(TokenPalette.onSurface, TokenPalette.surface, "onSurface/surface")
+    assertAaText(TokenPalette.onSurface, TokenPalette.background, "onSurface/background")
+    assertAaText(TokenPalette.onSurfaceMuted, TokenPalette.surface, "muted/surface")
+    assertAaText(TokenPalette.onSurfaceMuted, TokenPalette.background, "muted/background")
+    assertAaText(TokenPalette.onBrand, TokenPalette.brand, "onBrand/brand")
+  }
+
+  @Test
+  fun testIndicatorDotsMeetNonTextContrast() {
+    // Active page-indicator dot is non-text UI: needs >= 3:1 against background.
+    assertTrue(contrast(TokenPalette.indicatorActive.light, TokenPalette.background.light) >= 3.0)
+    assertTrue(contrast(TokenPalette.indicatorActive.dark, TokenPalette.background.dark) >= 3.0)
+  }
+
+  // MARK: - Session State
+
+  @Test
+  fun testSessionStatesCoverBannerConcepts() {
+    // The three concept states the banner must render, plus active + the
+    // neutral checking state used while the session check resolves.
+    val states = SessionState.values().toSet()
+    assertTrue(states.contains(SessionState.signedOut))
+    assertTrue(states.contains(SessionState.expiring))
+    assertTrue(states.contains(SessionState.reauthenticating))
+    assertTrue(states.contains(SessionState.active))
+    assertTrue(states.contains(SessionState.checking))
+    assertEquals(5, states.size)
+  }
+
   // MARK: - Amount Parsing Tests
 
   @Test

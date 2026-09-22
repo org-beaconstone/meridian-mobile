@@ -35,6 +35,19 @@ enum class TransactionStatus {
   completed, declined, pending
 }
 
+/**
+ * Presentation-layer authentication session state shown by the session banner.
+ *
+ * This is deliberately independent of the payment catalog fetch: the banner
+ * communicates whether the user can trust that they are signed in, and must
+ * render (and never block the primary sign-in action) regardless of whether
+ * the catalog has loaded. [checking] is the neutral state shown while the
+ * initial session check resolves.
+ */
+enum class SessionState {
+  checking, signedOut, active, expiring, reauthenticating
+}
+
 // MARK: - Models
 
 data class Recipient(
