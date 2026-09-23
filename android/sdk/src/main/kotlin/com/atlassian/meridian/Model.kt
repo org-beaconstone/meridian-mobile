@@ -1,6 +1,8 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonCreator
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.annotation.JsonValue
 import java.io.Serializable
 
 // MARK: - Domain Enums
@@ -23,8 +25,21 @@ enum class PaymentMethod {
   card, bank
 }
 
-enum class ProviderId {
-  adyen, worldpay
+/**
+ * Server-resolved provider identifier. Baseline values are Adyen and Worldpay;
+ * any other id is accepted as configuration data rather than a new client build.
+ */
+data class ProviderId @JsonCreator(mode = JsonCreator.Mode.DELEGATING) constructor(
+  @JsonValue val rawValue: String,
+) : Serializable {
+  init {
+    require(rawValue.isNotBlank()) { "Provider id is required" }
+  }
+
+  companion object {
+    val adyen: ProviderId = ProviderId("adyen")
+    val worldpay: ProviderId = ProviderId("worldpay")
+  }
 }
 
 enum class Scenario {

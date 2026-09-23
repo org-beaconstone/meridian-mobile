@@ -2,6 +2,7 @@ package com.atlassian.meridian
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
@@ -16,6 +17,9 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val providerConfigStore: ProviderConfigStore = ProviderConfigStore.shared,
+  val providerConfigHealth: ProviderConfigHealth = ProviderConfigHealth(),
+  private val pickerMode: ProviderPickerMode = ProviderPickerFlags.resolve(),
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
@@ -35,6 +39,7 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
+    lenientStatus: Boolean = true,
   ): T = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
@@ -83,7 +88,7 @@ class MeridianClient(
           }
         }
 
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
+        lenientStatus && (statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503) -> {
           // These are expected error statuses, parse the response
           try {
             mapper.readValue(responseBody, responseType)
@@ -120,6 +125,54 @@ class MeridianClient(
    */
   suspend fun getCatalog(): CatalogResponse =
     request("GET", "/catalog", responseType = CatalogResponse::class.java)
+
+  /**
+   * Payment methods for [corridor].
+   *
+   * Remote mode calls GET /config/payment-providers with the rehearsal session header.
+   * A failed or unusable response falls back to the last cached configuration for this
+   * session, or the Milestone 2 Adyen/Worldpay seed when nothing has been cached.
+   * Milestone 2 mode skips the network and returns that seed directly.
+   */
+  suspend fun loadPaymentProviders(
+    corridor: String,
+    mode: ProviderPickerMode = pickerMode,
+  ): ProviderPickerResult {
+    if (mode == ProviderPickerMode.MILESTONE_2_BASELINE) {
+      val baseline = milestone2BaselineConfig()
+      return ProviderPickerResult(
+        providers = baseline.providersForCorridor(corridor),
+        source = ProviderConfigSource.MILESTONE_2_BASELINE,
+        configVersion = baseline.configVersion,
+      )
+    }
+    return try {
+      val response = request(
+        method = "GET",
+        path = "/config/payment-providers",
+        responseType = PaymentProviderConfigResponse::class.java,
+        lenientStatus = false,
+      )
+      val config = validatePaymentProviderConfig(response)
+      providerConfigStore.put(sessionId, config)
+      providerConfigHealth.recordSuccess(config.configVersion)
+      ProviderPickerResult(
+        providers = config.providersForCorridor(corridor),
+        source = ProviderConfigSource.REMOTE,
+        configVersion = config.configVersion,
+      )
+    } catch (cancelled: CancellationException) {
+      throw cancelled
+    } catch (error: Exception) {
+      val cached = providerConfigStore.get(sessionId) ?: milestone2BaselineConfig()
+      providerConfigHealth.recordFallback(cached.configVersion, error.message ?: "config fetch failed")
+      ProviderPickerResult(
+        providers = cached.providersForCorridor(corridor),
+        source = ProviderConfigSource.CACHE,
+        configVersion = cached.configVersion,
+      )
+    }
+  }
 
   /**
    * GET /state - Fetch current bank state
