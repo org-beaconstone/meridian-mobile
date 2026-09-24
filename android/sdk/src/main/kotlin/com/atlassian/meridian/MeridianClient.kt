@@ -131,23 +131,24 @@ class MeridianClient(
    * POST /payments - Submit a payment
    * @param recipientId Recipient ID
    * @param amountMinor Amount in GBP pence (integer)
-   * @param method Payment method (card or bank)
+   * @param method Catalog method code. Sent unchanged; a retry must reuse it.
    * @param note Optional note (max 200 chars)
    * @param scenario Simulation scenario
-   * @param idempotencyKey Unique key for idempotency
+   * @param idempotencyKey Unique key for idempotency. Reuse it when the outcome is unknown.
    */
   suspend fun submitPayment(
     recipientId: String,
     amountMinor: Int,
-    method: PaymentMethod,
+    method: String,
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
   ): PaymentResponse {
+    require(method.isNotBlank()) { "Payment method is required" }
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
-      method = method.name,
+      method = method,
       note = note,
       scenario = scenario.name,
     )

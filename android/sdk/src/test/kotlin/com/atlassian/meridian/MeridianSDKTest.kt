@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
+import java.io.File
 
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
@@ -266,6 +267,83 @@ class MeridianSDKTest {
   }
 
   @Test
+  fun testBaselineCatalogBecomesPaymentOptions() {
+    val options = baselineCatalog().paymentMethodOptions()
+
+    assertEquals(listOf("adyen_card", "worldpay_bank"), options.map { it.id })
+    assertEquals(listOf("card", "bank"), options.map { it.method })
+    assertEquals(listOf("Adyen", "Worldpay"), options.map { it.providerName })
+    assertEquals("Debit card · Adyen", options[0].displayLabel)
+    assertEquals("Bank payment · Worldpay", options[1].displayLabel)
+  }
+
+  @Test
+  fun testCatalogOptionsAreNotCappedAtTwo() {
+    val catalog = CatalogResponse(
+      demoDate = "2026-09-18",
+      recipients = emptyList(),
+      providers = listOf(
+        Provider("adyen", "Adyen", "Card payment processor", listOf("card", "bank")),
+        Provider("worldpay", "Worldpay", "Bank payment processor", listOf("bank", "card")),
+      ),
+    )
+
+    val options = catalog.paymentMethodOptions()
+
+    assertEquals(4, options.size)
+    assertEquals(
+      listOf("adyen_card", "adyen_bank", "worldpay_bank", "worldpay_card"),
+      options.map { it.id },
+    )
+    assertEquals(listOf("card", "bank", "bank", "card"), options.map { it.method })
+  }
+
+  @Test
+  fun testCatalogKeepsUnknownMethodCodeWithoutRewritingIt() {
+    val catalog = CatalogResponse(
+      demoDate = "2026-09-18",
+      recipients = emptyList(),
+      providers = listOf(
+        Provider("adyen", "Adyen", "Card payment processor", listOf("card", "stored-method", " ")),
+      ),
+    )
+
+    val options = catalog.paymentMethodOptions()
+
+    assertEquals(2, options.size)
+    assertEquals("stored-method", options[1].method)
+    assertEquals("adyen_stored-method", options[1].id)
+    assertEquals("stored-method · Adyen", options[1].displayLabel)
+  }
+
+  @Test
+  fun testSelectionStaysOnTheChosenCatalogRow() {
+    val options = baselineCatalog().paymentMethodOptions()
+    val selected = defaultPaymentOption(options, "worldpay_bank")
+
+    assertEquals("worldpay_bank", selected?.id)
+    assertEquals("bank", selected?.method)
+    assertEquals("adyen_card", defaultPaymentOption(options, null)?.id)
+    assertEquals("adyen_card", defaultPaymentOption(options, "missing")?.id)
+    assertNull(defaultPaymentOption(emptyList(), "adyen_card"))
+  }
+
+  @Test
+  fun testPaymentScreenHasNoHardcodedProviderPicker() {
+    val source = mainActivitySource()
+
+    assertFalse(source.contains("PaymentMethod"))
+    assertFalse(source.contains("ProviderId"))
+    assertFalse(source.contains("Adyen"))
+    assertFalse(source.contains("Worldpay"))
+    assertFalse(source.contains("Debit card"))
+    assertFalse(source.contains("Bank payment"))
+    assertTrue(source.contains("paymentMethodOptions()"))
+    assertTrue(source.contains("defaultPaymentOption("))
+    assertTrue(source.contains("confirmedMethod"))
+  }
+
+  @Test
   fun testClientInitialization() {
     val client = MeridianClient(
       baseURL = "http://localhost:8080/api/v1",
@@ -303,9 +381,9 @@ class MeridianSDKTest {
     val port = server.address.port
     val baseUrl = "http://127.0.0.1:$port/api/v1"
 
-    // Track idempotency keys
+    // Track idempotency keys and the method sent with each attempt
     val seenKeys = mutableSetOf<String>()
-    var statusCode = 202
+    val submittedMethods = mutableListOf<String>()
 
     // Handler that validates headers and returns 202 first time, 200 on retry
     server.createContext("/api/v1/payments") { exchange ->
@@ -321,6 +399,10 @@ class MeridianSDKTest {
       val idempotencyKey = exchange.requestHeaders.getFirst("Idempotency-Key")
       assertNotNull(idempotencyKey)
       assertTrue(idempotencyKey.isNotEmpty())
+
+      val body = exchange.requestBody.bufferedReader().readText()
+      val payload = mapper.readValue(body, PaymentRequest::class.java)
+      submittedMethods.add(payload.method)
 
       // Track idempotency key
       val isRetry = idempotencyKey in seenKeys
@@ -349,7 +431,7 @@ class MeridianSDKTest {
         client.submitPayment(
           recipientId = "rec-1",
           amountMinor = 10000,
-          method = PaymentMethod.card,
+          method = "card",
           idempotencyKey = "idempotency-key-1"
         )
       }
@@ -362,16 +444,39 @@ class MeridianSDKTest {
         client.submitPayment(
           recipientId = "rec-1",
           amountMinor = 10000,
-          method = PaymentMethod.card,
+          method = "card",
           idempotencyKey = "idempotency-key-1"
         )
       }
       assertTrue(response2.ok)
 
-      // Verify only one idempotency key was used
+      // Verify only one idempotency key was used, and the method was not swapped
       assertEquals(1, seenKeys.size)
+      assertEquals(listOf("card", "card"), submittedMethods)
     } finally {
       server.stop(0)
     }
+  }
+
+  private fun baselineCatalog(): CatalogResponse {
+    return CatalogResponse(
+      demoDate = "2026-09-18",
+      recipients = emptyList(),
+      providers = listOf(
+        Provider("adyen", "Adyen", "Card payment processor", listOf("card")),
+        Provider("worldpay", "Worldpay", "Bank payment processor", listOf("bank")),
+      ),
+    )
+  }
+
+  private fun mainActivitySource(): String {
+    val candidates = listOf(
+      File("app/src/main/kotlin/com/atlassian/meridian/MainActivity.kt"),
+      File("android/app/src/main/kotlin/com/atlassian/meridian/MainActivity.kt"),
+      File("../app/src/main/kotlin/com/atlassian/meridian/MainActivity.kt"),
+    )
+    val file = candidates.firstOrNull { it.isFile }
+      ?: error("MainActivity.kt not found from ${File(".").absolutePath}")
+    return file.readText()
   }
 }

@@ -31,12 +31,18 @@ class MainActivity : ComponentActivity() {
   var recipient by remember { mutableStateOf("northline-studio") }
   var amount by remember { mutableStateOf("") }
   var note by remember { mutableStateOf("") }
-  var method by remember { mutableStateOf(PaymentMethod.card) }
+  var selectedOptionId by remember { mutableStateOf<String?>(null) }
+  var confirmedMethod by remember { mutableStateOf<String?>(null) }
+  var confirmedLabel by remember { mutableStateOf<String?>(null) }
   var review by remember { mutableStateOf(false) }
   var busy by remember { mutableStateOf(false) }
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  val options = catalog?.paymentMethodOptions().orEmpty()
+  LaunchedEffect(options.map { it.id }, review) {
+    if (!review && options.none { it.id == selectedOptionId }) selectedOptionId = options.firstOrNull()?.id
+  }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
@@ -55,7 +61,7 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;selectedOptionId=null;confirmedMethod=null;confirmedLabel=null;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -68,19 +74,39 @@ class MainActivity : ComponentActivity() {
       }
       OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
       OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
-      // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      options.forEach { option ->
+        Row {
+          RadioButton(
+            selected=selectedOptionId==option.id,
+            onClick={if(!review&&!busy) selectedOptionId=option.id},
+            enabled=!review&&!busy,
+          )
+          Text(option.displayLabel,Modifier.padding(top=12.dp))
+        }
+      }
+      if(options.isEmpty()) Text("No payment methods returned by the catalog.")
+      if(!review) Button(onClick={
+        val parsed=parseAmount(amount)
+        val chosen=defaultPaymentOption(options, selectedOptionId)
+        if(parsed.first==null) message=parsed.second?:"Invalid amount"
+        else if(chosen==null) message="No payment method is available"
+        else {
+          selectedOptionId=chosen.id
+          confirmedMethod=chosen.method
+          confirmedLabel=chosen.displayLabel
+          review=true
+          paymentKey=UUID.randomUUID().toString()
+        }
+      },enabled=!busy && options.isNotEmpty()){Text("Review payment")}
       else {
-        Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
-            if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
+        Text("Confirm £$amount to $recipient · ${confirmedLabel ?: confirmedMethod.orEmpty()}")
+        Button(onClick={val active=client;val minor=parseAmount(amount).first;val methodToSend=confirmedMethod;if(active!=null&&minor!=null&&methodToSend!=null&&!busy){busy=true;revision++;scope.launch{
+          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=methodToSend,note=note,idempotencyKey=paymentKey)
+            if(result.ok){state=result.state;review=false;amount="";note="";confirmedMethod=null;confirmedLabel=null;paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
             else message=result.error?:"Awaiting confirmation. Retry the same payment."
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
         }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
-        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
+        TextButton(onClick={review=false;confirmedMethod=null;confirmedLabel=null;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
       current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
