@@ -311,6 +311,8 @@ class MeridianSDKTest {
     server.createContext("/api/v1/payments") { exchange ->
       val method = exchange.requestMethod
       assertEquals("POST", method)
+      val requestBody = exchange.requestBody.bufferedReader().readText()
+      assertTrue(requestBody.contains("\"method\":\"card\""))
 
       // Validate session header
       val sessionHeader = exchange.requestHeaders.getFirst("X-Rehearsal-Session")
@@ -349,7 +351,7 @@ class MeridianSDKTest {
         client.submitPayment(
           recipientId = "rec-1",
           amountMinor = 10000,
-          method = PaymentMethod.card,
+          methodId = "card",
           idempotencyKey = "idempotency-key-1"
         )
       }
@@ -362,7 +364,7 @@ class MeridianSDKTest {
         client.submitPayment(
           recipientId = "rec-1",
           amountMinor = 10000,
-          method = PaymentMethod.card,
+          methodId = "card",
           idempotencyKey = "idempotency-key-1"
         )
       }

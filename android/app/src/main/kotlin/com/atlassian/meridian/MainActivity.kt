@@ -32,6 +32,9 @@ class MainActivity : ComponentActivity() {
   var amount by remember { mutableStateOf("") }
   var note by remember { mutableStateOf("") }
   var method by remember { mutableStateOf(PaymentMethod.card) }
+  var configDriven by remember { mutableStateOf(false) }
+  var methodId by remember { mutableStateOf(ProviderCatalog.ADYEN_CARD) }
+  var methodOptions by remember { mutableStateOf<List<PaymentMethodOption>>(emptyList()) }
   var review by remember { mutableStateOf(false) }
   var busy by remember { mutableStateOf(false) }
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
@@ -45,6 +48,15 @@ class MainActivity : ComponentActivity() {
         val fresh=current.getState(); val definitions=current.getCatalog()
         if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
       } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
+      if(current.usesConfigDrivenCatalog && current===client && started==revision && !busy) {
+        try {
+          val options=current.paymentMethods()
+          if(current===client && started==revision && !busy) {
+            methodOptions=options
+            methodId=ProviderCatalog.retainSelection(methodId, options)
+          }
+        } catch(_:Exception) { /* keep the methods already on screen */ }
+      }
       delay(2000)
     }
   }
@@ -55,7 +67,13 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {
+        val enabled=ProviderCatalogFlag.enabled()
+        configDriven=enabled
+        client=MeridianClient(base,room,configDrivenCatalog=enabled)
+        state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()
+        if(enabled){methodOptions=ProviderCatalog.safeDefault();methodId=ProviderCatalog.ADYEN_CARD}
+      }catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -68,14 +86,20 @@ class MainActivity : ComponentActivity() {
       }
       OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
       OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
-      // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      if(configDriven) {
+        methodOptions.forEach { option ->
+          Row {RadioButton(methodId==option.id,{methodId=option.id},enabled=!review&&!busy);Text(option.pickerLabel(),Modifier.padding(top=12.dp))}
+        }
+      } else {
+        // Intentional two-provider native baseline; changing it requires an app release.
+        Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
+        Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      }
       if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
+        Button(onClick={val active=client;val minor=parseAmount(amount).first;val selectedMethod=if(configDriven) methodId else method.name;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
+          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,methodId=selectedMethod,note=note,idempotencyKey=paymentKey)
             if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
             else message=result.error?:"Awaiting confirmation. Retry the same payment."
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
