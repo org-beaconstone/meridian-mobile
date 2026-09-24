@@ -1,9 +1,12 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +344,309 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let extra = await extraChecks()
+    passed += extra.passed
+    failed += extra.failed
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+}
+
+private func extraChecks() async -> (passed: Int, failed: Int) {
+  var passed = 0
+  var failed = 0
+
+  func check(_ name: String, _ ok: Bool) {
+    if ok {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+
+  print("21. Catalog accepts every configured provider...")
+  let catalogJson = """
+  {
+    "demoDate": "2026-09-18",
+    "recipients": [],
+    "providers": [
+      {"id": "adyen", "name": "Adyen", "description": "Card processor", "methods": ["card"]},
+      {"id": "worldpay", "name": "Worldpay", "description": "Bank processor", "methods": ["bank"]},
+      {"id": "configured-provider", "name": "Configured provider", "description": "Server configured", "methods": ["transfer", "wallet"]}
+    ]
+  }
+  """
+  let decoder = JSONDecoder()
+  let catalog = try? decoder.decode(CatalogResponse.self, from: Data(catalogJson.utf8))
+  let options = catalog?.paymentMethodOptions ?? []
+  check(
+    "catalog providers become one option per method",
+    options.map(\.id) == ["adyen_card", "worldpay_bank", "configured-provider_transfer", "configured-provider_wallet"]
+      && options.map(\.methodId) == ["card", "bank", "transfer", "wallet"]
+      && options.map(\.displayLabel) == ["Card · Adyen", "Bank · Worldpay", "Transfer · Configured provider", "Wallet · Configured provider"]
+  )
+  let blanks = CatalogResponse(
+    demoDate: "",
+    recipients: [],
+    providers: [Provider(id: "configured-provider", name: "Configured provider", description: "", methods: ["", "transfer"])]
+  )
+  check("blank method ids are not offered", blanks.paymentMethodOptions.map(\.methodId) == ["transfer"])
+
+  print("22. Confirmed selection does not substitute another method...")
+  check(
+    "selected catalog method is submitted as-is",
+    PaymentRouting.methodId(in: catalog ?? emptyCatalog(), selectedOptionId: "configured-provider_transfer") == "transfer"
+  )
+  check(
+    "missing selection does not fall back",
+    PaymentRouting.methodId(in: catalog ?? emptyCatalog(), selectedOptionId: "missing") == nil
+  )
+  check(
+    "refresh keeps the current option",
+    catalog.map { PaymentRouting.selectionId(in: $0, current: "worldpay_bank") } == "worldpay_bank"
+  )
+  check(
+    "refresh uses the first option only when the current one is gone",
+    catalog.map { PaymentRouting.selectionId(in: $0, current: "") } == "adyen_card"
+  )
+
+  print("23. Transaction records any provider id...")
+  let transactionJson = """
+  {
+    "id": "txn-extra",
+    "reference": "REF-1",
+    "recipientId": "northline-studio",
+    "name": "Northline Studio",
+    "category": "Shopping",
+    "amount": 100,
+    "date": "2026-09-18",
+    "provider": "configured-provider",
+    "method": "transfer",
+    "status": "completed",
+    "note": ""
+  }
+  """
+  let transaction = try? decoder.decode(Transaction.self, from: Data(transactionJson.utf8))
+  check(
+    "unknown provider and method decode",
+    transaction?.provider == "configured-provider" && transaction?.method == "transfer"
+  )
+
+  print("24. Payment body keeps the method id...")
+  let payload = PaymentRequest(
+    recipientId: "northline-studio",
+    amountMinor: 100,
+    method: "transfer",
+    note: "note",
+    scenario: .success
+  )
+  let encoded = (try? JSONEncoder().encode(payload)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+  check("encoded method is the catalog method", encoded?["method"] as? String == "transfer")
+
+  print("25. Catalog cache falls back, then expires...")
+  var cache = CatalogCache(ttl: 60)
+  let now = Date(timeIntervalSince1970: 1_700_000_000)
+  check("empty cache has no fallback", cache.fallback(at: now)?.providers == nil)
+  if let catalog {
+    cache.store(catalog, at: now)
+    let within = cache.fallback(at: now.addingTimeInterval(30))
+    let expired = cache.fallback(at: now.addingTimeInterval(61))
+    check(
+      "fallback is the fetched catalog inside the time-to-live",
+      within?.providers.map(\.id) == ["adyen", "worldpay", "configured-provider"]
+    )
+    check("expired cache is not reused", expired?.providers == nil)
+  } else {
+    check("fallback is the fetched catalog inside the time-to-live", false)
+    check("expired cache is not reused", false)
+  }
+
+  print("26. Client reuses the last catalog and does not rewrite the method...")
+  let transportResult = await transportChecks()
+  passed += transportResult.passed
+  failed += transportResult.failed
+
+  print("27. UI and model have no hardcoded provider picker...")
+  let source = sourceChecks()
+  passed += source.passed
+  failed += source.failed
+
+  return (passed, failed)
+}
+
+private func emptyCatalog() -> CatalogResponse {
+  CatalogResponse(demoDate: "", recipients: [], providers: [])
+}
+
+private final class LockedBox<T>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: T
+  init(_ value: T) { self.value = value }
+  func withLock<R>(_ body: (inout T) -> R) -> R {
+    lock.lock()
+    defer { lock.unlock() }
+    return body(&value)
+  }
+}
+
+private func transportChecks() async -> (passed: Int, failed: Int) {
+  var passed = 0
+  var failed = 0
+  func check(_ name: String, _ ok: Bool) {
+    if ok {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+
+  let catalogBody = """
+  {"demoDate":"2026-09-18","recipients":[],"providers":[
+    {"id":"adyen","name":"Adyen","description":"Card processor","methods":["card"]},
+    {"id":"worldpay","name":"Worldpay","description":"Bank processor","methods":["bank"]},
+    {"id":"configured-provider","name":"Configured provider","description":"Server configured","methods":["transfer"]}
+  ]}
+  """.data(using: .utf8)!
+  let script = LockedBox<[(Int, Data)]>([])
+  let seen = LockedBox<[URLRequest]>([])
+  let transport: @Sendable (URLRequest) async throws -> (Data, URLResponse) = { request in
+    seen.withLock { $0.append(request) }
+    let next = script.withLock { box -> (Int, Data) in
+      box.isEmpty ? (500, Data("{}".utf8)) : box.removeFirst()
+    }
+    let response = HTTPURLResponse(
+      url: request.url ?? URL(string: "http://127.0.0.1/api/v1")!,
+      statusCode: next.0,
+      httpVersion: "HTTP/1.1",
+      headerFields: nil
+    )!
+    return (next.1, response)
+  }
+  let clock = LockedBox(Date(timeIntervalSince1970: 1_700_000_000))
+  do {
+    let client = try MeridianClient(
+      baseURL: "http://127.0.0.1:8080/api/v1",
+      sessionId: "room-catalog",
+      catalogTTL: 60,
+      now: { clock.withLock { $0 } },
+      transport: transport
+    )
+    script.withLock { $0 = [(500, Data())] }
+    var initialFailed = false
+    do { _ = try await client.getCatalog() } catch { initialFailed = true }
+    let initialFromCache = await client.didServeCatalogFromCache()
+    check("first catalog failure has no built-in provider list", initialFailed && initialFromCache == false)
+
+    script.withLock { $0 = [(200, catalogBody), (503, Data("nope".utf8))] }
+    let fresh = try await client.getCatalog()
+    let freshFromCache = await client.didServeCatalogFromCache()
+    check("catalog fetch returns every provider", fresh.paymentMethodOptions.count == 3 && freshFromCache == false)
+    clock.withLock { $0 = $0.addingTimeInterval(30) }
+    let cached = try await client.getCatalog()
+    let cachedFromCache = await client.didServeCatalogFromCache()
+    check(
+      "failed fetch reuses the last catalog",
+      cached.providers.map(\.id) == fresh.providers.map(\.id) && cachedFromCache
+    )
+    clock.withLock { $0 = $0.addingTimeInterval(90) }
+    script.withLock { $0 = [(503, Data("nope".utf8))] }
+    var expired = false
+    do { _ = try await client.getCatalog() } catch { expired = true }
+    let expiredFromCache = await client.didServeCatalogFromCache()
+    check("catalog older than the time-to-live is not served", expired && expiredFromCache == false)
+
+    let methodId = PaymentRouting.methodId(in: fresh, selectedOptionId: "configured-provider_transfer")
+    let key = "idem-catalog-1"
+    let paymentOk = #"{"ok":true,"state":null,"transaction":null}"#.data(using: .utf8)!
+    script.withLock { $0 = [(200, paymentOk), (500, Data())] }
+    _ = try await client.submitPayment(
+      recipientId: "northline-studio",
+      amountMinor: 250,
+      method: methodId ?? "",
+      note: "catalog route",
+      idempotencyKey: key
+    )
+    var retryThrew = false
+    do {
+      _ = try await client.submitPayment(
+        recipientId: "northline-studio",
+        amountMinor: 250,
+        method: methodId ?? "",
+        note: "catalog route",
+        idempotencyKey: key
+      )
+    } catch {
+      retryThrew = true
+    }
+    let posts = seen.withLock { $0 }.filter { $0.httpMethod == "POST" }
+    let methods = posts.map { request -> String? in
+      guard let body = request.httpBody,
+        let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+      else { return nil }
+      return json["method"] as? String
+    }
+    let keys = posts.map { $0.value(forHTTPHeaderField: "Idempotency-Key") }
+    let sessions = posts.map { $0.value(forHTTPHeaderField: "X-Rehearsal-Session") }
+    check("payment posts the selected method twice", methods == ["transfer", "transfer"] && retryThrew)
+    check("retry keeps the idempotency key and session", keys == [key, key] && sessions == ["room-catalog", "room-catalog"])
+  } catch {
+    print("  ✗ transport checks errored: \(error)")
+    failed += 1
+  }
+  return (passed, failed)
+}
+
+private func sourceChecks() -> (passed: Int, failed: Int) {
+  var passed = 0
+  var failed = 0
+  func check(_ name: String, _ ok: Bool) {
+    if ok {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+  let iosRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+  let app = (try? String(contentsOf: iosRoot.appendingPathComponent("App/MeridianApp.swift"), encoding: .utf8)) ?? ""
+  let model = (try? String(contentsOf: iosRoot.appendingPathComponent("MeridianSDK/Sources/MeridianSDK/Model.swift"), encoding: .utf8)) ?? ""
+  let client = (try? String(contentsOf: iosRoot.appendingPathComponent("MeridianSDK/Sources/MeridianSDK/MeridianClient.swift"), encoding: .utf8)) ?? ""
+  let forbidden = ["PaymentMethod.card", "PaymentMethod.bank", "Adyen", "Worldpay", "adyen", "worldpay", "Debit card", "Bank payment", "FeatureFlag", "featureFlag"]
+  let uncertainRetry = app.range(of: "catch {message=\"Outcome may be unknown").map { start in
+    app[start.lowerBound...].prefix(while: { $0 != "}" })
+  }
+  check("payment screen source is present", !app.isEmpty && !model.isEmpty && !client.isEmpty)
+  check(
+    "payment screen has no provider enum or brand picker",
+    !app.isEmpty && forbidden.allSatisfy { !app.contains($0) } && app.contains("paymentMethodOptions") && app.contains("PaymentRouting.methodId")
+  )
+  check(
+    "uncertain payment retry does not replace the idempotency key",
+    uncertainRetry.map { !$0.contains("UUID") } ?? false
+  )
+  check(
+    "model has no closed provider or method enum",
+    !model.contains("enum PaymentMethod") && !model.contains("enum ProviderId") && !model.contains("adyen") && !model.contains("worldpay") && !model.contains("case card") && !model.contains("case bank")
+  )
+  check(
+    "client does not name baseline providers",
+    !client.contains("adyen") && !client.contains("worldpay") && !client.contains("PaymentMethod")
+  )
+  return (passed, failed)
 }

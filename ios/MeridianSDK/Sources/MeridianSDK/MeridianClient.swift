@@ -1,19 +1,31 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
-  private let session: URLSession
+  private let transport: @Sendable (URLRequest) async throws -> (Data, URLResponse)
+  private let now: @Sendable () -> Date
+  private var catalogCache: CatalogCache
+  private var servedCatalogFromCache = false
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - catalogTTL: How long a successful catalog may be reused after a later fetch fails
+  ///   - now: Clock used for the catalog time-to-live
+  ///   - transport: Optional request transport. The session is used when this is omitted.
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    catalogTTL: TimeInterval = 60,
+    now: @escaping @Sendable () -> Date = { Date() },
+    transport: (@Sendable (URLRequest) async throws -> (Data, URLResponse))? = nil
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -35,7 +47,15 @@ public actor MeridianClient {
 
     self.baseURL = url
     self.sessionId = sessionId
-    self.session = urlSession
+    self.now = now
+    self.catalogCache = CatalogCache(ttl: catalogTTL)
+    if let transport {
+      self.transport = transport
+    } else {
+      self.transport = { request in
+        try await urlSession.data(for: request)
+      }
+    }
   }
 
   // MARK: - Internal Request Method
@@ -50,6 +70,7 @@ public actor MeridianClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = method
+    request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
 
@@ -64,7 +85,7 @@ public actor MeridianClient {
       request.httpBody = try encoder.encode(body)
     }
 
-    let (data, response) = try await session.data(for: request)
+    let (data, response) = try await transport(request)
 
     guard let httpResponse = response as? HTTPURLResponse else {
       throw MeridianError.networkError("Invalid response type")
@@ -95,9 +116,28 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
-  /// GET /catalog - Fetch recipients and providers
+  /// GET /catalog - Fetch recipients and providers.
+  /// A failed fetch returns the last successful catalog until its time-to-live elapses.
+  /// There is no built-in provider list.
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    do {
+      let fresh: CatalogResponse = try await request(method: "GET", path: "/catalog")
+      catalogCache.store(fresh, at: now())
+      servedCatalogFromCache = false
+      return fresh
+    } catch {
+      if let cached = catalogCache.fallback(at: now()) {
+        servedCatalogFromCache = true
+        return cached
+      }
+      servedCatalogFromCache = false
+      throw error
+    }
+  }
+
+  /// True when the latest catalog result was the in-memory snapshot after a failed fetch.
+  public func didServeCatalogFromCache() -> Bool {
+    servedCatalogFromCache
   }
 
   /// GET /state - Fetch current bank state
@@ -109,14 +149,14 @@ public actor MeridianClient {
   /// - Parameters:
   ///   - recipientId: Recipient ID
   ///   - amountMinor: Amount in GBP pence (integer)
-  ///   - method: Payment method (card or bank)
+  ///   - method: Method id from the provider catalog. Submitted unchanged.
   ///   - note: Optional note (max 200 chars)
   ///   - scenario: Simulation scenario
   ///   - idempotencyKey: Unique key for idempotency
   public func submitPayment(
     recipientId: String,
     amountMinor: Int,
-    method: PaymentMethod,
+    method: String,
     note: String = "",
     scenario: Scenario = .success,
     idempotencyKey: String
