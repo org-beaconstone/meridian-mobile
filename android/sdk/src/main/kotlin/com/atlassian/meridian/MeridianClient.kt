@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
@@ -24,7 +25,10 @@ class MeridianClient(
   val usesConfigDrivenCatalog: Boolean = configDrivenCatalog
   val catalogMetrics: CatalogFetchMetrics = catalogMetrics
 
-  private val mapper = ObjectMapper().registerKotlinModule()
+  private val mapper = ObjectMapper().registerKotlinModule().apply {
+    // Match Swift JSONDecoder: additive catalog fields must not fail the picker.
+    disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+  }
   private val baseUrlNormalized = baseURL.removeSuffix("/")
   private val paymentLog = java.util.logging.Logger.getLogger("com.atlassian.meridian.payment")
 

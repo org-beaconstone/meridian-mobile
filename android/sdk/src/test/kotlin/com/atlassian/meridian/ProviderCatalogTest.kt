@@ -88,28 +88,22 @@ class ProviderCatalogTest {
   }
 
   @Test
-  fun testExtraCatalogFieldsStillDecodeKnownMethods() {
-    val json = """
-      {
-        "demoDate": "2026-09-18",
-        "region": "GB",
-        "recipients": [],
-        "providers": [
-          {
-            "id": "adyen",
-            "name": "Adyen",
-            "description": "Card payment processor",
-            "methods": ["card"],
-            "corridor": "domestic"
-          }
-        ]
-      }
-    """.trimIndent()
-
-    val options = ProviderCatalog.parse(mapper.readValue(json, CatalogResponse::class.java))
-
-    assertEquals(ProviderCatalog.ADYEN_CARD, options.single().id)
-    assertEquals("card", options.single().wireMethod)
+  fun testCatalogIgnoresAdditiveFields() {
+    val hits = AtomicInteger()
+    val body = MERIDIAN_API_CATALOG.replace(
+      "\"methods\": [\"card\"]",
+      "\"methods\": [\"card\"], \"corridor\": \"domestic\"",
+    )
+    val server = catalogServer(hits, status = 200, body = body)
+    try {
+      val client = MeridianClient(server.baseUrl, "test-session", configDrivenCatalog = true)
+      val options = runBlocking { client.paymentMethods() }
+      assertEquals(listOf(ProviderCatalog.ADYEN_CARD, ProviderCatalog.WORLDPAY_BANK), options.map { it.id })
+      assertEquals(1, client.catalogMetrics.successCount())
+      assertEquals(0, client.catalogMetrics.fallbackCount())
+    } finally {
+      server.server.stop(0)
+    }
   }
 
   @Test
@@ -221,7 +215,6 @@ class ProviderCatalogTest {
   @Test
   fun testSuccessfulRefetchReplacesCachedMethods() {
     var now = 0L
-    var worldpayOnly = false
     val repository = ProviderCatalogRepository(
       configDriven = true,
       ttlMillis = 1_000,
@@ -231,10 +224,9 @@ class ProviderCatalogTest {
     assertEquals(2, both.size)
 
     now = 1_000
-    worldpayOnly = true
     val replaced = runBlocking {
       repository.paymentMethods {
-        if (!worldpayOnly) catalog() else CatalogResponse(
+        CatalogResponse(
           demoDate = "2026-09-18",
           recipients = emptyList(),
           providers = listOf(Provider("worldpay", "Worldpay", "Bank transfer processor", listOf("bank"))),
