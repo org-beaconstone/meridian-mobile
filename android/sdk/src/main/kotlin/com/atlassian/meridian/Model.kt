@@ -19,14 +19,6 @@ enum class Category(val displayName: String) {
   }
 }
 
-enum class PaymentMethod {
-  card, bank
-}
-
-enum class ProviderId {
-  adyen, worldpay
-}
-
 enum class Scenario {
   success, declined, unavailable, pending
 }
@@ -78,6 +70,68 @@ data class Provider(
   val description: String,
   val methods: List<String>,
 ) : Serializable
+
+/**
+ * One row in the payment picker, built only from GET /catalog.
+ * [id] selects the row. [method] is the catalog method code and is submitted
+ * unchanged. The rehearsal baseline remains Adyen card and Worldpay bank as
+ * catalog data; this type does not name any further provider.
+ */
+data class PaymentMethodOption(
+  val id: String,
+  val method: String,
+  val displayLabel: String,
+  val providerId: String,
+  val providerName: String,
+) : Serializable
+
+fun CatalogResponse.paymentMethodOptions(): List<PaymentMethodOption> {
+  val seen = HashMap<String, Int>()
+  val options = ArrayList<PaymentMethodOption>()
+  for (provider in providers) {
+    for (method in provider.methods) {
+      if (method.isBlank()) continue
+      val baseId = "${provider.id}_$method"
+      val count = (seen[baseId] ?: 0) + 1
+      seen[baseId] = count
+      val id = if (count == 1) baseId else "${baseId}_$count"
+      options.add(
+        PaymentMethodOption(
+          id = id,
+          method = method,
+          displayLabel = baselineMethodLabel(method, provider.name),
+          providerId = provider.id,
+          providerName = provider.name,
+        )
+      )
+    }
+  }
+  return options
+}
+
+/**
+ * Keep the caller's selection when that catalog row is still present.
+ * Otherwise use the first catalog row. Does not substitute a different row
+ * while the selected id is still offered.
+ */
+fun defaultPaymentOption(
+  options: List<PaymentMethodOption>,
+  selectedId: String?,
+): PaymentMethodOption? {
+  if (selectedId != null) {
+    options.firstOrNull { it.id == selectedId }?.let { return it }
+  }
+  return options.firstOrNull()
+}
+
+private fun baselineMethodLabel(method: String, providerName: String): String {
+  val methodLabel = when (method) {
+    "card" -> "Debit card"
+    "bank" -> "Bank payment"
+    else -> method
+  }
+  return "$methodLabel · $providerName"
+}
 
 // MARK: - API Response Types
 
