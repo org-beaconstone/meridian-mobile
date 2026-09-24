@@ -3,6 +3,8 @@ package com.atlassian.meridian
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import android.util.Log
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -11,6 +13,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.atlassian.meridian.ui.PaymentSessionBanner
+import com.atlassian.meridian.ui.SessionBannerAnnouncer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -18,7 +22,21 @@ import java.util.UUID
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    setContent { MaterialTheme(colors=lightColors(primary=Color(0xFF142C35),secondary=Color(0xFFD5B77A))) { MeridianScreen() } }
+    setContent {
+      val dark = isSystemInDarkTheme()
+      MaterialTheme(
+        colors = if (dark) darkColors(
+          primary = Color(0xFF142C35),
+          secondary = Color(0xFFD5B77A),
+          background = Color(0xFF0E1A1E),
+          surface = Color(0xFF14282F),
+          onPrimary = Color.White,
+          onSecondary = Color(0xFF142C35),
+          onBackground = Color.White,
+          onSurface = Color.White,
+        ) else lightColors(primary = Color(0xFF142C35), secondary = Color(0xFFD5B77A)),
+      ) { MeridianScreen() }
+    }
   }
 }
 @Composable fun MeridianScreen() {
@@ -37,14 +55,63 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  // Session banner reads the rehearsal session already held by MeridianClient.
+  // There is no separate auth screen and this does not add an auth request.
+  var sessionLookup by remember { mutableStateOf(SessionLookup.Idle) }
+  var sessionConfirmed by remember { mutableStateOf(false) }
+  var connectedRoom by remember { mutableStateOf<String?>(null) }
+  var dismissedBannerKeys by remember { mutableStateOf(emptySet<String>()) }
+  val bannerMetrics = remember { SessionBannerMetrics() }
+  var lastBannerImpression by remember { mutableStateOf<String?>(null) }
+  var bannerAnnouncement by remember { mutableStateOf("") }
+  val sessionSnapshot = paymentSessionSnapshot(
+    clientConnected = client != null,
+    lookup = sessionLookup,
+    sessionId = connectedRoom,
+    sessionConfirmed = sessionConfirmed,
+  )
+  val sessionBanner = resolveSessionBanner(sessionSnapshot, dismissedBannerKeys)
+  LaunchedEffect(sessionBanner.liveIdentity) {
+    when (val banner = sessionBanner) {
+      is SessionBannerPresentation.Visible -> {
+        bannerAnnouncement = banner.announcement
+        if (banner.dismissalKey != lastBannerImpression) {
+          bannerMetrics.recordImpression(banner.metricState)
+          lastBannerImpression = banner.dismissalKey
+        }
+      }
+      SessionBannerPresentation.Skeleton -> bannerAnnouncement = SessionBannerPresentation.Skeleton.announcement
+      SessionBannerPresentation.Hidden -> Unit
+    }
+  }
+  val dismissSessionBanner: () -> Unit = {
+    val visible = sessionBanner as? SessionBannerPresentation.Visible
+    if (visible != null && visible.dismissible) {
+      val rate = bannerMetrics.recordDismissal(visible.metricState)
+      Log.i("SessionBanner", rate.logLine())
+      dismissedBannerKeys = dismissedBannerKeys + visible.dismissalKey
+      bannerAnnouncement = SessionBannerCopy.DISMISSED
+    }
+  }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
       val started=revision
       if(!busy) try {
         val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
-      } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
+        if(current===client && started==revision && !busy) {
+          state=fresh
+          catalog=definitions
+          sessionConfirmed=true
+          sessionLookup=SessionLookup.Ready
+          message="Connected to shared Java API"
+        }
+      } catch(e:Exception) {
+        if(current===client) {
+          sessionLookup=SessionLookup.Failed
+          message="API unavailable: ${e.message}"
+        }
+      }
       delay(2000)
     }
   }
@@ -55,14 +122,29 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {
+        client=MeridianClient(base,room)
+        connectedRoom=room
+        state=null
+        catalog=null
+        review=false
+        revision++
+        paymentKey=UUID.randomUUID().toString()
+        sessionConfirmed=false
+        sessionLookup=SessionLookup.Resolving
+      } catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
-    Text(message)
+    Box {
+      Text(message)
+      SessionBannerAnnouncer(bannerAnnouncement)
+    }
+    if (state == null) PaymentSessionBanner(sessionBanner, onDismiss = dismissSessionBanner)
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
       }
       Text("Make a payment",style=MaterialTheme.typography.h6)
+      PaymentSessionBanner(sessionBanner, onDismiss = dismissSessionBanner)
       catalog?.recipients?.forEach { person ->
         Row {RadioButton(selected=recipient==person.id,onClick={recipient=person.id},enabled=!review&&!busy);Text(person.name,Modifier.padding(top=12.dp))}
       }
