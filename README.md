@@ -42,6 +42,8 @@ Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `
 
 ## Deliberate baseline
 
-Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+Payment methods stay Adyen/card and Worldpay/bank. No third provider is implemented. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+
+On iOS the method picker is hardcoded to those two providers unless `MERIDIAN_CONFIG_DRIVEN_CATALOG=1` (or `true`). With the flag on, the Swift client reads `GET /catalog`, maps Adyen card and Worldpay bank into payment method options, and caches that list in memory for 30 seconds. A failed, timed out, or malformed catalog keeps the last known good list, or the built-in pair when nothing has been cached. `submitPayment` accepts that method id and still posts `card` or `bank` with the same `Idempotency-Key` header. The flag defaults off, which leaves the hardcoded picker and the previous payment call behavior in place.
 
 See [source context](https://github.com/org-beaconstone/meridian-api/blob/main/docs/context.md), [API contract](https://github.com/org-beaconstone/meridian-api/blob/main/docs/contract.md) and [connected runbook](https://github.com/org-beaconstone/meridian-api/blob/main/docs/connected-rehearsal.md). Existing Kaizen site remains standalone; no Java hosting is implied.
