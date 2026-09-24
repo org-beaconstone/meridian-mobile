@@ -110,22 +110,61 @@ public struct Budget: Codable, Hashable {
   }
 }
 
+/// Session status carried on GET /state. This is the existing rehearsal session,
+/// not a separate authentication check.
+public enum SessionStatus: String, Codable, Hashable {
+  case active
+  case expiring
+  case signedOutElsewhere = "signed_out_elsewhere"
+}
+
+public struct RehearsalSessionInfo: Codable, Hashable {
+  public var status: SessionStatus
+  /// Optional device label. Truncated before the core session message.
+  public var deviceDetail: String?
+
+  public init(status: SessionStatus, deviceDetail: String? = nil) {
+    self.status = status
+    self.deviceDetail = deviceDetail
+  }
+}
+
+public struct CorridorInfo: Codable, Hashable {
+  public var id: String
+  /// Notice identifier such as `european_launch`. Unknown values are ignored.
+  public var notice: String?
+
+  public init(id: String, notice: String? = nil) {
+    self.id = id
+    self.notice = notice
+  }
+}
+
 public struct BankState: Codable, Hashable {
   public let version: Int
   public let balance: Int // integer GBP pence
   public let transactions: [Transaction]
   public let budgets: [Budget]
+  /// Present when GET /state includes session status. Nil means the rehearsal
+  /// session loaded successfully and is treated as active.
+  public let session: RehearsalSessionInfo?
+  /// Present when GET /state includes a corridor notice.
+  public let corridor: CorridorInfo?
 
   public init(
     version: Int,
     balance: Int,
     transactions: [Transaction],
-    budgets: [Budget]
+    budgets: [Budget],
+    session: RehearsalSessionInfo? = nil,
+    corridor: CorridorInfo? = nil
   ) {
     self.version = version
     self.balance = balance
     self.transactions = transactions
     self.budgets = budgets
+    self.session = session
+    self.corridor = corridor
   }
 }
 
