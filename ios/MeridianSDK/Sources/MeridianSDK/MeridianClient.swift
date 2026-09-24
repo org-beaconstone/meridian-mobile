@@ -1,19 +1,29 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let catalogCache: ProviderCatalogCache
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - catalogTTL: In-memory lifetime of a successfully fetched provider catalog
+  ///   - catalogClock: Clock used for the catalog time-to-live
+  ///   - catalogLogger: Receives configuration fetch success, failure, and fallback logs
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    catalogTTL: TimeInterval = ProviderCatalogCache.defaultTTL,
+    catalogClock: @escaping @Sendable () -> Date = { Date() },
+    catalogLogger: any CatalogMetricLogging = StandardCatalogMetricLog()
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,6 +46,11 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.catalogCache = ProviderCatalogCache(
+      ttl: catalogTTL,
+      clock: catalogClock,
+      logger: catalogLogger
+    )
   }
 
   // MARK: - Internal Request Method
@@ -44,7 +59,8 @@ public actor MeridianClient {
     method: String,
     path: String,
     body: Encodable? = nil,
-    additionalHeaders: [String: String] = [:]
+    additionalHeaders: [String: String] = [:],
+    timeout: TimeInterval? = nil
   ) async throws -> T {
     let url = baseURL.appendingPathComponent(path)
 
@@ -52,6 +68,9 @@ public actor MeridianClient {
     request.httpMethod = method
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
+    if let timeout {
+      request.timeoutInterval = timeout
+    }
 
     // Add additional headers (e.g., Idempotency-Key)
     for (key, value) in additionalHeaders {
@@ -96,8 +115,29 @@ public actor MeridianClient {
   }
 
   /// GET /catalog - Fetch recipients and providers
-  public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+  public func getCatalog(timeout: TimeInterval? = nil) async throws -> CatalogResponse {
+    return try await request(method: "GET", path: "/catalog", timeout: timeout)
+  }
+
+  /// Config-driven provider list. Serves the in-memory cache inside its time-to-live.
+  /// Fetch failure, timeout, or a malformed catalog falls back to the last-known-good list.
+  public func loadProviderConfiguration() async -> ProviderConfiguration {
+    if let fresh = await catalogCache.freshConfiguration() {
+      return fresh
+    }
+    do {
+      let catalog = try await getCatalog(timeout: ProviderCatalogCache.fetchTimeout)
+      return await catalogCache.store(catalog: catalog, sessionId: sessionId)
+    } catch {
+      return await catalogCache.fail(
+        detail: CatalogFailureDetail.describe(error),
+        sessionId: sessionId
+      )
+    }
+  }
+
+  public func providerCatalogMetrics() async -> CatalogFetchMetrics {
+    await catalogCache.currentMetrics()
   }
 
   /// GET /state - Fetch current bank state
@@ -121,10 +161,31 @@ public actor MeridianClient {
     scenario: Scenario = .success,
     idempotencyKey: String
   ) async throws -> PaymentResponse {
-    let payload = PaymentRequest(
+    try await submitPayment(
       recipientId: recipientId,
       amountMinor: amountMinor,
-      method: method,
+      method: method.rawValue,
+      note: note,
+      scenario: scenario,
+      idempotencyKey: idempotencyKey
+    )
+  }
+
+  /// Submits a payment for a catalog method id (`adyen_card`, `worldpay_bank`) or the
+  /// existing wire values (`card`, `bank`). The idempotency key is forwarded unchanged.
+  /// The JSON body still uses `card` or `bank`, matching meridian-api.
+  public func submitPayment(
+    recipientId: String,
+    amountMinor: Int,
+    method: String,
+    note: String = "",
+    scenario: Scenario = .success,
+    idempotencyKey: String
+  ) async throws -> PaymentResponse {
+    let payload = try PaymentSubmission.request(
+      recipientId: recipientId,
+      amountMinor: amountMinor,
+      methodId: method,
       note: note,
       scenario: scenario
     )
@@ -133,7 +194,7 @@ public actor MeridianClient {
       method: "POST",
       path: "/payments",
       body: payload,
-      additionalHeaders: ["Idempotency-Key": idempotencyKey]
+      additionalHeaders: PaymentSubmission.headers(idempotencyKey: idempotencyKey)
     )
   }
 
