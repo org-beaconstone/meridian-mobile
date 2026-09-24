@@ -10,16 +10,6 @@ public enum Category: String, Codable, Hashable, CaseIterable {
   case lifestyle = "Lifestyle"
 }
 
-public enum PaymentMethod: String, Codable, Hashable {
-  case card
-  case bank
-}
-
-public enum ProviderId: String, Codable, Hashable {
-  case adyen
-  case worldpay
-}
-
 public enum Scenario: String, Codable {
   case success
   case declined
@@ -68,8 +58,8 @@ public struct Transaction: Codable, Hashable {
   public let category: Category
   public let amount: Int // integer GBP pence, positive (outgoing)
   public let date: String // ISO 8601
-  public let provider: ProviderId
-  public let method: PaymentMethod
+  public let provider: String
+  public let method: String
   public let status: TransactionStatus
   public let note: String
 
@@ -81,8 +71,8 @@ public struct Transaction: Codable, Hashable {
     category: Category,
     amount: Int,
     date: String,
-    provider: ProviderId,
-    method: PaymentMethod,
+    provider: String,
+    method: String,
     status: TransactionStatus,
     note: String
   ) {
@@ -130,16 +120,16 @@ public struct BankState: Codable, Hashable {
 }
 
 public struct Provider: Codable, Hashable {
-  public let id: ProviderId
+  public let id: String
   public let name: String
   public let description: String
-  public let methods: [PaymentMethod]
+  public let methods: [String]
 
   public init(
-    id: ProviderId,
+    id: String,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [String]
   ) {
     self.id = id
     self.name = name
@@ -160,6 +150,111 @@ public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
   public let providers: [Provider]
+
+  public init(demoDate: String, recipients: [Recipient], providers: [Provider]) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+  }
+}
+
+/// One payable method from GET /catalog. The id is client-side; `methodId` is submitted unchanged.
+public struct PaymentMethodOption: Hashable, Identifiable {
+  public let id: String
+  public let methodId: String
+  public let providerId: String
+  public let providerName: String
+  public let displayLabel: String
+
+  public init(
+    id: String,
+    methodId: String,
+    providerId: String,
+    providerName: String,
+    displayLabel: String
+  ) {
+    self.id = id
+    self.methodId = methodId
+    self.providerId = providerId
+    self.providerName = providerName
+    self.displayLabel = displayLabel
+  }
+
+  public static func label(methodId: String, providerName: String) -> String {
+    "\(humanize(methodId)) · \(providerName)"
+  }
+
+  /// Present a method id without interpreting which provider it belongs to.
+  public static func humanize(_ methodId: String) -> String {
+    let separated = methodId
+      .replacingOccurrences(of: "_", with: " ")
+      .replacingOccurrences(of: "-", with: " ")
+    return separated.split(separator: " ").map { part in
+      guard let first = part.first else { return "" }
+      return String(first).uppercased() + part.dropFirst().lowercased()
+    }.joined(separator: " ")
+  }
+}
+
+extension CatalogResponse {
+  /// Flatten every configured provider method. Count follows the payload, not a fixed provider list.
+  public var paymentMethodOptions: [PaymentMethodOption] {
+    providers.flatMap { provider in
+      provider.methods.filter { !$0.isEmpty }.map { methodId in
+        PaymentMethodOption(
+          id: "\(provider.id)_\(methodId)",
+          methodId: methodId,
+          providerId: provider.id,
+          providerName: provider.name,
+          displayLabel: PaymentMethodOption.label(methodId: methodId, providerName: provider.name)
+        )
+      }
+    }
+  }
+
+  public func paymentOption(selectedId: String, allowFallback: Bool) -> PaymentMethodOption? {
+    if let match = paymentMethodOptions.first(where: { $0.id == selectedId }) {
+      return match
+    }
+    guard allowFallback else { return nil }
+    return paymentMethodOptions.first
+  }
+}
+
+public enum PaymentRouting {
+  /// Method id to submit for a selection the user already confirmed. Never substitutes another option.
+  public static func methodId(in catalog: CatalogResponse, selectedOptionId: String) -> String? {
+    catalog.paymentOption(selectedId: selectedOptionId, allowFallback: false)?.methodId
+  }
+
+  /// Keep the current selection when it is still offered. Otherwise use the first catalog option.
+  public static func selectionId(in catalog: CatalogResponse, current: String) -> String {
+    if catalog.paymentMethodOptions.contains(where: { $0.id == current }) {
+      return current
+    }
+    return catalog.paymentMethodOptions.first?.id ?? ""
+  }
+}
+
+/// In-memory catalog snapshot. A failed fetch may reuse it until the time-to-live elapses.
+public struct CatalogCache {
+  public var ttl: TimeInterval
+  public private(set) var cached: CatalogResponse?
+  public private(set) var fetchedAt: Date?
+
+  public init(ttl: TimeInterval = 60) {
+    self.ttl = ttl
+  }
+
+  public mutating func store(_ catalog: CatalogResponse, at now: Date) {
+    cached = catalog
+    fetchedAt = now
+  }
+
+  public func fallback(at now: Date) -> CatalogResponse? {
+    guard let cached, let fetchedAt, now.timeIntervalSince(fetchedAt) <= ttl else { return nil }
+    return cached
+  }
 }
 
 public struct PaymentResponse: Codable {
@@ -207,14 +302,14 @@ public struct AuditEvent: Codable {
 public struct PaymentRequest: Codable {
   public let recipientId: String
   public let amountMinor: Int
-  public let method: PaymentMethod
+  public let method: String
   public let note: String
   public let scenario: Scenario
 
   public init(
     recipientId: String,
     amountMinor: Int,
-    method: PaymentMethod,
+    method: String,
     note: String,
     scenario: Scenario
   ) {
