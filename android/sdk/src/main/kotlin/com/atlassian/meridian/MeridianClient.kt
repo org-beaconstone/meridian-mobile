@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
@@ -16,9 +17,31 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  configDrivenCatalog: Boolean = false,
+  catalogTtlMillis: Long = ProviderCatalog.DEFAULT_TTL_MILLIS,
+  clock: () -> Long = System::currentTimeMillis,
+  catalogMetrics: CatalogFetchMetrics = CatalogFetchMetrics(),
 ) {
-  private val mapper = ObjectMapper().registerKotlinModule()
+  val usesConfigDrivenCatalog: Boolean = configDrivenCatalog
+  val catalogMetrics: CatalogFetchMetrics = catalogMetrics
+
+  private val mapper = ObjectMapper().registerKotlinModule().apply {
+    // Match Swift JSONDecoder: additive catalog fields must not fail the picker.
+    disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+  }
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+  private val paymentLog = java.util.logging.Logger.getLogger("com.atlassian.meridian.payment")
+
+  @Volatile
+  private var lastCorrelationId: String? = null
+
+  private val catalogRepository = ProviderCatalogRepository(
+    configDriven = configDrivenCatalog,
+    ttlMillis = catalogTtlMillis,
+    clock = clock,
+    metrics = catalogMetrics,
+    correlationId = { lastCorrelationId },
+  )
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -64,6 +87,7 @@ class MeridianClient(
 
       // Read response
       val statusCode = connection.responseCode
+      lastCorrelationId = correlationIdOf(connection)
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
       } else {
@@ -122,16 +146,31 @@ class MeridianClient(
     request("GET", "/catalog", responseType = CatalogResponse::class.java)
 
   /**
+   * Payment methods for the picker.
+   * Flag off returns the hardcoded Adyen card / Worldpay bank pair and does not
+   * read the catalog. Flag on parses `GET /catalog`, serves a short-lived memory
+   * cache, and on failure or a malformed body returns the last known good list.
+   * This does not throw for catalog failures.
+   */
+  suspend fun paymentMethods(): List<PaymentMethodOption> {
+    if (usesConfigDrivenCatalog) lastCorrelationId = null
+    return catalogRepository.paymentMethods { getCatalog() }
+  }
+
+  /**
    * GET /state - Fetch current bank state
    */
   suspend fun getState(): BankState =
     request("GET", "/state", responseType = BankState::class.java)
 
   /**
-   * POST /payments - Submit a payment
+   * POST /payments - Submit a payment.
+   * [methodId] is `card` / `bank` (hardcoded picker) or `adyen_card` / `worldpay_bank`
+   * (catalog picker). The JSON method stays `card` or `bank`. The idempotency key
+   * is forwarded unchanged and is not regenerated here.
    * @param recipientId Recipient ID
    * @param amountMinor Amount in GBP pence (integer)
-   * @param method Payment method (card or bank)
+   * @param methodId Payment method id from the picker
    * @param note Optional note (max 200 chars)
    * @param scenario Simulation scenario
    * @param idempotencyKey Unique key for idempotency
@@ -139,15 +178,17 @@ class MeridianClient(
   suspend fun submitPayment(
     recipientId: String,
     amountMinor: Int,
-    method: PaymentMethod,
+    methodId: String,
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
   ): PaymentResponse {
+    val wireMethod = ProviderCatalog.wireMethod(methodId)
+    paymentLog.info("payment_submit methodId=${methodId.trim()} wireMethod=$wireMethod")
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
-      method = method.name,
+      method = wireMethod,
       note = note,
       scenario = scenario.name,
     )
@@ -190,4 +231,11 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  private fun correlationIdOf(connection: HttpURLConnection): String? {
+    val names = listOf("X-Correlation-Id", "X-Request-Id", "X-Correlation-ID")
+    return names.firstNotNullOfOrNull { name ->
+      connection.getHeaderField(name)?.takeIf { it.isNotBlank() }
+    }
+  }
 }
