@@ -10,9 +10,25 @@ public enum Category: String, Codable, Hashable, CaseIterable {
   case lifestyle = "Lifestyle"
 }
 
-public enum PaymentMethod: String, Codable, Hashable {
+public enum PaymentMethod: String, Codable, Hashable, Sendable {
   case card
   case bank
+}
+
+/// One selectable provider method. `id` is the config identity (for example `adyen_card`).
+/// `method` is the value still sent on `POST /payments` (`card` or `bank`).
+public struct PaymentMethodOption: Hashable, Sendable, Identifiable {
+  public let id: String
+  public let displayLabel: String
+  public let providerName: String
+  public let method: PaymentMethod
+
+  public init(id: String, displayLabel: String, providerName: String, method: PaymentMethod) {
+    self.id = id
+    self.displayLabel = displayLabel
+    self.providerName = providerName
+    self.method = method
+  }
 }
 
 public enum ProviderId: String, Codable, Hashable {
