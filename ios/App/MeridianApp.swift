@@ -42,7 +42,7 @@ import MeridianSDK
           }
           TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
+          // Hardcoded Adyen card / Worldpay bank picker. Config-driven options stay behind MeridianFeatures (default off).
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
