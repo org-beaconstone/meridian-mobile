@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.CancellationException
@@ -22,7 +23,7 @@ class MeridianClient(
   val paymentEventLog: PaymentEventLog = PaymentEventLog(),
   private val clock: () -> Long = System::currentTimeMillis,
 ) {
-  private val mapper = ObjectMapper().registerKotlinModule()
+  private val mapper = jsonMapper()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
   private val providerConfigCache = ProviderConfigCache(
     ttlMillis = clientConfig.providerConfigTtlMillis,
@@ -364,4 +365,15 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  companion object {
+    /**
+     * Unknown JSON fields are ignored so a catalog extension from meridian-api
+     * does not fail the payment flow before the contract is reconciled.
+     */
+    internal fun jsonMapper(): ObjectMapper =
+      ObjectMapper().registerKotlinModule().apply {
+        configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+      }
+  }
 }

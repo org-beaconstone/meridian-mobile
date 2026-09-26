@@ -104,7 +104,9 @@ class ProviderConfigTest {
       }
     """.trimIndent()
 
-    val options = ProviderCatalog.optionsFromCatalog(mapper.readValue(json, CatalogResponse::class.java))
+    val options = ProviderCatalog.optionsFromCatalog(
+      MeridianClient.jsonMapper().readValue(json, CatalogResponse::class.java),
+    )
     assertEquals(listOf("adyen_card", "worldpay_bank"), options.map { it.id })
     assertEquals("Adyen", options[0].providerName)
     assertEquals("Debit card", options[0].displayLabel)
