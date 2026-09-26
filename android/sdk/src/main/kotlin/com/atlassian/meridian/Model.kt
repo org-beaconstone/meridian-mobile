@@ -19,8 +19,38 @@ enum class Category(val displayName: String) {
   }
 }
 
+/**
+ * Wire value for POST /payments (`card` or `bank`).
+ * Config-driven selections use [PaymentMethodOption] ids and map back to this enum
+ * so the idempotency payload stays on the existing meridian-api contract.
+ */
 enum class PaymentMethod {
   card, bank
+}
+
+/**
+ * One selectable payment method resolved from GET /catalog.
+ * Only the two live baseline pairings are recognized: Adyen card and Worldpay bank.
+ */
+data class PaymentMethodOption(
+  val id: String,
+  val displayLabel: String,
+  val providerName: String,
+) : Serializable
+
+/**
+ * Android SDK feature flags. [configDrivenProviders] defaults off so the payment
+ * picker keeps today's hardcoded Adyen card and Worldpay bank list.
+ */
+data class MeridianClientConfig(
+  val configDrivenProviders: Boolean = false,
+  val providerConfigTtlMillis: Long = 30_000,
+  val providerConfigTimeoutMillis: Int = 3_000,
+) {
+  init {
+    require(providerConfigTtlMillis > 0) { "Provider config TTL must be positive" }
+    require(providerConfigTimeoutMillis > 0) { "Provider config timeout must be positive" }
+  }
 }
 
 enum class ProviderId {
@@ -146,7 +176,11 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class NetworkError(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
   class InvalidURL(msg: String = "Invalid URL") : MeridianError(msg)
   class DecodingError(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
-  class HttpError(val statusCode: Int, msg: String) : MeridianError("HTTP $statusCode: $msg")
+  class HttpError(
+    val statusCode: Int,
+    msg: String,
+    val correlationId: String? = null,
+  ) : MeridianError("HTTP $statusCode: $msg")
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
   class ValidationError(msg: String) : MeridianError(msg)
