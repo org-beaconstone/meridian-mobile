@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -81,10 +82,15 @@ data class Provider(
 
 // MARK: - API Response Types
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class HealthResponse(
   val status: String,
   val service: String,
   val simulation: Boolean,
+  val sessionState: String? = null,
+  val accountName: String? = null,
+  val deviceName: String? = null,
+  val expiresAtEpochMs: Long? = null,
 ) : Serializable
 
 data class CatalogResponse(

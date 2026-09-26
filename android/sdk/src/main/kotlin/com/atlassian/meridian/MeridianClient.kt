@@ -35,14 +35,15 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
+    timeoutMs: Int = 15_000,
   ): T = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
     val connection = url.openConnection() as HttpURLConnection
     try {
-      connection.connectTimeout = 15000
-      connection.readTimeout = 15000
+      connection.connectTimeout = timeoutMs
+      connection.readTimeout = timeoutMs
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
@@ -112,8 +113,26 @@ class MeridianClient(
   /**
    * GET /health - Check service health
    */
-  suspend fun getHealth(): HealthResponse =
-    request("GET", "/health", responseType = HealthResponse::class.java)
+  suspend fun getHealth(timeoutMs: Int = 15_000): HealthResponse =
+    request("GET", "/health", responseType = HealthResponse::class.java, timeoutMs = timeoutMs)
+
+  /**
+   * Resolve the rehearsal session already held by this client.
+   * Uses GET /health and X-Rehearsal-Session. A timeout or transport failure
+   * stays unconfirmed and does not switch payment provider.
+   */
+  suspend fun probeAuthSession(timeoutMs: Long = SESSION_CHECK_TIMEOUT_MS): AuthSession {
+    val budget = timeoutMs.coerceIn(1L, 15_000L)
+    return resolveAuthSession(sessionId = sessionId, timeoutMs = budget) {
+      val health = getHealth(timeoutMs = budget.toInt())
+      SessionSnapshot(
+        sessionState = health.sessionState,
+        accountName = health.accountName,
+        deviceName = health.deviceName,
+        expiresAtEpochMs = health.expiresAtEpochMs,
+      )
+    }
+  }
 
   /**
    * GET /catalog - Fetch recipients and providers
