@@ -23,7 +23,9 @@ swift run MeridianDesktop
 MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks
 ```
 
-Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, 20 executable SDK assertions, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated.
+Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, executable SDK assertions, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated.
+
+The iOS auth screen (`MeridianUI`) shows a session banner for the existing rehearsal session: a loading skeleton on open, a blocking sign-in prompt when that session is missing or expired, non-blocking expiring and signed-in-elsewhere notices, and a neutral message when the session check fails or times out. `swift run MeridianSDKChecks` covers those transitions, contrast, truncation, focus order, and phone-width rendering. No iOS simulator or device build was run for the banner.
 
 For an iOS project, install Xcode and XcodeGen, then `cd ios && xcodegen generate`. `project.yml` builds `App/MeridianApp.swift` with the local SDK package. No iOS simulator/device build was run on the authoring machine because full Xcode was unavailable. Local network HTTP is for the rehearsal only; use HTTPS for any shared hosted endpoint.
 
