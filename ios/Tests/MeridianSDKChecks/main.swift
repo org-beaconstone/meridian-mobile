@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,10 +341,14 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let banner = await runSessionBannerChecks()
+    passed += banner.passed
+    failed += banner.failed
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)")
+    print("Failed: \(failed)")
 
     if failed > 0 {
       exit(1)

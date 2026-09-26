@@ -20,3 +20,5 @@ targets:
     dependencies:
       - package: MeridianSDK
         product: MeridianSDK
+      - package: MeridianSDK
+        product: MeridianUI
