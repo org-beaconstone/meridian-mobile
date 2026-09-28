@@ -379,6 +379,16 @@ legend {
 .mobile-review > span {
   font-size: 12px;
 }
+.rate-lock {
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: #142c35;
+}
+.rate-lock.expired {
+  color: #ae2a19;
+}
 .mobile-success {
   text-align: center;
   padding: 15px 0;

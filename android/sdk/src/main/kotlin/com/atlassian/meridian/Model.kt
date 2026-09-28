@@ -31,6 +31,11 @@ enum class Scenario {
   success, declined, unavailable, pending
 }
 
+/** Account currency is always GBP. EUR selects a locked conversion for the recipient. */
+enum class PayCurrency {
+  GBP, EUR
+}
+
 enum class TransactionStatus {
   completed, declined, pending
 }
@@ -157,6 +162,12 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
 fun money(pence: Int): String {
   val pounds = pence / 100.0
   return "£%.2f".format(pounds)
+}
+
+fun moneyEur(cents: Int): String {
+  val negative = cents < 0
+  val absolute = kotlin.math.abs(cents)
+  return "${if (negative) "-" else ""}€${absolute / 100}.${"%02d".format(absolute % 100)}"
 }
 
 /**

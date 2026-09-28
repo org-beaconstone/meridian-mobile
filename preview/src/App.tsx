@@ -25,14 +25,40 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  INVALID_IBAN_MESSAGE,
+  QUOTE_EXPIRED_MESSAGE,
+  formatEur,
+  ibanBlockReason,
+  ibanRequired,
+  isGatewayTimeoutStatus,
+  lockQuote,
+  makeIdempotencyKey,
+  parseFxQuote,
+  remainingSeconds,
+  submissionBlockReason,
+  submitPaymentWithRetry,
+  type FxQuoteLock,
+  type PayCurrency,
+} from './domain/payment';
 class RequestError extends Error {
   constructor(
     message: string,
     public code: string,
+    public status = 0,
   ) {
     super(message);
   }
 }
+type ApiBody = {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  state?: unknown;
+  transaction?: Transaction;
+  recipients?: Recipient[];
+  paymentId?: string;
+};
 async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
   let response: Response;
   try {
@@ -52,9 +78,23 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
       'NETWORK_ERROR',
     );
   }
-  const data = await response.json();
-  if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+  const text = await response.text();
+  let data: ApiBody = {};
+  if (text) {
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (parsed && typeof parsed === 'object') data = parsed as ApiBody;
+    } catch {
+      data = { error: text };
+    }
+  }
+  if (response.status !== 202 && !response.ok) {
+    throw new RequestError(
+      data.error || `HTTP ${response.status}`,
+      data.code || 'HTTP_ERROR',
+      response.status,
+    );
+  }
   return data;
 }
 function bankState(value: unknown): State {
@@ -84,6 +124,11 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
+  const [currency, setCurrency] = useState<PayCurrency>('GBP');
+  const [iban, setIban] = useState('');
+  const [quote, setQuote] = useState<FxQuoteLock | null>(null);
+  const [quoteSeconds, setQuoteSeconds] = useState(0);
+  const [quoteBusy, setQuoteBusy] = useState(false);
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -93,7 +138,7 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef(makeIdempotencyKey());
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -116,7 +161,7 @@ export default function App() {
             !mutating.current
           ) {
             setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            setRecipients(catalog.recipients ?? []);
             setConnected(true);
           }
         }
@@ -135,6 +180,13 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
+  useEffect(() => {
+    if (!quote || step !== 'review') return;
+    const tick = () => setQuoteSeconds(remainingSeconds(quote, Date.now()));
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [quote, step]);
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
@@ -153,19 +205,71 @@ export default function App() {
       setBusy(false);
     }
   }
+  async function mutatePayment(amountMinor: number) {
+    if (mutating.current || !connected) throw new Error('Wait for API connection before submitting.');
+    const generation = epoch.current;
+    mutating.current = true;
+    setBusy(true);
+    revision.current++;
+    try {
+      const result = await submitPaymentWithRetry({
+        idempotencyKey: paymentKey.current,
+        method,
+        isGatewayTimeout: (error) => error instanceof RequestError && isGatewayTimeoutStatus(error.status),
+        send: (key, attemptMethod) =>
+          request(
+            room,
+            '/payments',
+            'POST',
+            { recipientId: recipient, amountMinor, method: attemptMethod, note, scenario },
+            key,
+          ),
+      });
+      if (generation !== epoch.current) throw new Error('Room changed');
+      if (result.state) setState(bankState(result.state));
+      return result;
+    } finally {
+      revision.current++;
+      mutating.current = false;
+      setBusy(false);
+    }
+  }
   function freshPayment() {
     setStep('details');
     setAmount('');
     setNote('');
+    setIban('');
+    setQuote(null);
     setError('');
     setReceipt(null);
-    paymentKey.current = crypto.randomUUID();
+    paymentKey.current = makeIdempotencyKey();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
-    paymentKey.current = crypto.randomUUID();
+    setQuote(null);
+    paymentKey.current = makeIdempotencyKey();
+  }
+  async function lockRate(minor: number, retainKey: boolean) {
+    setQuoteBusy(true);
+    setError('');
+    try {
+      const data = await request(room, '/fx/quote', 'POST', {
+        sourceCurrency: 'GBP',
+        targetCurrency: 'EUR',
+        amountMinor: minor,
+      });
+      const locked = lockQuote(parseFxQuote(data), Date.now());
+      if (!retainKey) paymentKey.current = makeIdempotencyKey();
+      setQuote(locked);
+      setQuoteSeconds(remainingSeconds(locked, Date.now()));
+      setStep('review');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not lock a conversion rate');
+    } finally {
+      setQuoteBusy(false);
+    }
   }
   function review() {
     const value = pence(amount);
@@ -177,20 +281,42 @@ export default function App() {
       setError('Insufficient balance');
       return;
     }
+    if (ibanBlockReason(currency, method, iban)) {
+      setError(INVALID_IBAN_MESSAGE);
+      return;
+    }
     setError('');
+    if (currency === 'EUR') {
+      void lockRate(value, false);
+      return;
+    }
+    paymentKey.current = makeIdempotencyKey();
+    setQuote(null);
     setStep('review');
   }
   async function confirm() {
+    const value = pence(amount);
+    if (value === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    const blocked = submissionBlockReason({
+      currency,
+      method,
+      iban,
+      quote,
+      amountMinor: value,
+      nowEpochMs: Date.now(),
+    });
+    if (blocked) {
+      setError(blocked);
+      return;
+    }
     try {
       setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
+      const result = await mutatePayment(value);
       if (result.ok) {
-        setReceipt(result.transaction);
+        setReceipt(result.transaction ?? null);
         setStep('done');
       } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
@@ -198,6 +324,18 @@ export default function App() {
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const reviewAmount = pence(amount);
+  const reviewBlock =
+    step === 'review' && reviewAmount !== null
+      ? submissionBlockReason({
+          currency,
+          method,
+          iban,
+          quote,
+          amountMinor: reviewAmount,
+          nowEpochMs: Date.now(),
+        })
+      : null;
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -328,6 +466,34 @@ export default function App() {
                         onChange={(e) => setAmount(e.target.value)}
                         placeholder="0.00"
                       />
+                      {currency === 'EUR' && (
+                        <p>GBP amount to convert. The account is debited in pence.</p>
+                      )}
+                      <label htmlFor="mobile-currency">Currency</label>
+                      <select
+                        id="mobile-currency"
+                        value={currency}
+                        onChange={(e) => {
+                          setCurrency(e.target.value as PayCurrency);
+                          setQuote(null);
+                        }}
+                      >
+                        <option value="GBP">GBP · no conversion</option>
+                        <option value="EUR">EUR · convert from GBP</option>
+                      </select>
+                      {ibanRequired(currency, method) && (
+                        <>
+                          <label htmlFor="mobile-iban">Recipient IBAN</label>
+                          <input
+                            id="mobile-iban"
+                            value={iban}
+                            autoCapitalize="characters"
+                            spellCheck={false}
+                            onChange={(e) => setIban(e.target.value)}
+                            placeholder="GB00XXXX00000000000000"
+                          />
+                        </>
+                      )}
                       <label htmlFor="mobile-note">Reference</label>
                       <input
                         id="mobile-note"
@@ -358,8 +524,8 @@ export default function App() {
                           </label>
                         ))}
                       </fieldset>
-                      <button className="primary" disabled={!connected || busy} type="submit">
-                        Review payment
+                      <button className="primary" disabled={!connected || busy || quoteBusy} type="submit">
+                        {quoteBusy ? 'Locking rate…' : 'Review payment'}
                       </button>
                     </form>
                   )}
@@ -372,11 +538,45 @@ export default function App() {
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
                         </p>
+                        {currency === 'EUR' && quote && (
+                          <p
+                            className={quoteSeconds === 0 ? 'rate-lock expired' : 'rate-lock'}
+                            data-testid="quote-countdown"
+                            role={quoteSeconds === 0 ? 'alert' : 'timer'}
+                          >
+                            {quoteSeconds === 0
+                              ? QUOTE_EXPIRED_MESSAGE
+                              : `Rate locked for ${quoteSeconds}s · Recipient gets ${formatEur(quote.targetAmountMinor)} at ${quote.rate}`}
+                          </p>
+                        )}
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      {reviewBlock && !(currency === 'EUR' && quote && quoteSeconds === 0) && (
+                        <div role="alert" className="error-message">
+                          {reviewBlock}
+                        </div>
+                      )}
+                      <button
+                        className="primary"
+                        data-testid="confirm-payment"
+                        onClick={confirm}
+                        disabled={busy || quoteBusy || !connected || reviewBlock !== null}
+                      >
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
-                      <button className="secondary" disabled={busy} onClick={editPayment}>
+                      {currency === 'EUR' && (
+                        <button
+                          className="secondary"
+                          data-testid="refresh-rate"
+                          disabled={busy || quoteBusy || !connected}
+                          onClick={() => {
+                            const value = pence(amount);
+                            if (value !== null) void lockRate(value, true);
+                          }}
+                        >
+                          Refresh conversion rate
+                        </button>
+                      )}
+                      <button className="secondary" disabled={busy || quoteBusy} onClick={editPayment}>
                         Back to details
                       </button>
                     </>

@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
@@ -177,6 +178,24 @@ class MeridianClient(
       payload,
       responseType = BudgetResponse::class.java,
     )
+  }
+
+  /**
+   * POST /fx/quote - Lock a GBP to EUR conversion. The caller enforces the 60-second review countdown.
+   */
+  suspend fun requestFxQuote(amountMinor: Int): FxQuote {
+    val payload = mapOf(
+      "sourceCurrency" to "GBP",
+      "targetCurrency" to "EUR",
+      "amountMinor" to amountMinor,
+    )
+    val node = request(
+      "POST",
+      "/fx/quote",
+      payload,
+      responseType = JsonNode::class.java,
+    )
+    return fxQuoteFromJson(node)
   }
 
   /**
