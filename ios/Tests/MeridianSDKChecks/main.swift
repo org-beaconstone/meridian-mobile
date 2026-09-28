@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,10 +341,156 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    func check(_ name: String, _ ok: Bool) {
+      print("\(passed + failed + 1). \(name)...")
+      if ok {
+        print("  ✓ \(name)")
+        passed += 1
+      } else {
+        print("  ✗ \(name)")
+        failed += 1
+      }
+    }
+
+    check("IBAN MOD-97 accepts GB and spaced DE and FR", 
+      isValidIban("GB82WEST12345698765432")
+        && isValidIban("GB82 WEST 1234 5698 7654 32")
+        && isValidIban("de89 3704 0044 0532 0130 00")
+        && isValidIban("FR1420041010050500013M02606"))
+    check("IBAN MOD-97 rejects bad checksum and shape",
+      !isValidIban("GB82WEST12345698765433")
+        && !isValidIban("DE89370400440532013001")
+        && !isValidIban("")
+        && !isValidIban("GB82"))
+    let generated = makeIdempotencyKey()
+    check("idempotency key is UUID v4", isUuidV4(generated) && !isUuidV4("not-a-uuid") && !isUuidV4("aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee"))
+    check("retained key is not regenerated", nextIdempotencyKey(current: generated, retain: true) == generated)
+
+    let lockedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let quote = FxQuote(
+      quoteId: "q-1",
+      sourceAmountMinor: 1000,
+      targetAmountMinor: 1170,
+      rate: "1.1700",
+      serverExpiresAt: nil
+    )
+    let lock = lockQuote(quote, lockedAt: lockedAt)
+    check("quote countdown starts at 60 seconds", lock.remainingSeconds(at: lockedAt) == 60 && !lock.isExpired(at: lockedAt))
+    let expiredAt = lockedAt.addingTimeInterval(60)
+    check("quote expires at 60 seconds", lock.remainingSeconds(at: expiredAt) == 0 && lock.isExpired(at: expiredAt))
+    let sooner = FxQuote(
+      quoteId: "q-2",
+      sourceAmountMinor: 1000,
+      targetAmountMinor: 1170,
+      rate: "1.1700",
+      serverExpiresAt: lockedAt.addingTimeInterval(15)
+    )
+    let shortLock = lockQuote(sooner, lockedAt: lockedAt)
+    check("server expiry shorter than 60 seconds wins", shortLock.expiresAt == lockedAt.addingTimeInterval(15))
+
+    let fresh = submissionBlockReason(currency: .eur, method: .bank, iban: "GB82WEST12345698765432", quote: lock, amountMinor: 1000, now: lockedAt)
+    check("fresh EUR quote can be confirmed", fresh == nil)
+    let blocked = submissionBlockReason(currency: .eur, method: .bank, iban: "GB82WEST12345698765432", quote: lock, amountMinor: 1000, now: expiredAt)
+    check("expired quote blocks confirmation", blocked == quoteExpiredMessage)
+    let badIban = submissionBlockReason(currency: .gbp, method: .bank, iban: "GB82WEST12345698765433", quote: nil, amountMinor: 1000, now: lockedAt)
+    check("invalid IBAN blocks submission", badIban == invalidIbanMessage)
+    let domestic = submissionBlockReason(currency: .gbp, method: .card, iban: "", quote: nil, amountMinor: 1000, now: lockedAt)
+    check("GBP card does not require an IBAN", domestic == nil)
+
+    let quoteJson = """
+    {"quoteId":"q-9","amountMinor":2500,"targetAmountMinor":2925,"rate":"1.1700","expiresInSeconds":60}
+    """.data(using: .utf8)!
+    let decoded = try? JSONDecoder().decode(FxQuote.self, from: quoteJson)
+    check("FX quote JSON decodes", decoded?.quoteId == "q-9" && decoded?.sourceAmountMinor == 2500 && decoded?.targetAmountMinor == 2925)
+
+    struct Attempt {
+      let key: String
+      let method: PaymentMethod
+    }
+    final class RetryProbe: @unchecked Sendable {
+      var attempts: [Attempt] = []
+      var delays: [Int] = []
+      var calls = 0
+    }
+    let probe = RetryProbe()
+    let paymentKey = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    let retried = try? await submitPaymentWithRetry(
+      idempotencyKey: paymentKey,
+      method: .bank,
+      sleepMilliseconds: { milliseconds in probe.delays.append(milliseconds) }
+    ) { attemptKey, attemptMethod in
+      probe.calls += 1
+      probe.attempts.append(Attempt(key: attemptKey, method: attemptMethod))
+      if probe.calls < 3 {
+        throw MeridianError.httpError(statusCode: probe.calls == 1 ? 502 : 504, message: "gateway")
+      }
+      return PaymentResponse(ok: true, state: nil, transaction: nil, error: nil, code: nil, paymentId: "pay-1")
+    }
+    let sameKey = probe.attempts.allSatisfy { $0.key == paymentKey && $0.method == .bank }
+    check(
+      "502 and 504 retry the same key and method",
+      retried?.ok == true && probe.attempts.count == 3 && sameKey && probe.delays == [200, 400]
+    )
+
+    let rejected = RetryProbe()
+    do {
+      _ = try await submitPaymentWithRetry(
+        idempotencyKey: paymentKey,
+        method: .card,
+        sleepMilliseconds: { _ in rejected.delays.append(1) }
+      ) { _, _ in
+        rejected.calls += 1
+        throw MeridianError.httpError(statusCode: 400, message: "bad request")
+      }
+      check("HTTP 400 is not retried", false)
+    } catch {
+      check("HTTP 400 is not retried", rejected.calls == 1 && rejected.delays.isEmpty)
+    }
+
+    let unavailable = RetryProbe()
+    do {
+      _ = try await submitPaymentWithRetry(
+        idempotencyKey: paymentKey,
+        method: .card,
+        sleepMilliseconds: { _ in unavailable.delays.append(1) }
+      ) { _, _ in
+        unavailable.calls += 1
+        throw MeridianError.httpError(statusCode: 503, message: "unavailable")
+      }
+      check("HTTP 503 does not switch provider or retry", false)
+    } catch {
+      check("HTTP 503 does not switch provider or retry", unavailable.calls == 1 && unavailable.delays.isEmpty)
+    }
+
+    let exhausted = RetryProbe()
+    do {
+      _ = try await submitPaymentWithRetry(
+        idempotencyKey: paymentKey,
+        method: .bank,
+        sleepMilliseconds: { milliseconds in exhausted.delays.append(milliseconds) }
+      ) { _, attemptMethod in
+        exhausted.calls += 1
+        if attemptMethod != .bank { throw MeridianError.validationError("provider changed") }
+        throw MeridianError.httpError(statusCode: 502, message: "gateway")
+      }
+      check("gateway retries stop after 3 attempts", false)
+    } catch let error as MeridianError {
+      if case .httpError(let statusCode, _) = error {
+        check("gateway retries stop after 3 attempts", statusCode == 502 && exhausted.calls == 3 && exhausted.delays == [200, 400])
+      } else {
+        check("gateway retries stop after 3 attempts", false)
+      }
+    } catch {
+      check("gateway retries stop after 3 attempts", false)
+    }
+
+    check("backoff schedule is exponential", gatewayBackoffMilliseconds(afterFailure: 1) == 200 && gatewayBackoffMilliseconds(afterFailure: 2) == 400 && gatewayBackoffMilliseconds(afterFailure: 3) == 800)
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

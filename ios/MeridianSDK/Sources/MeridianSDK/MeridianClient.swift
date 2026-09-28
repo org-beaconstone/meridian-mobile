@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -151,6 +154,16 @@ public actor MeridianClient {
       path: "/budgets",
       body: payload
     )
+  }
+
+  /// POST /fx/quote - Lock a GBP→EUR conversion. The caller enforces the 60-second review countdown.
+  public func requestFxQuote(amountMinor: Int) async throws -> FxQuote {
+    let payload = FxQuoteRequest(
+      sourceCurrency: "GBP",
+      targetCurrency: "EUR",
+      amountMinor: amountMinor
+    )
+    return try await request(method: "POST", path: "/fx/quote", body: payload)
   }
 
   /// POST /reset - Reset session state

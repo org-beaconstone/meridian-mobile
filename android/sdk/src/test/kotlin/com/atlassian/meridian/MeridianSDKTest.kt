@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
+import java.nio.charset.StandardCharsets
 
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
@@ -370,6 +371,195 @@ class MeridianSDKTest {
 
       // Verify only one idempotency key was used
       assertEquals(1, seenKeys.size)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testIbanMod97() {
+    assertTrue(isValidIban("GB82WEST12345698765432"))
+    assertTrue(isValidIban("GB82 WEST 1234 5698 7654 32"))
+    assertTrue(isValidIban("de89 3704 0044 0532 0130 00"))
+    assertTrue(isValidIban("FR1420041010050500013M02606"))
+    assertFalse(isValidIban("GB82WEST12345698765433"))
+    assertFalse(isValidIban("DE89370400440532013001"))
+    assertFalse(isValidIban(""))
+    assertFalse(isValidIban("GB82"))
+  }
+
+  @Test
+  fun testUuidV4IdempotencyKey() {
+    val key = makeIdempotencyKey()
+    assertTrue(isUuidV4(key))
+    assertFalse(isUuidV4("not-a-uuid"))
+    assertFalse(isUuidV4("aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee"))
+    assertEquals(key, nextIdempotencyKey(key, retain = true))
+    assertNotEquals(key, nextIdempotencyKey(key, retain = false))
+  }
+
+  @Test
+  fun testQuoteLockCountdown() {
+    val lockedAt = 1_700_000_000_000L
+    val quote = FxQuote("q-1", "GBP", "EUR", 1000, 1170, "1.1700", 60, null)
+    val lock = lockQuote(quote, lockedAt)
+    assertEquals(60, lock.remainingSeconds(lockedAt))
+    assertFalse(lock.isExpired(lockedAt))
+    assertEquals(0, lock.remainingSeconds(lockedAt + 60_000))
+    assertTrue(lock.isExpired(lockedAt + 60_000))
+    val shorter = lockQuote(quote.copy(serverExpiresAtEpochMs = lockedAt + 15_000), lockedAt)
+    assertEquals(lockedAt + 15_000, shorter.expiresAtEpochMs)
+    assertEquals(15, shorter.remainingSeconds(lockedAt))
+  }
+
+  @Test
+  fun testSubmissionGate() {
+    val lockedAt = 1_700_000_000_000L
+    val lock = lockQuote(FxQuote("q-1", "GBP", "EUR", 1000, 1170, "1.1700", 60, null), lockedAt)
+    assertNull(
+      submissionBlockReason(PayCurrency.EUR, PaymentMethod.bank, "GB82WEST12345698765432", lock, 1000, lockedAt)
+    )
+    assertEquals(
+      QUOTE_EXPIRED_MESSAGE,
+      submissionBlockReason(PayCurrency.EUR, PaymentMethod.bank, "GB82WEST12345698765432", lock, 1000, lockedAt + 60_000)
+    )
+    assertEquals(
+      INVALID_IBAN_MESSAGE,
+      submissionBlockReason(PayCurrency.GBP, PaymentMethod.bank, "GB82WEST12345698765433", null, 1000, lockedAt)
+    )
+    assertNull(submissionBlockReason(PayCurrency.GBP, PaymentMethod.card, "", null, 1000, lockedAt))
+    assertEquals(
+      QUOTE_EXPIRED_MESSAGE,
+      submissionBlockReason(PayCurrency.EUR, PaymentMethod.card, "GB82WEST12345698765432", lock, 999, lockedAt)
+    )
+  }
+
+  @Test
+  fun testFxQuoteJson() {
+    val node = mapper.readTree(
+      """{"quoteId":"q-9","amountMinor":2500,"targetAmountMinor":2925,"rate":1.17,"expiresInSeconds":60,"expiresAt":"2026-09-28T12:00:00Z"}"""
+    )
+    val quote = fxQuoteFromJson(node)
+    assertEquals("q-9", quote.quoteId)
+    assertEquals(2500, quote.sourceAmountMinor)
+    assertEquals(2925, quote.targetAmountMinor)
+    assertEquals("1.17", quote.rate)
+    assertNotNull(quote.serverExpiresAtEpochMs)
+  }
+
+  @Test
+  fun testGatewayRetryKeepsKeyAndMethod() = runBlocking {
+    val keys = mutableListOf<String>()
+    val methods = mutableListOf<PaymentMethod>()
+    val delays = mutableListOf<Long>()
+    var calls = 0
+    val key = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    val result = submitPaymentWithRetry(key, PaymentMethod.bank, sleep = { delays += it }) { attemptKey, attemptMethod ->
+      calls += 1
+      keys += attemptKey
+      methods += attemptMethod
+      if (calls < 3) throw MeridianError.HttpError(if (calls == 1) 502 else 504, "gateway")
+      PaymentResponse(ok = true, paymentId = "pay-1")
+    }
+    assertTrue(result.ok)
+    assertEquals(listOf(key, key, key), keys)
+    assertEquals(listOf(PaymentMethod.bank, PaymentMethod.bank, PaymentMethod.bank), methods)
+    assertEquals(listOf(200L, 400L), delays)
+  }
+
+  @Test
+  fun testNonGatewayStatusesDoNotRetry() = runBlocking {
+    for (status in listOf(400, 409, 422, 503)) {
+      var calls = 0
+      val delays = mutableListOf<Long>()
+      try {
+        submitPaymentWithRetry("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", PaymentMethod.card, sleep = { delays += it }) { _, _ ->
+          calls += 1
+          throw MeridianError.HttpError(status, "stop")
+        }
+        fail("expected HTTP $status")
+      } catch (error: MeridianError.HttpError) {
+        assertEquals(status, error.statusCode)
+        assertEquals(1, calls)
+        assertTrue(delays.isEmpty())
+      }
+    }
+  }
+
+  @Test
+  fun testGatewayRetriesStopAfterThreeAttempts() = runBlocking {
+    var calls = 0
+    val delays = mutableListOf<Long>()
+    try {
+      submitPaymentWithRetry("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", PaymentMethod.bank, sleep = { delays += it }) { _, method ->
+        calls += 1
+        check(method == PaymentMethod.bank)
+        throw MeridianError.HttpError(502, "gateway")
+      }
+      fail("expected exhausted gateway")
+    } catch (error: MeridianError.HttpError) {
+      assertEquals(502, error.statusCode)
+      assertEquals(3, calls)
+      assertEquals(listOf(200L, 400L), delays)
+    }
+    assertEquals(200L, gatewayBackoffMilliseconds(1))
+    assertEquals(400L, gatewayBackoffMilliseconds(2))
+    assertEquals(800L, gatewayBackoffMilliseconds(3))
+  }
+
+  @Test
+  fun testOrchestratorRetriesSameKeyOverHttp() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    val baseUrl = "http://127.0.0.1:$port/api/v1"
+    val keys = mutableListOf<String>()
+    val sessions = mutableListOf<String>()
+    val methods = mutableListOf<String>()
+    var hits = 0
+    server.createContext("/api/v1/payments") { exchange ->
+      hits += 1
+      keys += exchange.requestHeaders.getFirst("Idempotency-Key")
+      sessions += exchange.requestHeaders.getFirst("X-Rehearsal-Session")
+      val body = String(exchange.requestBody.readBytes(), StandardCharsets.UTF_8)
+      methods += Regex("\"method\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.get(1) ?: ""
+      val status = if (hits < 3) 502 else 200
+      val responseBody = if (hits < 3) "bad gateway" else """{"ok":true,"paymentId":"tx-9"}"""
+      exchange.sendResponseHeaders(status, responseBody.toByteArray(StandardCharsets.UTF_8).size.toLong())
+      exchange.responseBody.write(responseBody.toByteArray(StandardCharsets.UTF_8))
+      exchange.close()
+    }
+    server.createContext("/api/v1/fx/quote") { exchange ->
+      assertEquals("POST", exchange.requestMethod)
+      assertEquals("quote-room", exchange.requestHeaders.getFirst("X-Rehearsal-Session"))
+      val responseBody = """{"quoteId":"q1","amountMinor":1000,"targetAmountMinor":1170,"rate":"1.1700","sourceCurrency":"GBP","targetCurrency":"EUR","expiresInSeconds":60}"""
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, responseBody.toByteArray(StandardCharsets.UTF_8).size.toLong())
+      exchange.responseBody.write(responseBody.toByteArray(StandardCharsets.UTF_8))
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient(baseUrl, "quote-room")
+      val key = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+      val response = runBlocking {
+        submitPaymentWithRetry(key, PaymentMethod.bank, sleep = {}) { attemptKey, attemptMethod ->
+          client.submitPayment(
+            recipientId = "rec-1",
+            amountMinor = 1000,
+            method = attemptMethod,
+            idempotencyKey = attemptKey,
+          )
+        }
+      }
+      assertTrue(response.ok)
+      assertEquals(3, hits)
+      assertEquals(listOf(key, key, key), keys)
+      assertEquals(listOf("quote-room", "quote-room", "quote-room"), sessions)
+      assertEquals(listOf("bank", "bank", "bank"), methods)
+      val quote = runBlocking { client.requestFxQuote(1000) }
+      assertEquals("q1", quote.quoteId)
+      assertEquals(1170, quote.targetAmountMinor)
+      assertEquals("1.1700", quote.rate)
     } finally {
       server.stop(0)
     }
