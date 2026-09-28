@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +341,220 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let catalogResult = await runCatalogChecks()
+    passed += catalogResult.passed
+    failed += catalogResult.failed
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+}
+
+private struct CatalogCheckResult {
+  var passed = 0
+  var failed = 0
+
+  mutating func expect(_ name: String, _ condition: Bool) {
+    if condition {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+}
+
+private final class CatalogHTTPStub: URLProtocol, @unchecked Sendable {
+  static let lock = NSLock()
+  static var handler: ((URLRequest) throws -> (Int, Data))?
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    Self.lock.lock()
+    let handler = Self.handler
+    Self.lock.unlock()
+    guard let handler, let url = request.url else {
+      client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+      return
+    }
+    do {
+      let (status, body) = try handler(request)
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: status,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "application/json"]
+      )!
+      client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+      client?.urlProtocol(self, didLoad: body)
+      client?.urlProtocolDidFinishLoading(self)
+    } catch {
+      client?.urlProtocol(self, didFailWithError: error)
+    }
+  }
+  override func stopLoading() {}
+}
+
+private final class CatalogClock: @unchecked Sendable {
+  var date: Date
+  init(_ date: Date) { self.date = date }
+  func now() -> Date { date }
+}
+
+private func catalogJSON(providers: String, corridors: String = #"[{"id":"gb-domestic","source":"GB","destination":"GB","currency":"GBP"},{"id":"closed","source":"GB","destination":"GB","currency":"GBP","available":false}]"#) -> Data {
+  let json = """
+  {
+    "demoDate": "saved",
+    "recipients": [
+      {"id":"northline-studio","name":"Northline Studio","initials":"NS","detail":"Design","category":"Shopping","color":"#111111"}
+    ],
+    "providers": \(providers),
+    "corridors": \(corridors)
+  }
+  """
+  return Data(json.utf8)
+}
+
+private let baselineProviders = #"""
+[{"id":"adyen","name":"Adyen","description":"Card payment processor","methods":["card"]},{"id":"worldpay","name":"Worldpay","description":"Bank payment processor","methods":["bank"]}]
+"""#
+
+private final class CatalogScript: @unchecked Sendable {
+  var status = 200
+  var body = catalogJSON(providers: baselineProviders)
+  var hits = 0
+}
+
+private func runCatalogChecks() async -> CatalogCheckResult {
+  var result = CatalogCheckResult()
+  print("21. Catalog cache, fallback, and baseline providers...")
+  let clock = CatalogClock(Date(timeIntervalSince1970: 10))
+  let store = MemoryCatalogStore()
+  let script = CatalogScript()
+  CatalogHTTPStub.handler = { request in
+    script.hits += 1
+    if request.value(forHTTPHeaderField: "X-Rehearsal-Session") == nil {
+      throw URLError(.userAuthenticationRequired)
+    }
+    return (script.status, script.body)
+  }
+  URLProtocol.registerClass(CatalogHTTPStub.self)
+  let configuration = URLSessionConfiguration.ephemeral
+  configuration.protocolClasses = [CatalogHTTPStub.self]
+  let session = URLSession(configuration: configuration)
+  do {
+    let client = try MeridianClient(
+      baseURL: "http://catalog.test/api/v1",
+      sessionId: "room-a",
+      urlSession: session,
+      catalogStore: store,
+      catalogTtl: 1,
+      now: { clock.now() }
+    )
+    let first = try await client.getCatalog()
+    result.expect("catalog decodes both baseline providers", first.providers.map(\.id) == ["adyen", "worldpay"])
+    result.expect("catalog decodes recipients", first.recipients.map(\.id) == ["northline-studio"])
+    result.expect("unavailable corridors are hidden", first.corridors.map(\.id) == ["gb-domestic"])
+    let firstWasFallback = await client.catalogUsingFallback
+    result.expect("fresh catalog is not a fallback", firstWasFallback == false)
+    let cached = try await client.getCatalog()
+    result.expect("fresh cache skips the network", script.hits == 1 && cached.providers.map(\.id) == ["adyen", "worldpay"])
+
+    clock.date = clock.date.addingTimeInterval(5)
+    script.status = 502
+    script.body = Data(#"{"error":"bad gateway"}"#.utf8)
+    let gateway = try await client.getCatalog()
+    let gatewayWasFallback = await client.catalogUsingFallback
+    result.expect("HTTP 502 reuses the saved catalog", gateway.recipients.map(\.id) == ["northline-studio"] && gatewayWasFallback)
+
+    script.status = 500
+    let internalError = try await client.getCatalog()
+    result.expect("HTTP 500 reuses the saved catalog", internalError.providers.map(\.id) == ["adyen", "worldpay"])
+
+    script.status = 504
+    let timeout = try await client.getCatalog()
+    result.expect("HTTP 504 keeps Adyen card and Worldpay bank", timeout.activeBaselineMethods() == Set([PaymentMethod.card, PaymentMethod.bank]))
+
+    script.status = 200
+    script.body = catalogJSON(providers: #"[{"id":"adyen","name":"Adyen","description":"Card payment processor","methods":["card"],"available":false},{"id":"worldpay","name":"Worldpay","description":"Bank payment processor","methods":["bank"]}]"#)
+    let hidden = try await client.getCatalog()
+    result.expect("unavailable Adyen is hidden", hidden.providers.map(\.id) == ["worldpay"] && hidden.activeBaselineMethods() == Set([PaymentMethod.bank]))
+
+    clock.date = clock.date.addingTimeInterval(5)
+    script.body = catalogJSON(providers: #"[{"id":"adyen","name":"Adyen","description":"Card payment processor","methods":["card"]},{"id":"unknown","name":"Unknown","description":"Unrecognized","methods":["card"]}]"#)
+    let rejected = try await client.getCatalog()
+    let saved = store.read(cacheKey: "http://catalog.test/api/v1\nroom-a")
+    result.expect(
+      "unrecognized provider falls back",
+      rejected.providers.map(\.id) == ["worldpay"] && saved?.catalog.providers.contains { $0.id == "unknown" } == false
+    )
+
+    script.status = 400
+    script.body = Data(#"{"error":"bad request"}"#.utf8)
+    clock.date = clock.date.addingTimeInterval(5)
+    var threw400 = false
+    do {
+      _ = try await client.getCatalog()
+    } catch let error as MeridianError {
+      if case let .httpError(code, _) = error, code == 400 { threw400 = true }
+    }
+    result.expect("HTTP 400 is not treated as a catalog", threw400)
+
+    let other = try MeridianClient(
+      baseURL: "http://catalog.test/api/v1",
+      sessionId: "room-b",
+      urlSession: session,
+      catalogStore: store,
+      catalogTtl: 1,
+      now: { clock.now() }
+    )
+    script.status = 504
+    let isolated = try await other.getCatalog()
+    result.expect("sessions do not share catalogs", isolated.recipients.isEmpty && isolated.providers.map(\.id) == ["adyen", "worldpay"])
+
+    script.status = 200
+    script.body = catalogJSON(providers: baselineProviders)
+    CatalogHTTPStub.handler = { _ in throw URLError(.notConnectedToInternet) }
+    clock.date = clock.date.addingTimeInterval(5)
+    let offline = try await client.getCatalog()
+    let offlineWasFallback = await client.catalogUsingFallback
+    result.expect("offline load reuses the saved catalog", offline.recipients.map(\.id) == ["northline-studio"] && offlineWasFallback)
+  } catch {
+    print("  ✗ catalog checks threw \(error)")
+    result.failed += 1
+  }
+
+  print("22. Encrypted catalog storage...")
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent("meridian-catalog-\(UUID().uuidString)", isDirectory: true)
+  do {
+    let encrypted = try EncryptedFileCatalogStore(directory: directory)
+    try encrypted.write(cacheKey: "room-secret", entry: CachedCatalog(catalog: baselineCatalog(), fetchedAtEpochMs: 42))
+    let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+    let blobURL = files.first { $0.lastPathComponent.hasSuffix(".catalog") }
+    let blob = try Data(contentsOf: blobURL!)
+    let text = String(decoding: blob, as: UTF8.self)
+    let isJsonObject = !blob.isEmpty && blob[0] == UInt8(ascii: "{")
+    result.expect("catalog file is not plaintext", !text.contains("worldpay") && !text.contains("adyen") && !isJsonObject)
+    let reopened = try EncryptedFileCatalogStore(directory: directory)
+    let loaded = reopened.read(cacheKey: "room-secret")
+    result.expect(
+      "encrypted catalog round-trips",
+      loaded?.fetchedAtEpochMs == 42 && loaded?.catalog.providers.map(\.id) == ["adyen", "worldpay"]
+    )
+    result.expect("other cache keys stay empty", reopened.read(cacheKey: "other") == nil)
+  } catch {
+    print("  ✗ encrypted catalog checks threw \(error)")
+    result.failed += 1
+  }
+  try? FileManager.default.removeItem(at: directory)
+  return result
 }

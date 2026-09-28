@@ -4,16 +4,32 @@ public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let injectedStore: (any CatalogStore)?
+  private let catalogTtl: TimeInterval
+  private let now: @Sendable () -> Date
+  private var resolvedStore: (any CatalogStore)?
+  private var catalogClient: CatalogClient?
+
+  /// True when the last catalog load reused a saved snapshot or the compiled-in baseline.
+  public var catalogUsingFallback: Bool {
+    catalogClient?.usingFallback ?? false
+  }
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - catalogStore: Encrypted or in-memory catalog cache. Defaults to an encrypted file cache.
+  ///   - catalogTtl: How long a saved catalog stays fresh before the next refresh.
+  ///   - now: Clock used for catalog expiry. Tests can inject a fixed time.
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    catalogStore: (any CatalogStore)? = nil,
+    catalogTtl: TimeInterval = defaultCatalogTtl,
+    now: @escaping @Sendable () -> Date = { Date() }
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -33,9 +49,37 @@ public actor MeridianClient {
       throw MeridianError.invalidURL
     }
 
+    guard catalogTtl >= 0 else {
+      throw MeridianError.validationError("Catalog TTL must be zero or positive")
+    }
+
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.injectedStore = catalogStore
+    self.catalogTtl = catalogTtl
+    self.now = now
+  }
+
+  private func catalogs() throws -> CatalogClient {
+    if let catalogClient { return catalogClient }
+    let store: any CatalogStore
+    if let resolvedStore {
+      store = resolvedStore
+    } else if let injectedStore {
+      store = injectedStore
+    } else {
+      store = try EncryptedFileCatalogStore(directory: EncryptedFileCatalogStore.defaultDirectory())
+    }
+    resolvedStore = store
+    let client = CatalogClient(
+      cacheKey: baseURL.absoluteString + "\n" + sessionId,
+      store: store,
+      ttl: catalogTtl,
+      now: now
+    )
+    catalogClient = client
+    return client
   }
 
   // MARK: - Internal Request Method
@@ -64,7 +108,15 @@ public actor MeridianClient {
       request.httpBody = try encoder.encode(body)
     }
 
-    let (data, response) = try await session.data(for: request)
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await session.data(for: request)
+    } catch let error as MeridianError {
+      throw error
+    } catch {
+      throw MeridianError.networkError(error.localizedDescription)
+    }
 
     guard let httpResponse = response as? HTTPURLResponse else {
       throw MeridianError.networkError("Invalid response type")
@@ -84,7 +136,11 @@ public actor MeridianClient {
     do {
       return try decoder.decode(T.self, from: data)
     } catch {
-      throw MeridianError.decodingError(error.localizedDescription)
+      if httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 {
+        throw MeridianError.decodingError(error.localizedDescription)
+      }
+      let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw MeridianError.httpError(statusCode: httpResponse.statusCode, message: errorMsg)
     }
   }
 
@@ -95,9 +151,25 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
-  /// GET /catalog - Fetch recipients and providers
+  /// GET /catalog - Fetch recipients, providers, and corridors.
+  /// A fresh cached copy is reused until the TTL expires. Gateway failures,
+  /// offline errors, and unrecognized provider ids return the last accepted catalog.
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    let client = try catalogs()
+    if let cached = client.freshCachedCatalog() {
+      return cached
+    }
+    do {
+      let fresh: CatalogResponse = try await request(method: "GET", path: "/catalog")
+      return try client.accept(fresh)
+    } catch let error as MeridianError {
+      if shouldFallbackCatalog(error) {
+        return client.fallback()
+      }
+      throw error
+    } catch {
+      return client.fallback()
+    }
   }
 
   /// GET /state - Fetch current bank state

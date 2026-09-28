@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -37,6 +38,7 @@ enum class TransactionStatus {
 
 // MARK: - Models
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class Recipient(
   val id: String,
   val name: String,
@@ -72,11 +74,22 @@ data class BankState(
   val budgets: List<Budget>,
 ) : Serializable
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class Provider(
   val id: String,
   val name: String,
   val description: String,
   val methods: List<String>,
+  val available: Boolean = true,
+) : Serializable
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class Corridor(
+  val id: String = "",
+  val source: String? = null,
+  val destination: String? = null,
+  val currency: String? = null,
+  val available: Boolean = true,
 ) : Serializable
 
 // MARK: - API Response Types
@@ -87,11 +100,30 @@ data class HealthResponse(
   val simulation: Boolean,
 ) : Serializable
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CatalogResponse(
   val demoDate: String,
   val recipients: List<Recipient>,
   val providers: List<Provider>,
-) : Serializable
+  val corridors: List<Corridor> = emptyList(),
+) : Serializable {
+
+  /**
+   * Adyen remains card-only and Worldpay remains bank-only.
+   * Unavailable or unrecognized providers contribute nothing.
+   */
+  fun activeBaselineMethods(): Set<PaymentMethod> {
+    val methods = linkedSetOf<PaymentMethod>()
+    for (provider in providers) {
+      if (!provider.available) continue
+      when (provider.id) {
+        ProviderId.adyen.name -> if (PaymentMethod.card.name in provider.methods) methods.add(PaymentMethod.card)
+        ProviderId.worldpay.name -> if (PaymentMethod.bank.name in provider.methods) methods.add(PaymentMethod.bank)
+      }
+    }
+    return methods
+  }
+}
 
 data class PaymentResponse(
   val ok: Boolean,
