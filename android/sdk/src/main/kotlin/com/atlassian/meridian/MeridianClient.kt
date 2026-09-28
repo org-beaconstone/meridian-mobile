@@ -116,6 +116,12 @@ class MeridianClient(
     request("GET", "/health", responseType = HealthResponse::class.java)
 
   /**
+   * Confirms the current rehearsal session is still reachable.
+   * Keeps the selected session id. Does not rotate an idempotency key or payment method.
+   */
+  suspend fun refreshSession(): HealthResponse = getHealth()
+
+  /**
    * GET /catalog - Fetch recipients and providers
    */
   suspend fun getCatalog(): CatalogResponse =

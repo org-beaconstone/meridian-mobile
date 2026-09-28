@@ -341,10 +341,153 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let draft = InFlightPaymentDraft(
+      recipientId: "northline-studio",
+      amount: "18.50",
+      reference: "Studio materials",
+      method: .card,
+      reviewing: true,
+      idempotencyKey: "pay-key-114"
+    )
+    let fiveMinutes: Int64 = SessionBanner.expiringWindowMs
+
+    // CHECK 21: connected copy and non-blocking active state
+    print("21. Session banner active copy...")
+    let active = SessionBanner.present(nowMs: 0, expiresAtMs: fiveMinutes + 1, activeElsewhere: false)
+    if active.state == .active
+      && active.message == "Connected to secure payments platform"
+      && active.accessibilityLabel == active.message
+      && !active.blocksInteraction
+      && active.extendActionLabel == nil
+      && active.meetsWcagAa()
+    {
+      print("  ✓ Active banner uses the approved copy and stays non-blocking")
+      passed += 1
+    } else {
+      print("  ✗ Active banner mismatch: \(active.message)")
+      failed += 1
+    }
+
+    // CHECK 22: expiring soon at the five-minute boundary
+    print("22. Session banner expiring soon...")
+    let expiring = SessionBanner.present(nowMs: 1_000, expiresAtMs: 1_000 + fiveMinutes, activeElsewhere: false)
+    if expiring.state == .expiringSoon
+      && expiring.message == "Session expiring soon. Tap to extend."
+      && expiring.extendActionLabel == "Tap to extend"
+      && !expiring.blocksInteraction
+      && expiring.minimumTapTargetPoints >= 48
+      && expiring.meetsWcagAa()
+    {
+      print("  ✓ Expiring banner is an amber non-blocking extend action")
+      passed += 1
+    } else {
+      print("  ✗ Expiring banner mismatch: \(expiring.message)")
+      failed += 1
+    }
+
+    // CHECK 23: active on another device
+    print("23. Session banner active elsewhere...")
+    let elsewhere = SessionBanner.present(nowMs: 0, expiresAtMs: fiveMinutes + 60_000, activeElsewhere: true)
+    if elsewhere.state == .activeElsewhere
+      && elsewhere.message == "Session active on another device."
+      && !elsewhere.blocksInteraction
+      && elsewhere.extendActionLabel == nil
+      && elsewhere.meetsWcagAa()
+    {
+      print("  ✓ Elsewhere banner stays non-blocking")
+      passed += 1
+    } else {
+      print("  ✗ Elsewhere banner mismatch: \(elsewhere.message)")
+      failed += 1
+    }
+
+    // CHECK 24: expired blocks and uses approved copy
+    print("24. Session banner expired...")
+    let expired = SessionBanner.present(nowMs: 5_000, expiresAtMs: 5_000, activeElsewhere: true)
+    if expired.state == .expired
+      && expired.message == "Session expired. Please re-authenticate to confirm this transfer."
+      && expired.blocksInteraction
+      && expired.reauthenticateActionLabel == "Re-authenticate"
+      && expired.meetsWcagAa()
+    {
+      print("  ✓ Expired banner blocks interaction and asks for re-authentication")
+      passed += 1
+    } else {
+      print("  ✗ Expired banner mismatch: \(expired.message)")
+      failed += 1
+    }
+
+    // CHECK 25: extend keeps the in-flight draft and payment key
+    print("25. Extend keeps in-flight payment draft...")
+    let extended = SessionRefresh.extend(nowMs: 50_000, draft: draft, activeElsewhere: false)
+    if extended.draft == draft
+      && extended.draft.method == .card
+      && extended.draft.idempotencyKey == "pay-key-114"
+      && extended.draft.reviewing
+      && extended.expiresAtMs == 50_000 + SessionBanner.defaultDurationMs
+      && extended.presentation.state == .active
+    {
+      print("  ✓ Extend refreshes the session without changing payment details")
+      passed += 1
+    } else {
+      print("  ✗ Extend changed the draft or failed to renew the session")
+      failed += 1
+    }
+
+    // CHECK 26: failed refresh retains expiry, key, and method
+    print("26. Uncertain refresh retains session and draft...")
+    let retained = SessionRefresh.retain(
+      nowMs: 90_000,
+      expiresAtMs: 90_000 + 60_000,
+      activeElsewhere: false,
+      draft: draft
+    )
+    if retained.draft == draft
+      && retained.draft.method == .card
+      && retained.draft.idempotencyKey == "pay-key-114"
+      && retained.expiresAtMs == 150_000
+      && retained.presentation.state == .expiringSoon
+    {
+      print("  ✓ Failed refresh keeps the payment key and does not extend expiry")
+      passed += 1
+    } else {
+      print("  ✗ Failed refresh changed expiry or draft")
+      failed += 1
+    }
+
+    // CHECK 27: re-authenticate keeps the transfer draft
+    print("27. Re-authenticate keeps transfer draft...")
+    let reauthed = SessionRefresh.reauthenticate(nowMs: 10_000, draft: draft)
+    if reauthed.draft == draft
+      && !reauthed.activeElsewhere
+      && reauthed.presentation.state == .active
+      && !reauthed.presentation.blocksInteraction
+    {
+      print("  ✓ Re-authenticate opens a fresh window and keeps the transfer")
+      passed += 1
+    } else {
+      print("  ✗ Re-authenticate changed the draft")
+      failed += 1
+    }
+
+    // CHECK 28: contrast helper matches black on white
+    print("28. WCAG contrast helper...")
+    let black = SessionColor(token: "color.black", red: 0, green: 0, blue: 0)
+    let white = SessionColor(token: "color.white", red: 255, green: 255, blue: 255)
+    let ratio = black.contrastRatio(against: white)
+    if abs(ratio - 21.0) < 0.001 && active.contrastRatio() >= 4.5 {
+      print("  ✓ Contrast helper reports 21:1 for black on white")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected contrast \(ratio)")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

@@ -95,6 +95,12 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
+  /// Confirms the current rehearsal session is still reachable.
+  /// Keeps the selected session id. Does not rotate an idempotency key or payment method.
+  public func refreshSession() async throws -> HealthResponse {
+    try await getHealth()
+  }
+
   /// GET /catalog - Fetch recipients and providers
   public func getCatalog() async throws -> CatalogResponse {
     return try await request(method: "GET", path: "/catalog")
