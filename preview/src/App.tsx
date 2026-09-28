@@ -20,11 +20,13 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  REGIONAL_UNAVAILABILITY_WARNING,
+  resolvePaymentRails,
+  type CatalogProvider,
+} from './domain/paymentRails';
+import { PaymentMethodSheet, PaymentMethodSkeletons } from './PaymentMethodSheet';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -84,6 +86,8 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
+  const [catalogProviders, setCatalogProviders] = useState<CatalogProvider[] | null>(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -99,16 +103,15 @@ export default function App() {
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
     setState(null);
+    setCatalogProviders(null);
+    setSheetOpen(false);
     setConnected(false);
     setError('');
     async function poll() {
       const version = revision.current;
       try {
         if (!mutating.current) {
-          const [raw, catalog] = await Promise.all([
-            request(room, '/state'),
-            request(room, '/catalog'),
-          ]);
+          const raw = await request(room, '/state');
           if (
             !closed &&
             generation === epoch.current &&
@@ -116,8 +119,17 @@ export default function App() {
             !mutating.current
           ) {
             setState(bankState(raw));
-            setRecipients(catalog.recipients);
             setConnected(true);
+          }
+          const catalog = await request(room, '/catalog');
+          if (
+            !closed &&
+            generation === epoch.current &&
+            version === revision.current &&
+            !mutating.current
+          ) {
+            setRecipients(catalog.recipients ?? []);
+            setCatalogProviders(Array.isArray(catalog.providers) ? catalog.providers : []);
           }
         }
       } catch (e) {
@@ -153,6 +165,8 @@ export default function App() {
       setBusy(false);
     }
   }
+  const rails = catalogProviders ? resolvePaymentRails(catalogProviders) : null;
+  const selectedRail = rails?.find((rail) => rail.method === method) ?? null;
   function freshPayment() {
     setStep('details');
     setAmount('');
@@ -177,10 +191,23 @@ export default function App() {
       setError('Insufficient balance');
       return;
     }
+    if (catalogProviders && !rails?.some((rail) => rail.method === method && rail.selectable)) {
+      setError(REGIONAL_UNAVAILABILITY_WARNING);
+      return;
+    }
     setError('');
+    setSheetOpen(false);
     setStep('review');
   }
   async function confirm() {
+    if (!rails?.some((rail) => rail.method === method && rail.selectable)) {
+      setError(
+        catalogProviders === null
+          ? 'Payment methods are still loading.'
+          : REGIONAL_UNAVAILABILITY_WARNING,
+      );
+      return;
+    }
     try {
       setError('');
       const result = await mutate(
@@ -336,28 +363,39 @@ export default function App() {
                         onChange={(e) => setNote(e.target.value)}
                         placeholder="What’s it for?"
                       />
-                      <fieldset>
-                        <legend>Payment method</legend>
-                        {providers.map((provider) => (
-                          <label
-                            className={
-                              'mobile-method ' + (method === provider.method ? 'selected' : '')
-                            }
-                            key={provider.id}
-                          >
-                            <input
-                              type="radio"
-                              name="method"
-                              checked={method === provider.method}
-                              onChange={() => setMethod(provider.method)}
-                            />
-                            <span>
-                              {provider.method === 'card' ? 'Debit card' : 'Bank payment'}
-                              <small>{provider.name} simulation</small>
-                            </span>
-                          </label>
-                        ))}
-                      </fieldset>
+                      <div className="method-field">
+                        <span id="payment-method-label">Payment method</span>
+                        {rails === null ? (
+                          <PaymentMethodSkeletons />
+                        ) : rails.length === 0 ? (
+                          <p>No payment methods are available.</p>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="method-trigger"
+                              aria-haspopup="dialog"
+                              aria-expanded={sheetOpen}
+                              aria-label={
+                                selectedRail
+                                  ? `Payment method, ${selectedRail.title}`
+                                  : 'Choose payment method'
+                              }
+                              onClick={() => setSheetOpen(true)}
+                              disabled={busy}
+                            >
+                              <strong>{selectedRail?.title ?? 'Choose payment method'}</strong>
+                              {selectedRail && <small>{selectedRail.badge}</small>}
+                              <span className="method-chevron" aria-hidden="true">
+                                ▲
+                              </span>
+                            </button>
+                            {selectedRail?.warning && (
+                              <p className="rail-warning">{selectedRail.warning}</p>
+                            )}
+                          </>
+                        )}
+                      </div>
                       <button className="primary" disabled={!connected || busy} type="submit">
                         Review payment
                       </button>
@@ -369,11 +407,17 @@ export default function App() {
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
-                          {note || 'No reference'}
+                          {selectedRail
+                            ? `${selectedRail.title} · ${selectedRail.badge}`
+                            : 'Payment method'}{' '}
+                          · {note || 'No reference'}
                         </p>
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      <button
+                        className="primary"
+                        onClick={confirm}
+                        disabled={busy || !connected || !selectedRail?.selectable}
+                      >
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
                       <button className="secondary" disabled={busy} onClick={editPayment}>
@@ -519,6 +563,7 @@ export default function App() {
               onClick={() => {
                 setPage(item);
                 setNotice('');
+                setSheetOpen(false);
               }}
             >
               {item}
@@ -526,6 +571,17 @@ export default function App() {
           ))}
         </nav>
         <footer>Fictional Meridian Bank · GBP simulation</footer>
+        {sheetOpen && rails && (
+          <PaymentMethodSheet
+            rails={rails}
+            selectedMethod={method}
+            onSelect={(next) => {
+              setMethod(next);
+              setSheetOpen(false);
+            }}
+            onClose={() => setSheetOpen(false)}
+          />
+        )}
       </div>
     </div>
   );
