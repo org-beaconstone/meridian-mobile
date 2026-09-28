@@ -341,10 +341,111 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: Catalog rails keep Adyen card and Worldpay bank, with screen-reader indexes
+    print("21. Payment rails resolve the baseline in catalog order...")
+    let ordered = resolvePaymentRails(from: [
+      Provider(id: "worldpay", name: "Worldpay", description: "Bank", methods: ["bank"]),
+      Provider(id: "adyen", name: "Adyen", description: "Card", methods: ["card"])
+    ])
+    if ordered.count == 2
+      && ordered[0].method == .bank
+      && ordered[0].provider == .worldpay
+      && ordered[0].title == worldpayBankTitle
+      && ordered[0].badge == worldpayBankBadge
+      && ordered[0].selectable
+      && ordered[0].warning == nil
+      && ordered[0].announcement == "Select Bank payment, radio button, 1 of 2"
+      && ordered[1].method == .card
+      && ordered[1].badge == adyenCardBadge
+      && ordered[1].announcement == "Select Debit card, radio button, 2 of 2"
+      && ordered[1].announcement == paymentOptionAnnouncement(title: adyenCardTitle, index: 2, total: 2) {
+      print("  ✓ Baseline rails and announcements")
+      passed += 1
+    } else {
+      print("  ✗ Rail resolution mismatch: \(ordered)")
+      failed += 1
+    }
+
+    // CHECK 22: Degraded and offline rails are visible but cannot be selected
+    print("22. Unavailable rails expose the regional warning...")
+    let blocked = resolvePaymentRails(from: [
+      Provider(id: "adyen", name: "Adyen", description: "Card", methods: ["card"], status: "degraded"),
+      Provider(id: "worldpay", name: "Worldpay", description: "Bank", methods: ["bank"], status: "OFFLINE")
+    ])
+    if blocked.count == 2
+      && blocked[0].availability == .degraded
+      && !blocked[0].selectable
+      && blocked[0].warning == regionalUnavailabilityWarning
+      && blocked[1].availability == .unavailable
+      && !blocked[1].selectable
+      && blocked[1].warning == regionalUnavailabilityWarning
+      && blocked[0].announcement == "Select Debit card, radio button, 1 of 2" {
+      print("  ✓ Degraded and offline rails are disabled")
+      passed += 1
+    } else {
+      print("  ✗ Unavailable rail mismatch: \(blocked)")
+      failed += 1
+    }
+
+    // CHECK 23: Unknown providers, wrong pairings, and duplicates are not offered
+    print("23. Non-baseline catalog entries are ignored...")
+    let filtered = resolvePaymentRails(from: [
+      Provider(id: "adyen", name: "Adyen", description: "Card", methods: ["bank", "card"]),
+      Provider(id: "adyen", name: "Adyen duplicate", description: "Card", methods: ["card"]),
+      Provider(id: "not-baseline", name: "Not Shown", description: "Skip", methods: ["card"], status: "available"),
+      Provider(id: "worldpay", name: "Worldpay", description: "Bank", methods: ["card"])
+    ])
+    let rendered = filtered.map { "\($0.title) \($0.badge) \($0.announcement)" }.joined(separator: " ")
+    if filtered.count == 1
+      && filtered[0].provider == .adyen
+      && filtered[0].method == .card
+      && filtered[0].announcement == "Select Debit card, radio button, 1 of 1"
+      && !rendered.contains("Not Shown")
+      && resolvePaymentRails(from: []).isEmpty {
+      print("  ✓ Unknown providers and wrong pairings ignored")
+      passed += 1
+    } else {
+      print("  ✗ Filter mismatch: \(filtered)")
+      failed += 1
+    }
+
+    // CHECK 24: Catalog JSON with an extra provider still decodes, and only baseline rails are used
+    print("24. Catalog status decodes without offering an unknown provider...")
+    let statusJson = """
+    {
+      "demoDate": "2026-09-18",
+      "recipients": [],
+      "providers": [
+        {"id": "adyen", "name": "Adyen", "description": "Card processor", "methods": ["card"], "status": "available"},
+        {"id": "worldpay", "name": "Worldpay", "description": "Bank", "methods": ["bank"]},
+        {"id": "other", "name": "Other", "description": "Skip", "methods": ["card"], "status": "unavailable"}
+      ]
+    }
+    """
+    do {
+      let decoded = try JSONDecoder().decode(CatalogResponse.self, from: statusJson.data(using: .utf8)!)
+      let rails = resolvePaymentRails(from: decoded.providers)
+      if decoded.providers.count == 3
+        && decoded.providers[1].status == nil
+        && rails.count == 2
+        && rails.allSatisfy(\.selectable)
+        && rails.map(\.method) == [.card, .bank] {
+        print("  ✓ Catalog status decoded and unknown provider dropped")
+        passed += 1
+      } else {
+        print("  ✗ Status catalog mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Status catalog failed to decode: \(error)")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

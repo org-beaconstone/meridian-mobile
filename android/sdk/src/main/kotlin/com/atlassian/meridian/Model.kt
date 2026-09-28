@@ -77,6 +77,8 @@ data class Provider(
   val name: String,
   val description: String,
   val methods: List<String>,
+  /** Absent, empty, "available", and "online" can be selected. "degraded", "unavailable", and "offline" cannot. */
+  val status: String? = null,
 ) : Serializable
 
 // MARK: - API Response Types

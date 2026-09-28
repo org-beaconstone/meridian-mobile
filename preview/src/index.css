@@ -324,6 +324,106 @@ legend {
   color: #54635c;
   font-weight: 400;
 }
+.method-field {
+  margin: 24px 0;
+}
+.method-field > span {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.method-trigger {
+  position: relative;
+  width: 100%;
+  text-align: left;
+  background: #fff;
+  border: 1px solid #dce3d6;
+  border-radius: 12px;
+  padding: 16px 36px 16px 16px;
+}
+.method-chevron {
+  position: absolute;
+  right: 14px;
+  top: 16px;
+  color: #5c6b64;
+  font-size: 12px;
+}
+.method-trigger strong,
+.method-trigger small {
+  display: block;
+}
+.method-trigger small,
+.rail-warning {
+  margin-top: 5px;
+  font-size: 10px;
+  font-weight: 400;
+  color: #54635c;
+}
+.rail-warning {
+  color: #8d2517;
+}
+.mobile-method.unavailable {
+  opacity: 0.85;
+}
+.method-skeletons {
+  display: grid;
+  gap: 10px;
+}
+.skeleton-card {
+  height: 72px;
+  border-radius: 12px;
+  background: #d5ddd0;
+  animation: meridian-pulse 0.9s ease-in-out infinite;
+}
+@keyframes meridian-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.sheet-root {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+}
+.sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: #142c3573;
+}
+.sheet-panel {
+  position: relative;
+  width: min(440px, 100%);
+  max-height: 78vh;
+  overflow: auto;
+  background: #f8f9f6;
+  border-radius: 18px 18px 0 0;
+  padding: 10px 18px 22px;
+}
+.sheet-handle {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: #8b9588;
+  margin: 6px auto 12px;
+}
+.sheet-note {
+  margin: 8px 0 16px !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-card {
+    animation: none;
+    opacity: 0.75;
+  }
+}
 .primary,
 .secondary {
   width: 100%;

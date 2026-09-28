@@ -130,21 +130,26 @@ public struct BankState: Codable, Hashable {
 }
 
 public struct Provider: Codable, Hashable {
-  public let id: ProviderId
+  public let id: String
   public let name: String
   public let description: String
-  public let methods: [PaymentMethod]
+  public let methods: [String]
+  /// Optional catalog rail status. Absent, empty, "available", and "online" can be selected.
+  /// "degraded", "unavailable", and "offline" cannot.
+  public let status: String?
 
   public init(
-    id: ProviderId,
+    id: String,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [String],
+    status: String? = nil
   ) {
     self.id = id
     self.name = name
     self.description = description
     self.methods = methods
+    self.status = status
   }
 }
 
