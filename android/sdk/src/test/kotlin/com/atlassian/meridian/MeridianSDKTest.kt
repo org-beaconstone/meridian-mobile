@@ -322,6 +322,9 @@ class MeridianSDKTest {
       assertNotNull(idempotencyKey)
       assertTrue(idempotencyKey.isNotEmpty())
 
+      val traceparent = checkNotNull(exchange.requestHeaders.getFirst("traceparent"))
+      assertTrue(TraceContext.isValidTraceparent(traceparent))
+
       // Track idempotency key
       val isRetry = idempotencyKey in seenKeys
       seenKeys.add(idempotencyKey)

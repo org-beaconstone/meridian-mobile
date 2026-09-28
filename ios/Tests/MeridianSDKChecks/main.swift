@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +341,292 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    // Summary
+    let extra = await runTelemetryChecks()
+    passed += extra.passed
+    failed += extra.failed
+
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+}
+
+private final class CheckTally {
+  var passed = 0
+  var failed = 0
+  func expect(_ title: String, _ condition: Bool) {
+    if condition {
+      print("  ✓ \(title)")
+      passed += 1
+    } else {
+      print("  ✗ \(title)")
+      failed += 1
+    }
+  }
+}
+
+private final class RehearsalURLProtocol: URLProtocol {
+  static let lock = NSLock()
+  static var handler: ((URLRequest) -> (Int, Data))?
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    let active: ((URLRequest) -> (Int, Data))?
+    Self.lock.lock()
+    active = Self.handler
+    Self.lock.unlock()
+    guard let active, let url = request.url else {
+      client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+      return
+    }
+    let (status, data) = active(request)
+    if status == 0 {
+      client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+      return
+    }
+    let response = HTTPURLResponse(
+      url: url,
+      statusCode: status,
+      httpVersion: "HTTP/1.1",
+      headerFields: ["Content-Type": "application/json"]
+    )!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: data)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+}
+
+private func rehearsalClient() throws -> MeridianClient {
+  let configuration = URLSessionConfiguration.ephemeral
+  configuration.protocolClasses = [RehearsalURLProtocol.self]
+  return try MeridianClient(
+    baseURL: "http://127.0.0.1:8080/api/v1",
+    sessionId: "room-telemetry",
+    urlSession: URLSession(configuration: configuration)
+  )
+}
+
+private func runTelemetryChecks() async -> CheckTally {
+  let tally = CheckTally()
+  let pan = "4111111111111111"
+  let iban = "GB29NWBK60161331926819"
+  let noteIban = "DE89370400440532013000"
+  let spacedIban = "GB29 NWBK 6016 1331 9268 19"
+  let spacedPan = "4111-1111-1111-1111"
+  print("21. W3C traceparent and route selection...")
+  let header = TraceContext.root().traceparent
+  tally.expect("traceparent shape", TraceContext.isValidTraceparent(header))
+  tally.expect(
+    "all-zero trace rejected",
+    !TraceContext.isValidTraceparent("00-\(String(repeating: "0", count: 32))-\(String(repeating: "1", count: 16))-01")
+  )
+  tally.expect("catalog route", shouldInjectTraceparent(path: "/catalog"))
+  tally.expect("payments route", shouldInjectTraceparent(path: "/api/v1/payments"))
+  tally.expect("session health route", shouldInjectTraceparent(path: "/session/health"))
+  tally.expect("plain health excluded", !shouldInjectTraceparent(path: "/health"))
+  tally.expect("state excluded", !shouldInjectTraceparent(path: "/state"))
+
+  print("22. Sanitizer redacts PAN and IBAN...")
+  tally.expect("compact PAN", TelemetrySanitizer.redact(pan) == "[REDACTED_PAN]")
+  tally.expect("spaced PAN", TelemetrySanitizer.redact(spacedPan) == "[REDACTED_PAN]")
+  tally.expect("compact IBAN", TelemetrySanitizer.redact(iban) == "[REDACTED_IBAN]")
+  tally.expect("german IBAN", TelemetrySanitizer.redact(noteIban) == "[REDACTED_IBAN]")
+  tally.expect("spaced IBAN", TelemetrySanitizer.redact(spacedIban) == "[REDACTED_IBAN]")
+  let mixed = TelemetrySanitizer.redact("card \(pan) iban \(iban) ref rent")
+  tally.expect("mixed redaction keeps context", !mixed.contains(pan) && !mixed.contains(iban) && mixed.contains("rent"))
+  tally.expect("balance untouched", TelemetrySanitizer.redact("balance 1248050") == "balance 1248050")
+
+  print("23. Attribute policy drops secrets...")
+  let policy = TelemetryLog()
+  policy.recordError(
+    code: iban,
+    stage: "gateway_roundtrip",
+    attributes: [
+      "note": noteIban,
+      "detail": pan,
+      "error.message": "declined \(pan) \(spacedIban)",
+      "payment.provider": "other",
+      "payment.method": "card",
+      "outcome": "DECLINED",
+    ]
+  )
+  let policyText = policy.rendered()
+  tally.expect(
+    "policy rendering is sanitized",
+    !policyText.contains(pan) && !policyText.contains(iban) && !policyText.contains(noteIban)
+      && !policyText.contains("other") && policyText.contains("REDACTED_CODE")
+      && policyText.contains("[REDACTED_PAN]") && policyText.contains("payment.method=card")
+  )
+
+  print("24. Local biometric prompt span...")
+  let biometricClient = try? MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "telemetry-room")
+  let accepted = await biometricClient?.resolveLocalBiometricPrompt(method: .card)
+  let prompt = biometricClient?.telemetry.spans().first { $0.name == "biometric.prompt" }
+  tally.expect(
+    "accepted biometric span",
+    accepted?.accepted == true && accepted?.fallback == false && prompt?.status == "ok"
+      && prompt?.attributes["payment.provider"] == "adyen" && (prompt?.durationMillis ?? -1) >= 0
+  )
+  let fallback = await biometricClient?.resolveLocalBiometricPrompt(method: .bank, accepted: true, available: false)
+  let fallbackEvent = biometricClient?.telemetry.events().first { $0.name == "sca.fallback" }
+  tally.expect(
+    "biometric SCA fallback stays local",
+    fallback?.fallback == true && fallback?.accepted == false
+      && fallbackEvent?.errorCode == "SCA_CHALLENGE_FALLBACK"
+      && fallbackEvent?.failureStage == "biometric_prompt"
+      && fallbackEvent?.attributes["payment.provider"] == "worldpay"
+  )
+  _ = await biometricClient?.resolveLocalBiometricPrompt(method: .card, accepted: false)
+  tally.expect(
+    "declined biometric event",
+    biometricClient?.telemetry.events().contains { $0.errorCode == "BIOMETRIC_DECLINED" && $0.failureStage == "biometric_prompt" } == true
+  )
+
+  print("25. Traced catalog, payment, and session health...")
+  let healthCalls = CheckCounter()
+  let paymentCalls = CheckCounter()
+  RehearsalURLProtocol.lock.lock()
+  RehearsalURLProtocol.handler = { request in
+    let path = request.url?.path ?? ""
+    let trace = request.value(forHTTPHeaderField: "traceparent")
+    if path.hasSuffix("/catalog") {
+      let json = """
+      {"demoDate":"2026-09-18","recipients":[{"id":"northline-studio","name":"Northline","initials":"NS","detail":"\(iban)","category":"Shopping","color":"#111111"}],"providers":[{"id":"adyen","name":"Adyen","description":"Card","methods":["card"]}]}
+      """
+      return (trace.map { TraceContext.isValidTraceparent($0) } == true) ? (200, Data(json.utf8)) : (500, Data("{}".utf8))
+    }
+    if path.hasSuffix("/payments") {
+      paymentCalls.value += 1
+      let valid = trace.map { TraceContext.isValidTraceparent($0) } == true
+        && request.value(forHTTPHeaderField: "Idempotency-Key") == "same-key"
+        && request.value(forHTTPHeaderField: "X-Rehearsal-Session") == "room-telemetry"
+      let code = paymentCalls.value == 1 ? "DECLINED" : "SCA_REQUIRED"
+      let json = """
+      {"ok":false,"code":"\(code)","error":"card \(pan) iban \(iban)"}
+      """
+      return valid ? (422, Data(json.utf8)) : (500, Data("{}".utf8))
+    }
+    if path.hasSuffix("/session/health") {
+      guard trace.map({ TraceContext.isValidTraceparent($0) }) == true else {
+        return (500, Data("{}".utf8))
+      }
+      let json: String
+      switch healthCalls.value {
+      case 0, 1:
+        json = #"{"status":"UP","service":"meridian-api","simulation":true}"#
+      default:
+        json = #"{"status":"degraded","corridors":[{"id":"adyen-card","provider":"adyen","method":"card","state":"degraded"},{"id":"other-wallet","provider":"other","method":"card","state":"degraded"}]}"#
+      }
+      healthCalls.value += 1
+      return (200, Data(json.utf8))
+    }
+    if path.hasSuffix("/state") || path.hasSuffix("/health") {
+      if trace != nil { return (500, Data("{}".utf8)) }
+      if path.hasSuffix("/health") {
+        return (200, Data(#"{"status":"UP","service":"meridian-api","simulation":true}"#.utf8))
+      }
+      return (200, Data(#"{"version":1,"balance":1248050,"transactions":[],"budgets":[]}"#.utf8))
+    }
+    return (404, Data("{}".utf8))
+  }
+  RehearsalURLProtocol.lock.unlock()
+
+  do {
+    let client = try rehearsalClient()
+    let catalog = try await client.getCatalog()
+    let parse = client.telemetry.spans().first { $0.name == "catalog.parse" }
+    tally.expect(
+      "catalog parse span omits IBAN",
+      catalog.recipients.first?.detail == iban && parse?.status == "ok" && parse?.parentSpanId?.isEmpty == false
+        && (parse?.durationMillis ?? -1) >= 0 && !client.telemetry.rendered().contains(iban)
+    )
+    _ = try await client.getState()
+    let health = try await client.getHealth()
+    tally.expect("untraced health still decodes", health.status == "UP")
+    let declined = try await client.submitPayment(
+      recipientId: "northline-studio",
+      amountMinor: 2500,
+      method: .card,
+      note: noteIban,
+      scenario: .declined,
+      idempotencyKey: "same-key"
+    )
+    let gateway = client.telemetry.spans().first { $0.name == "payment.gateway" }
+    let gatewayError = client.telemetry.events().first { $0.name == "client.error" && $0.failureStage == "gateway_roundtrip" }
+    let rendered = client.telemetry.rendered()
+    tally.expect(
+      "gateway error is sanitized",
+      declined.code == "DECLINED" && gateway?.status == "error" && gateway?.parentSpanId == nil
+        && gateway?.attributes["payment.provider"] == "adyen" && gatewayError?.errorCode == "DECLINED"
+        && !rendered.contains(pan) && !rendered.contains(iban) && !rendered.contains(noteIban)
+    )
+    let challenged = try await client.submitPayment(
+      recipientId: "northline-studio",
+      amountMinor: 2500,
+      method: .card,
+      note: "rent",
+      scenario: .unavailable,
+      idempotencyKey: "same-key"
+    )
+    tally.expect(
+      "SCA fallback does not open another provider call",
+      challenged.code == "SCA_REQUIRED" && paymentCalls.value == 2
+        && client.telemetry.events().contains { $0.name == "sca.fallback" && $0.errorCode == "SCA_REQUIRED" && $0.failureStage == "sca_challenge" }
+    )
+    let first = await client.checkSessionHealth()
+    let changes = client.telemetry.events().filter { $0.name == "session.connection_changed" }.count
+    let second = await client.checkSessionHealth()
+    let afterSecond = client.telemetry.events().filter { $0.name == "session.connection_changed" }.count
+    let third = await client.checkSessionHealth()
+    let degraded = client.telemetry.events().first { $0.name == "corridor.degraded" && $0.attributes["corridor.id"] == "adyen-card" }
+    tally.expect(
+      "corridor degrade is recorded once",
+      first.connectionState == "healthy" && second.connectionState == "healthy"
+        && afterSecond == changes
+        && third.connectionState == "degraded" && degraded?.attributes["payment.provider"] == "adyen"
+        && !client.telemetry.rendered().contains("other")
+    )
+  } catch {
+    tally.expect("traced HTTP rehearsal \(error)", false)
+  }
+
+  print("26. Network failure keeps the failure stage...")
+  RehearsalURLProtocol.lock.lock()
+  RehearsalURLProtocol.handler = { _ in (0, Data()) }
+  RehearsalURLProtocol.lock.unlock()
+  if let client = try? rehearsalClient() {
+    var threw = false
+    do {
+      _ = try await client.submitPayment(
+        recipientId: "northline-studio",
+        amountMinor: 100,
+        method: .bank,
+        note: noteIban,
+        idempotencyKey: "kept-key"
+      )
+    } catch {
+      threw = true
+    }
+    let rendered = client.telemetry.rendered()
+    tally.expect(
+      "network error span omits IBAN",
+      threw && rendered.contains("NETWORK_ERROR") && rendered.contains("gateway_roundtrip")
+        && client.telemetry.spans().contains { $0.name == "payment.gateway" && $0.status == "error" && $0.attributes["payment.provider"] == "worldpay" }
+        && !rendered.contains(noteIban)
+    )
+  } else {
+    tally.expect("network client init", false)
+  }
+  return tally
+}
+
+private final class CheckCounter: @unchecked Sendable {
+  var value = 0
 }
