@@ -140,6 +140,11 @@ data class BudgetRequest(
   val limitMinor: Int,
 ) : Serializable
 
+data class PaymentSubmission(
+  val statusCode: Int,
+  val body: PaymentResponse,
+) : Serializable
+
 // MARK: - Error Types
 
 sealed class MeridianError(message: String?, cause: Throwable? = null) : Exception(message, cause) {
@@ -159,12 +164,22 @@ fun money(pence: Int): String {
   return "£%.2f".format(pounds)
 }
 
+/** Card is Adyen and bank is Worldpay. A timeout must not select another provider. */
+fun baselineProvider(method: PaymentMethod): String = when (method) {
+  PaymentMethod.card -> ProviderId.adyen.name
+  PaymentMethod.bank -> ProviderId.worldpay.name
+}
+
 /**
- * Parse amount string to integer pence
+ * Parse amount string to integer GBP pence.
  * @param input Amount string (e.g., "10.50", "10", "10.5")
+ * @param currency ISO currency code. Only GBP is accepted.
  * @return Pair of (pence: Int?, error: String?)
  */
-fun parseAmount(input: String): Pair<Int?, String?> {
+fun parseAmount(input: String, currency: String = "GBP"): Pair<Int?, String?> {
+  if (currency != "GBP") {
+    return Pair(null, "Only GBP integer pence are supported")
+  }
   val trimmed = input.trim()
 
   // Empty or whitespace only

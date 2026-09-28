@@ -324,8 +324,21 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    // CHECK 20: Client rejects invalid URL
-    print("20. Client rejects invalid URL...")
+    // CHECK 20: GBP bounds are 0.01 through 10000.00
+    print("20. parseAmount GBP bounds...")
+    let (penceMin, errMin) = parseAmount("0.01")
+    let (penceMax, errMax) = parseAmount("10000.00")
+    let (euro, euroErr) = parseAmount("0.01", currency: "EUR")
+    if penceMin == 1 && errMin == nil && penceMax == 1_000_000 && errMax == nil && euro == nil && euroErr != nil {
+      print("  ✓ 0.01 GBP = 1 pence, 10000.00 GBP = 1000000 pence, EUR rejected")
+      passed += 1
+    } else {
+      print("  ✗ GBP bounds or currency guard failed")
+      failed += 1
+    }
+
+    // CHECK 21: Client rejects invalid URL
+    print("21. Client rejects invalid URL...")
     do {
       _ = try MeridianClient(
         baseURL: "not a url",
@@ -343,8 +356,8 @@ struct MeridianSDKChecks {
 
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/21")
+    print("Failed: \(failed)/21")
 
     if failed > 0 {
       exit(1)

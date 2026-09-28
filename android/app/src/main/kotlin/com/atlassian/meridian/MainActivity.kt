@@ -26,6 +26,7 @@ class MainActivity : ComponentActivity() {
   var base by remember { mutableStateOf("http://10.0.2.2:8080/api/v1") }
   var room by remember { mutableStateOf("meridian-rehearsal") }
   var client by remember { mutableStateOf<MeridianClient?>(null) }
+  var rehearsal by remember { mutableStateOf<RehearsalSession?>(null) }
   var state by remember { mutableStateOf<BankState?>(null) }
   var catalog by remember { mutableStateOf<CatalogResponse?>(null) }
   var recipient by remember { mutableStateOf("northline-studio") }
@@ -39,12 +40,24 @@ class MainActivity : ComponentActivity() {
   var revision by remember { mutableStateOf(0) }
   LaunchedEffect(client) {
     val current=client
-    while(current!=null) {
+    val active=rehearsal
+    while(current!=null && active!=null) {
       val started=revision
       if(!busy) try {
-        val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
-      } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
+        val fresh=current.getState()
+        val hydration=active.hydrateCatalog()
+        if(current===client && started==revision && !busy) {
+          state=fresh
+          if(hydration.catalog!=null) catalog=hydration.catalog
+          message=if(hydration.degraded) "Showing last-known-good catalog" else "Connected to shared Java API"
+        }
+      } catch(e:Exception) {
+        val hydration=try { active.hydrateCatalog() } catch(_:Exception) { null }
+        if(current===client && started==revision) {
+          if(hydration?.catalog!=null) catalog=hydration.catalog
+          message=if(hydration?.degraded==true && hydration.catalog!=null) "Showing last-known-good catalog" else "API unavailable: ${e.message}"
+        }
+      }
       delay(2000)
     }
   }
@@ -55,7 +68,12 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {
+        val next=MeridianClient(base,room)
+        client=next
+        rehearsal=RehearsalSession(next)
+        state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()
+      }catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -74,11 +92,17 @@ class MainActivity : ComponentActivity() {
       if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
-            if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
-            else message=result.error?:"Awaiting confirmation. Retry the same payment."
-          }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
+        Button(onClick={val active=rehearsal;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
+          try {
+            val attempt=PaymentAttempt(recipient,minor,method,note,Scenario.success,paymentKey)
+            when(val outcome=active.submit(attempt)){
+              is PaymentOutcome.Settled -> {state=outcome.response.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
+              is PaymentOutcome.Pending -> {paymentKey=outcome.attempt.idempotencyKey;message=outcome.response.error?:"Payment pending confirmation. Retry the same payment."}
+              is PaymentOutcome.Declined -> {paymentKey=outcome.attempt.idempotencyKey;message=outcome.response.error?:"Payment declined. No debit was made."}
+              is PaymentOutcome.Retryable -> {paymentKey=outcome.attempt.idempotencyKey;method=outcome.attempt.method;message="${outcome.message} Retry keeps the same key and selected method."}
+              is PaymentOutcome.Rejected -> {paymentKey=outcome.attempt.idempotencyKey;message=outcome.message}
+            }
+          } finally { revision++; busy=false }
         }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
         TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }

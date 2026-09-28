@@ -23,7 +23,7 @@ swift run MeridianDesktop
 MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks
 ```
 
-Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, 20 executable SDK assertions, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated.
+`swift test` runs the XCTest rehearsal suite. `swift run MeridianSDKChecks` runs the executable assertions. `swift run MeridianLiveChecks` talks to the Java API. The SwiftUI desktop executable is part of the package on macOS; a Linux host skips that product because SwiftUI is not available there. Native desktop interactions were not UI-automated. No iOS simulator or device build is claimed.
 
 For an iOS project, install Xcode and XcodeGen, then `cd ios && xcodegen generate`. `project.yml` builds `App/MeridianApp.swift` with the local SDK package. No iOS simulator/device build was run on the authoring machine because full Xcode was unavailable. Local network HTTP is for the rehearsal only; use HTTPS for any shared hosted endpoint.
 
@@ -36,12 +36,22 @@ mvn clean verify
 gradle :app:assembleDebug
 ```
 
-`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 22 tests including an actual local HTTP transport check for session/idempotency headers and HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
+`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes the JUnit suite, including an HTTP transport check and the rehearsal suite (catalog hydration, GBP pence, idempotency, HTTP 202 pending, unavailable retry, gateway timeout, last-known-good catalog). The suite runs on the JVM because the rehearsal logic has no Android framework dependency; Robolectric is not used. `LiveChecksKt` exercises the same client against the real Spring Boot API when that process is running. `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
 
 ## Deliberate baseline
 
-Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. Amounts are integer GBP pence from £0.01 to £10,000. A timeout or unavailable response retries the same idempotency key and the same method; it does not select another provider. HTTP 202 stays pending and does not debit. If catalog refresh fails after a successful load, the UI keeps the last catalog. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+
+```sh
+(cd ios && swift test)
+(cd android && mvn -B test)
+# With the Java API already listening:
+(cd ios && MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks)
+(cd android && MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 mvn -B exec:java)
+```
+
+`swift test` and `mvn test` use an in-process contract mock so they do not need the Spring Boot process. The live checks above are the ones that talk to the Java mock container. The browser companion is still not a native binary.
 
 See [source context](https://github.com/org-beaconstone/meridian-api/blob/main/docs/context.md), [API contract](https://github.com/org-beaconstone/meridian-api/blob/main/docs/contract.md) and [connected runbook](https://github.com/org-beaconstone/meridian-api/blob/main/docs/connected-rehearsal.md). Existing Kaizen site remains standalone; no Java hosting is implied.

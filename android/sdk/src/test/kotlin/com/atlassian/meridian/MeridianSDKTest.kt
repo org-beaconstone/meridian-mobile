@@ -88,6 +88,26 @@ class MeridianSDKTest {
     assertNull(error)
   }
 
+  @Test
+  fun testParseAmountOnePenceAndGbpCeiling() {
+    val (min, minError) = parseAmount("0.01")
+    assertEquals(1, min)
+    assertNull(minError)
+    val (max, maxError) = parseAmount("10000.00")
+    assertEquals(1_000_000, max)
+    assertNull(maxError)
+  }
+
+  @Test
+  fun testParseAmountRejectsNonGbp() {
+    val (pence, error) = parseAmount("0.01", "EUR")
+    assertNull(pence)
+    assertEquals("Only GBP integer pence are supported", error)
+    val (switched, switchedError) = parseAmount("10000.00", "EUR")
+    assertNull(switched)
+    assertEquals("Only GBP integer pence are supported", switchedError)
+  }
+
   // MARK: - Formatting Tests
 
   @Test
