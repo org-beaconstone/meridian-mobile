@@ -1,9 +1,8 @@
 package com.atlassian.meridian
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -16,9 +15,26 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val catalogStore: CatalogStore? = null,
+  private val catalogTtlMillis: Long = DEFAULT_CATALOG_TTL_MILLIS,
+  private val clock: () -> Long = System::currentTimeMillis,
 ) {
-  private val mapper = ObjectMapper().registerKotlinModule()
+  private val mapper = meridianMapper()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+  private val catalogsDelegate = lazy {
+    CatalogClient(
+      cacheKey = "$baseUrlNormalized\n$sessionId",
+      store = catalogStore ?: EncryptedFileCatalogStore(defaultCatalogDirectory()),
+      ttlMillis = catalogTtlMillis,
+      clock = clock,
+      fetch = { request("GET", "/catalog", responseType = CatalogResponse::class.java) },
+    )
+  }
+  private val catalogs: CatalogClient by catalogsDelegate
+
+  /** True when the last catalog load reused a saved snapshot or the compiled-in baseline. */
+  val catalogUsingFallback: Boolean
+    get() = if (catalogsDelegate.isInitialized()) catalogs.usingFallback else false
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -39,7 +55,11 @@ class MeridianClient(
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
-    val connection = url.openConnection() as HttpURLConnection
+    val connection = try {
+      url.openConnection() as HttpURLConnection
+    } catch (e: IOException) {
+      throw MeridianError.NetworkError(e.message ?: "Network error", e)
+    }
     try {
       connection.connectTimeout = 15000
       connection.readTimeout = 15000
@@ -102,6 +122,10 @@ class MeridianClient(
           )
         }
       }
+    } catch (e: MeridianError) {
+      throw e
+    } catch (e: IOException) {
+      throw MeridianError.NetworkError(e.message ?: "Network error", e)
     } finally {
       connection.disconnect()
     }
@@ -116,10 +140,11 @@ class MeridianClient(
     request("GET", "/health", responseType = HealthResponse::class.java)
 
   /**
-   * GET /catalog - Fetch recipients and providers
+   * GET /catalog - Fetch recipients, providers, and corridors.
+   * A fresh cached copy is reused until the TTL expires. Gateway failures,
+   * offline errors, and unrecognized provider ids return the last accepted catalog.
    */
-  suspend fun getCatalog(): CatalogResponse =
-    request("GET", "/catalog", responseType = CatalogResponse::class.java)
+  suspend fun getCatalog(): CatalogResponse = catalogs.load()
 
   /**
    * GET /state - Fetch current bank state

@@ -42,14 +42,17 @@ import MeridianSDK
           }
           TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
-          Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          // Adyen card and Worldpay bank only. Catalog availability can hide one; it cannot add a provider.
+          Picker("Method", selection: $method) {
+            if catalog == nil || catalog?.activeBaselineMethods().contains(.card) == true { Text("Debit card · Adyen").tag(PaymentMethod.card) }
+            if catalog == nil || catalog?.activeBaselineMethods().contains(.bank) == true { Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }
+          }.disabled(review || busy)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
             Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; guard catalog?.activeBaselineMethods().isEmpty != true else { message="No payment method is available"; return }; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy || catalog?.activeBaselineMethods().isEmpty == true)
           }
           Text("Recent activity").font(.title2)
           ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
@@ -68,7 +71,18 @@ import MeridianSDK
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    do {
+      let next=try await client.getState()
+      let definitions=try await client.getCatalog()
+      let fallback=await client.catalogUsingFallback
+      if started==generation && !busy {
+        state=next
+        catalog=definitions
+        let allowed=definitions.activeBaselineMethods()
+        if !allowed.contains(method), let first=allowed.first { method=first }
+        message = fallback ? "Connected. Provider list is the last saved catalog." : "Connected to shared Java API"
+      }
+    } catch { if started==generation {message="API unavailable: \(error)"} }
   }
   private func pay() async {
     guard let client, !busy else {return}; busy=true; generation += 1

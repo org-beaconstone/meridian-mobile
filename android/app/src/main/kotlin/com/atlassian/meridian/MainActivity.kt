@@ -10,9 +10,11 @@ import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
@@ -23,6 +25,8 @@ class MainActivity : ComponentActivity() {
 }
 @Composable fun MeridianScreen() {
   val scope=rememberCoroutineScope()
+  val appContext = LocalContext.current.applicationContext
+  val catalogStore = remember(appContext) { EncryptedFileCatalogStore(File(appContext.filesDir, "catalog")) }
   var base by remember { mutableStateOf("http://10.0.2.2:8080/api/v1") }
   var room by remember { mutableStateOf("meridian-rehearsal") }
   var client by remember { mutableStateOf<MeridianClient?>(null) }
@@ -43,7 +47,13 @@ class MainActivity : ComponentActivity() {
       val started=revision
       if(!busy) try {
         val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
+        if(current===client && started==revision && !busy) {
+          state=fresh
+          catalog=definitions
+          val allowed=definitions.activeBaselineMethods()
+          if(method !in allowed && allowed.isNotEmpty()) method=allowed.first()
+          message=if(current.catalogUsingFallback) "Connected. Provider list is the last saved catalog." else "Connected to shared Java API"
+        }
       } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
       delay(2000)
     }
@@ -55,7 +65,7 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room,catalogStore=catalogStore);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -68,10 +78,11 @@ class MainActivity : ComponentActivity() {
       }
       OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
       OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
-      // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      // Adyen card and Worldpay bank only. Catalog availability can hide one; it cannot add a provider.
+      val methods = catalog?.activeBaselineMethods() ?: setOf(PaymentMethod.card, PaymentMethod.bank)
+      if(PaymentMethod.card in methods) Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
+      if(PaymentMethod.bank in methods) Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy && methods.isNotEmpty()){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
         Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
