@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -46,6 +49,21 @@ public actor MeridianClient {
     body: Encodable? = nil,
     additionalHeaders: [String: String] = [:]
   ) async throws -> T {
+    let (decoded, _): (T, Int) = try await requestWithStatus(
+      method: method,
+      path: path,
+      body: body,
+      additionalHeaders: additionalHeaders
+    )
+    return decoded
+  }
+
+  private func requestWithStatus<T: Decodable>(
+    method: String,
+    path: String,
+    body: Encodable? = nil,
+    additionalHeaders: [String: String] = [:]
+  ) async throws -> (T, Int) {
     let url = baseURL.appendingPathComponent(path)
 
     var request = URLRequest(url: url)
@@ -82,7 +100,7 @@ public actor MeridianClient {
 
     let decoder = JSONDecoder()
     do {
-      return try decoder.decode(T.self, from: data)
+      return (try decoder.decode(T.self, from: data), httpResponse.statusCode)
     } catch {
       throw MeridianError.decodingError(error.localizedDescription)
     }
@@ -112,29 +130,33 @@ public actor MeridianClient {
   ///   - method: Payment method (card or bank)
   ///   - note: Optional note (max 200 chars)
   ///   - scenario: Simulation scenario
-  ///   - idempotencyKey: Unique key for idempotency
+  ///   - idempotencyKey: Unique key for idempotency. Reuse it when retrying, including after SCA.
+  ///   - scaChallengeToken: Set only after local biometric or passcode verification.
   public func submitPayment(
     recipientId: String,
     amountMinor: Int,
     method: PaymentMethod,
     note: String = "",
     scenario: Scenario = .success,
-    idempotencyKey: String
-  ) async throws -> PaymentResponse {
+    idempotencyKey: String,
+    scaChallengeToken: String? = nil
+  ) async throws -> PaymentSubmission {
     let payload = PaymentRequest(
       recipientId: recipientId,
       amountMinor: amountMinor,
       method: method,
       note: note,
-      scenario: scenario
+      scenario: scenario,
+      scaChallengeToken: scaChallengeToken
     )
 
-    return try await request(
+    let (body, statusCode): (PaymentResponse, Int) = try await requestWithStatus(
       method: "POST",
       path: "/payments",
       body: payload,
       additionalHeaders: ["Idempotency-Key": idempotencyKey]
     )
+    return PaymentSubmission(statusCode: statusCode, body: body)
   }
 
   /// PATCH /budgets - Update budget for a category

@@ -25,6 +25,18 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  BIOMETRIC_PROMPT,
+  SCA_FAILURE_MESSAGE,
+  beginSca,
+  biometricUnavailableOrFailed,
+  passcodeMatches,
+  passcodeRejected,
+  passcodeVerified,
+  resubmitPayment,
+  type InFlightPayment,
+  type ScaHandler,
+} from './domain/sca';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -55,7 +67,7 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
   const data = await response.json();
   if (!response.ok)
     throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
-  return data;
+  return { ...data, status: response.status };
 }
 function bankState(value: unknown): State {
   const v = value as State;
@@ -84,7 +96,10 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
-  const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
+  const [step, setStep] = useState<'details' | 'review' | 'sca' | 'done'>('details');
+  const [sca, setSca] = useState<ScaHandler | null>(null);
+  const [passcodeEntry, setPasscodeEntry] = useState('');
+  const [enrolledPasscode, setEnrolledPasscode] = useState('');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<Transaction | null>(null);
@@ -159,6 +174,8 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
+    setSca(null);
+    setPasscodeEntry('');
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
@@ -180,18 +197,80 @@ export default function App() {
     setError('');
     setStep('review');
   }
-  async function confirm() {
+  function inflight(amountMinor: number): InFlightPayment {
+    return {
+      recipientId: recipient,
+      amountMinor,
+      method,
+      note,
+      scenario,
+      idempotencyKey: paymentKey.current,
+    };
+  }
+  async function completeSca(handler: ScaHandler) {
+    const retry = resubmitPayment(handler);
+    if (!retry) return;
     try {
       setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
+      const result = await mutate('/payments', 'POST', retry.body, retry.idempotencyKey);
+      const again = beginSca(result.status, result, handler.payment, Date.now());
+      if (again) {
+        setSca(null);
+        setStep('review');
+        setError(SCA_FAILURE_MESSAGE);
+        return;
+      }
       if (result.ok) {
         setReceipt(result.transaction);
         setStep('done');
+        setSca(null);
+        setPasscodeEntry('');
+      } else {
+        setSca(handler);
+        setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      }
+    } catch (e) {
+      setSca(handler);
+      setError(e instanceof Error ? e.message : 'Payment failed');
+    }
+  }
+  async function confirm() {
+    const amountMinor = pence(amount);
+    if (amountMinor === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    try {
+      setError('');
+      const payment = inflight(amountMinor);
+      const result = await mutate(
+        '/payments',
+        'POST',
+        {
+          recipientId: payment.recipientId,
+          amountMinor: payment.amountMinor,
+          method: payment.method,
+          note: payment.note,
+          scenario: payment.scenario,
+        },
+        payment.idempotencyKey,
+      );
+      const handler = beginSca(result.status, result, payment, Date.now());
+      if (handler) {
+        if (handler.phase.kind === 'failed') {
+          setSca(null);
+          setStep('review');
+          setError(handler.phase.message);
+        } else {
+          setSca(handler);
+          setStep('sca');
+        }
+        return;
+      }
+      if (result.ok) {
+        setReceipt(result.transaction);
+        setStep('done');
+        setSca(null);
       } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
@@ -363,11 +442,97 @@ export default function App() {
                       </button>
                     </form>
                   )}
+                  {step === 'sca' && sca && (
+                    <>
+                      <div className="mobile-review">
+                        <span data-testid="sca-recipient">To {selected?.name || recipient}</span>
+                        <strong data-testid="sca-amount">{money(pence(amount) || 0)}</strong>
+                        <p>
+                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {note || 'No reference'}
+                        </p>
+                      </div>
+                      <div className="sca-panel" data-testid="sca-challenge">
+                        <p className="preview-label">
+                          Browser companion rehearsal. Face ID, Touch ID, and BiometricPrompt run in
+                          the native apps.
+                        </p>
+                        <h2>{BIOMETRIC_PROMPT}</h2>
+                        {sca.phase.kind === 'biometric' && (
+                          <button
+                            className="primary"
+                            type="button"
+                            onClick={() => {
+                              const next = biometricUnavailableOrFailed(sca, Date.now());
+                              setSca(next.phase.kind === 'failed' ? null : next);
+                              if (next.phase.kind === 'failed') {
+                                setStep('review');
+                                setError(next.phase.message);
+                              }
+                            }}
+                          >
+                            Use security passcode
+                          </button>
+                        )}
+                        {sca.phase.kind === 'passcode' && (
+                          <form
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              const now = Date.now();
+                              const next = passcodeMatches(passcodeEntry, enrolledPasscode)
+                                ? passcodeVerified(sca, now)
+                                : passcodeRejected(sca, now);
+                              setPasscodeEntry('');
+                              if (next.phase.kind === 'ready') {
+                                setSca(next);
+                                void completeSca(next);
+                              } else if (next.phase.kind === 'failed') {
+                                setSca(null);
+                                setStep('review');
+                                setError(next.phase.message);
+                              } else {
+                                setSca(next);
+                                if (next.phase.kind === 'passcode' && next.phase.message) {
+                                  setError(next.phase.message);
+                                }
+                              }
+                            }}
+                          >
+                            <label htmlFor="sca-passcode">Security passcode</label>
+                            <input
+                              id="sca-passcode"
+                              type="password"
+                              inputMode="numeric"
+                              autoComplete="off"
+                              value={passcodeEntry}
+                              maxLength={6}
+                              onChange={(event) =>
+                                setPasscodeEntry(event.target.value.replace(/\D/g, '').slice(0, 6))
+                              }
+                            />
+                            <button className="primary" type="submit" disabled={busy || !connected}>
+                              Verify passcode
+                            </button>
+                          </form>
+                        )}
+                        {sca.phase.kind === 'ready' && (
+                          <button
+                            className="primary"
+                            type="button"
+                            disabled={busy || !connected}
+                            onClick={() => void completeSca(sca)}
+                          >
+                            Retry settlement
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  )}
                   {step === 'review' && (
                     <>
                       <div className="mobile-review">
-                        <span>To {selected?.name}</span>
-                        <strong>{money(pence(amount) || 0)}</strong>
+                        <span data-testid="sca-recipient">To {selected?.name}</span>
+                        <strong data-testid="sca-amount">{money(pence(amount) || 0)}</strong>
                         <p>
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
@@ -433,6 +598,22 @@ export default function App() {
                   >
                     Apply room
                   </button>
+                  <label htmlFor="mobile-passcode">Rehearsal security passcode</label>
+                  <input
+                    id="mobile-passcode"
+                    type="password"
+                    inputMode="numeric"
+                    autoComplete="off"
+                    value={enrolledPasscode}
+                    maxLength={6}
+                    onChange={(event) =>
+                      setEnrolledPasscode(event.target.value.replace(/\D/g, '').slice(0, 6))
+                    }
+                  />
+                  <p className="fine-print">
+                    Stored in this browser session only. It is not sent to the API or a payment
+                    provider.
+                  </p>
                   <label htmlFor="mobile-scenario">Payment scenario</label>
                   <select
                     id="mobile-scenario"
