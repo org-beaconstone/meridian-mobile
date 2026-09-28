@@ -277,10 +277,25 @@ public func money(_ pence: Int) -> String {
   return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
 }
 
-/// Parse amount string to integer pence
-/// - Parameter input: Amount string (e.g., "10.50", "10", "10.5")
+/// Card is Adyen and bank is Worldpay. A timeout must not select another provider.
+public func baselineProvider(for method: PaymentMethod) -> ProviderId {
+  switch method {
+  case .card:
+    return .adyen
+  case .bank:
+    return .worldpay
+  }
+}
+
+/// Parse amount string to integer GBP pence.
+/// - Parameters:
+///   - input: Amount string (e.g., "10.50", "10", "10.5")
+///   - currency: ISO currency code. Only GBP is accepted.
 /// - Returns: Tuple of (pence: Int?, error: String?)
-public func parseAmount(_ input: String) -> (Int?, String?) {
+public func parseAmount(_ input: String, currency: String = "GBP") -> (Int?, String?) {
+  if currency != "GBP" {
+    return (nil, "Only GBP integer pence are supported")
+  }
   let trimmed = input.trimmingCharacters(in: .whitespaces)
 
   // Empty or whitespace only

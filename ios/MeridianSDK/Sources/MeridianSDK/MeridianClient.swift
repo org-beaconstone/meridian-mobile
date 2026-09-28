@@ -1,19 +1,35 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+public struct PaymentSubmission {
+  public let statusCode: Int
+  public let body: PaymentResponse
+
+  public init(statusCode: Int, body: PaymentResponse) {
+    self.statusCode = statusCode
+    self.body = body
+  }
+}
 
 public actor MeridianClient {
   private let baseURL: URL
-  private let sessionId: String
+  public let sessionId: String
   private let session: URLSession
+  private let timeout: TimeInterval
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - timeout: Per-request timeout. Uncertain timeouts keep the caller's idempotency key.
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    timeout: TimeInterval = 15
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,6 +52,7 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.timeout = timeout
   }
 
   // MARK: - Internal Request Method
@@ -45,11 +62,12 @@ public actor MeridianClient {
     path: String,
     body: Encodable? = nil,
     additionalHeaders: [String: String] = [:]
-  ) async throws -> T {
+  ) async throws -> (value: T, statusCode: Int) {
     let url = baseURL.appendingPathComponent(path)
 
     var request = URLRequest(url: url)
     request.httpMethod = method
+    request.timeoutInterval = timeout
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
 
@@ -64,7 +82,15 @@ public actor MeridianClient {
       request.httpBody = try encoder.encode(body)
     }
 
-    let (data, response) = try await session.data(for: request)
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await session.data(for: request)
+    } catch let error as URLError where error.code == .timedOut {
+      throw MeridianError.networkError("Gateway timeout. Retry the same payment.")
+    } catch {
+      throw MeridianError.networkError(String(describing: error))
+    }
 
     guard let httpResponse = response as? HTTPURLResponse else {
       throw MeridianError.networkError("Invalid response type")
@@ -82,7 +108,7 @@ public actor MeridianClient {
 
     let decoder = JSONDecoder()
     do {
-      return try decoder.decode(T.self, from: data)
+      return (try decoder.decode(T.self, from: data), httpResponse.statusCode)
     } catch {
       throw MeridianError.decodingError(error.localizedDescription)
     }
@@ -92,17 +118,23 @@ public actor MeridianClient {
 
   /// GET /health - Check service health
   public func getHealth() async throws -> HealthResponse {
-    return try await request(method: "GET", path: "/health")
+    let response: (value: HealthResponse, statusCode: Int) = try await request(method: "GET", path: "/health")
+    return response.value
   }
 
   /// GET /catalog - Fetch recipients and providers
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    let response: (value: CatalogResponse, statusCode: Int) = try await request(method: "GET", path: "/catalog")
+    guard response.statusCode == 200 else {
+      throw MeridianError.httpError(statusCode: response.statusCode, message: "Catalog request failed")
+    }
+    return response.value
   }
 
   /// GET /state - Fetch current bank state
   public func getState() async throws -> BankState {
-    return try await request(method: "GET", path: "/state")
+    let response: (value: BankState, statusCode: Int) = try await request(method: "GET", path: "/state")
+    return response.value
   }
 
   /// POST /payments - Submit a payment
@@ -121,6 +153,26 @@ public actor MeridianClient {
     scenario: Scenario = .success,
     idempotencyKey: String
   ) async throws -> PaymentResponse {
+    try await submitPaymentDetailed(
+      recipientId: recipientId,
+      amountMinor: amountMinor,
+      method: method,
+      note: note,
+      scenario: scenario,
+      idempotencyKey: idempotencyKey
+    ).body
+  }
+
+  /// POST /payments including the HTTP status so callers can tell 200 settlement from 202 pending.
+  /// The idempotency key is sent unchanged. Method stays the caller's card or bank choice.
+  public func submitPaymentDetailed(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = .success,
+    idempotencyKey: String
+  ) async throws -> PaymentSubmission {
     let payload = PaymentRequest(
       recipientId: recipientId,
       amountMinor: amountMinor,
@@ -128,13 +180,13 @@ public actor MeridianClient {
       note: note,
       scenario: scenario
     )
-
-    return try await request(
+    let response: (value: PaymentResponse, statusCode: Int) = try await request(
       method: "POST",
       path: "/payments",
       body: payload,
       additionalHeaders: ["Idempotency-Key": idempotencyKey]
     )
+    return PaymentSubmission(statusCode: response.statusCode, body: response.value)
   }
 
   /// PATCH /budgets - Update budget for a category
@@ -146,20 +198,23 @@ public actor MeridianClient {
     limitMinor: Int
   ) async throws -> BudgetResponse {
     let payload = BudgetRequest(category: category, limitMinor: limitMinor)
-    return try await request(
+    let response: (value: BudgetResponse, statusCode: Int) = try await request(
       method: "PATCH",
       path: "/budgets",
       body: payload
     )
+    return response.value
   }
 
   /// POST /reset - Reset session state
   public func reset() async throws -> ResetResponse {
-    return try await request(method: "POST", path: "/reset")
+    let response: (value: ResetResponse, statusCode: Int) = try await request(method: "POST", path: "/reset")
+    return response.value
   }
 
   /// GET /events - Fetch audit events
   public func getEvents() async throws -> EventsResponse {
-    return try await request(method: "GET", path: "/events")
+    let response: (value: EventsResponse, statusCode: Int) = try await request(method: "GET", path: "/events")
+    return response.value
   }
 }

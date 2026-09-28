@@ -15,7 +15,8 @@ import java.nio.charset.StandardCharsets
  */
 class MeridianClient(
   private val baseURL: String,
-  private val sessionId: String,
+  val sessionId: String,
+  private val timeoutMillis: Int = 15_000,
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
@@ -35,14 +36,21 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
+  ): T = requestWithStatus(method, path, body, additionalHeaders, responseType).second
+
+  private suspend fun <T> requestWithStatus(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+    responseType: Class<T>,
+  ): Pair<Int, T> = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
-
     val connection = url.openConnection() as HttpURLConnection
     try {
-      connection.connectTimeout = 15000
-      connection.readTimeout = 15000
+      connection.connectTimeout = timeoutMillis
+      connection.readTimeout = timeoutMillis
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
@@ -72,26 +80,12 @@ class MeridianClient(
 
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
 
-      // Check HTTP status and handle errors
-      when {
-        statusCode >= 200 && statusCode < 300 -> {
-          // Success
+      val parsed: T = when {
+        statusCode in 200..299 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
           try {
             mapper.readValue(responseBody, responseType)
           } catch (e: Exception) {
             throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
-          }
-        }
-
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
-          // These are expected error statuses, parse the response
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.HttpError(
-              statusCode,
-              responseBody.ifEmpty { "Unknown error" }
-            )
           }
         }
 
@@ -102,6 +96,13 @@ class MeridianClient(
           )
         }
       }
+      Pair(statusCode, parsed)
+    } catch (e: MeridianError) {
+      throw e
+    } catch (e: java.net.SocketTimeoutException) {
+      throw MeridianError.NetworkError("Gateway timeout. Retry the same payment.", e)
+    } catch (e: java.io.IOException) {
+      throw MeridianError.NetworkError(e.message ?: "Network error", e)
     } finally {
       connection.disconnect()
     }
@@ -143,7 +144,27 @@ class MeridianClient(
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
-  ): PaymentResponse {
+  ): PaymentResponse = submitPaymentDetailed(
+    recipientId,
+    amountMinor,
+    method,
+    note,
+    scenario,
+    idempotencyKey,
+  ).body
+
+  /**
+   * POST /payments including the HTTP status so callers can tell 200 settlement from 202 pending.
+   * The idempotency key is sent unchanged. Method stays the caller's card or bank choice.
+   */
+  suspend fun submitPaymentDetailed(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+    idempotencyKey: String,
+  ): PaymentSubmission {
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
@@ -152,13 +173,14 @@ class MeridianClient(
       scenario = scenario.name,
     )
 
-    return request(
+    val (statusCode, body) = requestWithStatus(
       "POST",
       "/payments",
       payload,
       mapOf("Idempotency-Key" to idempotencyKey),
       PaymentResponse::class.java,
     )
+    return PaymentSubmission(statusCode, body)
   }
 
   /**

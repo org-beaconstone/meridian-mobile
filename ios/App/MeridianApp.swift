@@ -8,6 +8,7 @@ import MeridianSDK
   @State private var endpoint = "http://127.0.0.1:8080/api/v1"
   @State private var room = "meridian-rehearsal"
   @State private var client: MeridianClient?
+  @State private var rehearsal: RehearsalSession?
   @State private var state: BankState?
   @State private var catalog: CatalogResponse?
   @State private var recipient = "northline-studio"
@@ -63,22 +64,57 @@ import MeridianSDK
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
+    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString; client=nil; rehearsal=nil
+    do {
+      let next=try MeridianClient(baseURL:endpoint,sessionId:room)
+      client=next
+      rehearsal=RehearsalSession(client:next)
+      await refresh()
+    } catch { message=String(describing:error) }
   }
   private func refresh() async {
-    guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    guard let client, let rehearsal else {return}
+    let started=generation
+    var stateError: String?
+    do {
+      let next=try await client.getState()
+      if started==generation && !busy { state=next }
+    } catch { stateError=String(describing:error) }
+    let hydration=await rehearsal.hydrateCatalog()
+    guard started==generation && !busy else { return }
+    if let definitions=hydration.catalog { catalog=definitions }
+    if hydration.degraded {
+      message = hydration.catalog == nil ? "API unavailable and no catalog has been loaded" : "Showing last-known-good catalog"
+    } else if let stateError {
+      message="API unavailable: \(stateError)"
+    } else {
+      message="Connected to shared Java API"
+    }
   }
   private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
+    guard let rehearsal, !busy else {return}
+    busy=true; generation += 1
     defer {busy=false}
-    do {
-      let (minor,error)=parseAmount(amount)
-      guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
-    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+    let (minor,error)=parseAmount(amount)
+    guard let minor else {message=error ?? "Invalid amount";return}
+    let attempt=PaymentAttempt(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
+    switch await rehearsal.submit(attempt) {
+    case let .settled(response, _):
+      state=response.state; review=false; amount=""; reference=""; key=UUID().uuidString
+      message="Demo payment completed. Other clients will refresh."
+    case let .pending(response, kept):
+      key=kept.idempotencyKey
+      message=response.error ?? "Payment pending confirmation. Retry the same payment, not a new one."
+    case let .declined(response, kept):
+      key=kept.idempotencyKey
+      message=response.error ?? "Payment declined. No debit was made."
+    case let .retryable(text, kept):
+      key=kept.idempotencyKey
+      method=kept.method
+      message="\(text) Retry keeps the same payment key and selected method."
+    case let .rejected(text, kept):
+      key=kept.idempotencyKey
+      message=text
+    }
   }
 }
