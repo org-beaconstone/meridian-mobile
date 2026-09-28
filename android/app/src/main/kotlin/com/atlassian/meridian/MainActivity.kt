@@ -12,6 +12,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -37,14 +38,23 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  var corridor by remember { mutableStateOf("unknown") }
   LaunchedEffect(client) {
-    val current=client
-    while(current!=null) {
+    val current=client ?: return@LaunchedEffect
+    launch {
+      while(isActive && current===client) {
+        val report=current.checkSessionHealth()
+        if(current===client) corridor=report.connectionState
+        delay(15000)
+      }
+    }
+    while(isActive) {
       val started=revision
+      corridor=current.telemetry.connectionState()
       if(!busy) try {
         val fresh=current.getState(); val definitions=current.getCatalog()
         if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
-      } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
+      } catch(e:Exception) {if(current===client)message="API unavailable: ${com.atlassian.meridian.TelemetrySanitizer.redact(e.message ?: "network failure")}"}
       delay(2000)
     }
   }
@@ -55,9 +65,10 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;corridor="unknown";revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
+    Text("Corridor: $corridor",style=MaterialTheme.typography.caption)
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
@@ -71,14 +82,22 @@ class MainActivity : ComponentActivity() {
       // Intentional two-provider native baseline; changing it requires an app release.
       Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
       Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      Text("Confirm runs a local biometric check on this device. Telemetry omits card numbers and IBANs.",style=MaterialTheme.typography.caption)
       if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
         Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
-            if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
-            else message=result.error?:"Awaiting confirmation. Retry the same payment."
-          }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
+          try {
+            val biometric=active.resolveLocalBiometricPrompt(method)
+            if(biometric.fallback){message="Local biometric check could not finish. Retry this same payment key."}
+            else if(!biometric.accepted){message="Local biometric check was declined. The payment key is unchanged."}
+            else {
+              val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
+              if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
+              else if(result.code?.uppercase()?.contains("SCA")==true) message="SCA challenge needs another attempt on the same provider. The payment key is unchanged."
+              else message=TelemetrySanitizer.redact(result.error?:"Awaiting confirmation. Retry the same payment.")
+            }
+          }catch(e:Exception){message="Outcome may be unknown: ${TelemetrySanitizer.redact(e.message ?: "network failure")}. Retry keeps the same key."}finally{revision++;busy=false}
         }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
         TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }

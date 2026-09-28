@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import {
+  createTraceparent,
+  probeSessionHealth,
+  redact,
+  rehearsalTelemetry,
+  shouldInjectTraceparent,
+} from './domain/telemetry';
 
 type Method = 'card' | 'bank';
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
@@ -33,7 +40,19 @@ class RequestError extends Error {
     super(message);
   }
 }
-async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
+type ApiPayload = {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  state?: unknown;
+  transaction?: Transaction;
+  recipients?: Recipient[];
+  providers?: unknown[];
+};
+async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string): Promise<ApiPayload> {
+  const traced = shouldInjectTraceparent(path);
+  const traceparent = traced ? createTraceparent() : undefined;
+  const started = performance.now();
   let response: Response;
   try {
     response = await fetch('/api/v1' + path, {
@@ -42,20 +61,78 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
         'Content-Type': 'application/json',
         'X-Rehearsal-Session': room,
         ...(key ? { 'Idempotency-Key': key } : {}),
+        ...(traceparent ? { traceparent } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(15000),
     });
   } catch {
+    const stage = path.endsWith('/payments') ? 'gateway_roundtrip' : 'network';
+    if (path.endsWith('/payments') && traceparent) {
+      rehearsalTelemetry.recordGateway({
+        traceparent,
+        durationMillis: performance.now() - started,
+        httpStatus: 0,
+        ok: false,
+        code: 'NETWORK_ERROR',
+        method: paymentMethod(body),
+      });
+    } else {
+      rehearsalTelemetry.recordError('NETWORK_ERROR', stage);
+    }
     throw new RequestError(
       'Connection lost. Outcome may be unknown. Retry this same payment after reconnecting.',
       'NETWORK_ERROR',
     );
   }
-  const data = await response.json();
+  const raw = await response.text();
+  if (path.endsWith('/catalog')) {
+    const parseStarted = performance.now();
+    let data: ApiPayload;
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      rehearsalTelemetry.recordError('DECODING_ERROR', 'catalog_parse');
+      throw new RequestError('Catalog response could not be read.', 'DECODING_ERROR');
+    }
+    if (traceparent) {
+      rehearsalTelemetry.recordCatalogParse(
+        traceparent,
+        performance.now() - parseStarted,
+        Array.isArray(data.recipients) ? data.recipients.length : 0,
+        Array.isArray(data.providers) ? data.providers.length : 0,
+      );
+    }
+    if (!response.ok) {
+      throw new RequestError(redact(data.error || `HTTP ${response.status}`), data.code || 'HTTP_ERROR');
+    }
+    return data;
+  }
+  let data: ApiPayload;
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch {
+    data = {};
+  }
+  if (path.endsWith('/payments') && traceparent) {
+    rehearsalTelemetry.recordGateway({
+      traceparent,
+      durationMillis: performance.now() - started,
+      httpStatus: response.status,
+      ok: response.ok && data.ok !== false,
+      code: data.code || (response.ok ? undefined : 'HTTP_ERROR'),
+      message: data.error,
+      method: paymentMethod(body),
+    });
+  }
   if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+    throw new RequestError(redact(data.error || `HTTP ${response.status}`), data.code || 'HTTP_ERROR');
   return data;
+}
+function paymentMethod(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object' || !('method' in body)) return undefined;
+  const method = (body as { method?: unknown }).method;
+  return method === 'card' || method === 'bank' ? method : undefined;
 }
 function bankState(value: unknown): State {
   const v = value as State;
@@ -79,6 +156,7 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [corridor, setCorridor] = useState('unknown');
   const [page, setPage] = useState<'Home' | 'Pay' | 'History' | 'Settings'>('Home');
   const [recipient, setRecipient] = useState('northline-studio');
   const [amount, setAmount] = useState('');
@@ -98,6 +176,8 @@ export default function App() {
     const generation = ++epoch.current;
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
+    rehearsalTelemetry.reset();
+    setCorridor('unknown');
     setState(null);
     setConnected(false);
     setError('');
@@ -116,15 +196,21 @@ export default function App() {
             !mutating.current
           ) {
             setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            setRecipients(catalog.recipients ?? []);
             setConnected(true);
           }
         }
       } catch (e) {
         if (!closed && generation === epoch.current) {
           setConnected(false);
-          setError(e instanceof Error ? e.message : 'API unavailable');
+          setError(e instanceof Error ? redact(e.message) : 'API unavailable');
         }
+      }
+      try {
+        const nextCorridor = await probeSessionHealth(room);
+        if (!closed && generation === epoch.current) setCorridor(nextCorridor);
+      } catch {
+        if (!closed && generation === epoch.current) setCorridor('unreachable');
       } finally {
         if (!closed) timer = setTimeout(poll, 2000);
       }
@@ -181,6 +267,15 @@ export default function App() {
     setStep('review');
   }
   async function confirm() {
+    const biometric = rehearsalTelemetry.resolveLocalBiometric(method);
+    if (!biometric.accepted) {
+      setError(
+        biometric.fallback
+          ? 'Local biometric check could not finish. Retry this same payment.'
+          : 'Local biometric check was declined. The payment key is unchanged.',
+      );
+      return;
+    }
     try {
       setError('');
       const result = await mutate(
@@ -190,11 +285,15 @@ export default function App() {
         paymentKey.current,
       );
       if (result.ok) {
-        setReceipt(result.transaction);
+        setReceipt(result.transaction ?? null);
         setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      } else if (String(result.code || '').toUpperCase().includes('SCA')) {
+        setError('SCA challenge needs another attempt on the same provider. The payment key is unchanged.');
+      } else setError(redact(result.error || 'Payment pending confirmation. Do not create a new payment.'));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Payment failed');
+      if (e instanceof RequestError && e.code.toUpperCase().includes('SCA')) {
+        setError('SCA challenge needs another attempt on the same provider. The payment key is unchanged.');
+      } else setError(e instanceof Error ? redact(e.message) : 'Payment failed');
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
@@ -223,6 +322,7 @@ export default function App() {
         <div className="connection-bar">
           <span className={connected ? 'status-dot' : 'status-dot offline'} />
           <strong>{connected ? 'Connected API' : 'API unavailable'}</strong>
+          <span data-testid="corridor-state">Corridor {corridor}</span>
           <span>{room}</span>
         </div>
         <main>
@@ -372,6 +472,7 @@ export default function App() {
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
                         </p>
+                        <p>Local biometric check runs on this device before the payment is sent.</p>
                       </div>
                       <button className="primary" onClick={confirm} disabled={busy || !connected}>
                         {busy ? 'Confirming…' : 'Confirm payment'}
@@ -504,7 +605,8 @@ export default function App() {
                   </button>
                   <p className="fine-print">
                     Room IDs isolate fictional data. They are not authentication. Never enter real
-                    account or card details.
+                    account or card details. This browser companion redacts card numbers and IBANs
+                    from its telemetry.
                   </p>
                 </section>
               )}

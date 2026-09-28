@@ -23,7 +23,7 @@ swift run MeridianDesktop
 MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks
 ```
 
-Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, 20 executable SDK assertions, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated.
+`swift run MeridianSDKChecks` covers amount parsing, model decoding, W3C traceparent injection, span timers, and redaction. A previous macOS run compiled the SwiftUI desktop executable and exercised Java transport, including payment, duplicate-key retry, pending response, and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated, and this tracing change was not recompiled on macOS.
 
 For an iOS project, install Xcode and XcodeGen, then `cd ios && xcodegen generate`. `project.yml` builds `App/MeridianApp.swift` with the local SDK package. No iOS simulator/device build was run on the authoring machine because full Xcode was unavailable. Local network HTTP is for the rehearsal only; use HTTPS for any shared hosted endpoint.
 
@@ -36,9 +36,13 @@ mvn clean verify
 gradle :app:assembleDebug
 ```
 
-`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 22 tests including an actual local HTTP transport check for session/idempotency headers and HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
+`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 28 tests including an actual local HTTP transport check for session, idempotency, and `traceparent` headers, plus HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
+
+## Tracing and telemetry
+
+The Swift and Kotlin SDKs inject a W3C `traceparent` header on `GET /catalog`, `POST /payments`, and `GET /session/health`. Span timers cover catalog JSON parsing, the local biometric prompt, and the payment gateway round trip. Session health polls record connection changes and emit a telemetry event when an Adyen card or Worldpay bank corridor degrades. Card numbers and IBANs are redacted before anything is stored in the in-memory log. The log is not exported and does not call a payment provider. The browser companion under `preview/` mirrors the same header, spans, and redaction; it is still a rehearsal UI, not a native build.
 
 ## Deliberate baseline
 

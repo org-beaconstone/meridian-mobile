@@ -19,6 +19,7 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @State private var corridor = "unknown"
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -30,6 +31,7 @@ import MeridianSDK
           Button("Connect") { Task { await connect() } }.disabled(busy)
         }.textFieldStyle(.roundedBorder)
         Text(message).font(.callout).foregroundStyle(.secondary)
+        Text("Corridor: \(corridor)").font(.caption).foregroundStyle(.secondary)
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
@@ -44,6 +46,7 @@ import MeridianSDK
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
           // Intentionally hardcoded baseline: new providers still require a native release.
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          Text("Confirm runs a local biometric check on this device. Telemetry omits card numbers and IBANs.").font(.caption).foregroundStyle(.secondary)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
@@ -63,12 +66,19 @@ import MeridianSDK
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
+    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString; corridor="unknown"
+    await client?.stopSessionHealthChecks()
+    do {
+      let next=try MeridianClient(baseURL:endpoint,sessionId:room)
+      client=next
+      await next.startSessionHealthChecks()
+      await refresh()
+    } catch { message=TelemetrySanitizer.redact(String(describing:error)) }
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    corridor=client.telemetry.connectionState()
+    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"; corridor=client.telemetry.connectionState()} } catch { if started==generation {message="API unavailable: \(TelemetrySanitizer.redact(String(describing:error)))"} }
   }
   private func pay() async {
     guard let client, !busy else {return}; busy=true; generation += 1
@@ -76,9 +86,13 @@ import MeridianSDK
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
+      let biometric=await client.resolveLocalBiometricPrompt(method:method)
+      if biometric.fallback { message="Local biometric check could not finish. Retry this same payment key."; return }
+      if !biometric.accepted { message="Local biometric check was declined. The payment key is unchanged."; return }
       let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
       if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
-    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+      else if let code=result.code, code.uppercased().contains("SCA") { message="SCA challenge needs another attempt on the same provider. The payment key is unchanged." }
+      else {message=TelemetrySanitizer.redact(result.error ?? "Payment pending. Retry the same payment, not a new one.")}
+    } catch {message="Outcome may be unknown: \(TelemetrySanitizer.redact(String(describing:error))). Retry preserves the payment key."}
   }
 }
