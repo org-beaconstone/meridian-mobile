@@ -35,7 +35,18 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
+  ): T {
+    val (decoded, _) = requestWithStatus(method, path, body, additionalHeaders, responseType)
+    return decoded
+  }
+
+  private suspend fun <T> requestWithStatus(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+    responseType: Class<T>,
+  ): Pair<T, Int> = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
@@ -75,18 +86,18 @@ class MeridianClient(
       // Check HTTP status and handle errors
       when {
         statusCode >= 200 && statusCode < 300 -> {
-          // Success
+          // Success, including HTTP 202 SCA_STEP_UP_REQUIRED and PAYMENT_PENDING
           try {
-            mapper.readValue(responseBody, responseType)
+            Pair(mapper.readValue(responseBody, responseType), statusCode)
           } catch (e: Exception) {
             throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
           }
         }
 
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
+        statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
           // These are expected error statuses, parse the response
           try {
-            mapper.readValue(responseBody, responseType)
+            Pair(mapper.readValue(responseBody, responseType), statusCode)
           } catch (e: Exception) {
             throw MeridianError.HttpError(
               statusCode,
@@ -134,7 +145,8 @@ class MeridianClient(
    * @param method Payment method (card or bank)
    * @param note Optional note (max 200 chars)
    * @param scenario Simulation scenario
-   * @param idempotencyKey Unique key for idempotency
+   * @param idempotencyKey Unique key for idempotency. Reuse it when retrying, including after SCA.
+   * @param scaChallengeToken Set only after local biometric or passcode verification.
    */
   suspend fun submitPayment(
     recipientId: String,
@@ -143,22 +155,25 @@ class MeridianClient(
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
-  ): PaymentResponse {
+    scaChallengeToken: String? = null,
+  ): PaymentSubmission {
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
       method = method.name,
       note = note,
       scenario = scenario.name,
+      scaChallengeToken = scaChallengeToken,
     )
 
-    return request(
+    val (body, statusCode) = requestWithStatus(
       "POST",
       "/payments",
       payload,
       mapOf("Idempotency-Key" to idempotencyKey),
       PaymentResponse::class.java,
     )
+    return PaymentSubmission(statusCode, body)
   }
 
   /**

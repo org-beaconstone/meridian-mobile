@@ -1,6 +1,8 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.JsonNode
 import java.io.Serializable
 
 // MARK: - Domain Enums
@@ -101,6 +103,19 @@ data class PaymentResponse(
   val code: String? = null,
   @JsonProperty("paymentId")
   val paymentId: String? = null,
+  /** Object or string payload from an HTTP 202 SCA_STEP_UP_REQUIRED body. */
+  val challenge: JsonNode? = null,
+  val challengePayload: String? = null,
+  val expiresAt: String? = null,
+  val expirationTimestamp: String? = null,
+  val expiration: String? = null,
+  val scaChallengeToken: String? = null,
+) : Serializable
+
+/** Payment POST plus HTTP status so a 202 step-up is not treated as a transport failure. */
+data class PaymentSubmission(
+  val statusCode: Int,
+  val body: PaymentResponse,
 ) : Serializable
 
 data class BudgetResponse(
@@ -133,6 +148,9 @@ data class PaymentRequest(
   val method: String,
   val note: String,
   val scenario: String,
+  /** Present only after local verification. Null is omitted so the first POST cannot skip SCA. */
+  @get:JsonInclude(JsonInclude.Include.NON_NULL)
+  val scaChallengeToken: String? = null,
 ) : Serializable
 
 data class BudgetRequest(

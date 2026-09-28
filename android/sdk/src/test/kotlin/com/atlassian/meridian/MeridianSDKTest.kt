@@ -353,9 +353,10 @@ class MeridianSDKTest {
           idempotencyKey = "idempotency-key-1"
         )
       }
-      assertFalse(response1.ok)
-      assertEquals("PAYMENT_PENDING", response1.code)
-      assertEquals("tx-123", response1.paymentId)
+      assertEquals(202, response1.statusCode)
+      assertFalse(response1.body.ok)
+      assertEquals("PAYMENT_PENDING", response1.body.code)
+      assertEquals("tx-123", response1.body.paymentId)
 
       // Second call with same key returns 200 (success)
       val response2 = runBlocking {
@@ -366,7 +367,8 @@ class MeridianSDKTest {
           idempotencyKey = "idempotency-key-1"
         )
       }
-      assertTrue(response2.ok)
+      assertEquals(200, response2.statusCode)
+      assertTrue(response2.body.ok)
 
       // Verify only one idempotency key was used
       assertEquals(1, seenKeys.size)
@@ -374,4 +376,223 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  @Test
+  fun testScaPromptAndFailureCopy() {
+    assertEquals(
+      "Confirm with Face ID / Fingerprint to authorize European payment",
+      ScaStepUp.BIOMETRIC_PROMPT,
+    )
+    assertEquals(
+      "Authentication challenge failed. Please verify with your passcode.",
+      ScaStepUp.FAILURE_MESSAGE,
+    )
+  }
+
+  @Test
+  fun testScaTimestampParsesZuluAndOffset() {
+    val zulu = parseScaTimestamp("2026-09-28T21:45:00Z")
+    val offset = parseScaTimestamp("2026-09-28T22:45:00+01:00")
+    val fractional = parseScaTimestamp("2026-09-28T21:45:00.123Z")
+    assertNotNull(zulu)
+    assertEquals(zulu, offset)
+    assertEquals(zulu!! + 123L, fractional)
+  }
+
+  @Test
+  fun testScaStepUpExtractsChallengeAndFallsBackWithoutReleasingToken() {
+    val body = paymentResponse(
+      """
+      {
+        "ok": false,
+        "code": "SCA_STEP_UP_REQUIRED",
+        "challenge": {
+          "payload": "challenge-payload",
+          "expiresAt": "2099-01-01T00:00:00Z",
+          "scaChallengeToken": "token-123"
+        }
+      }
+      """.trimIndent(),
+    )
+    val payment = samplePayment()
+    val now = 1_700_000_000_000L
+    val handler = ScaChallengeHandler.begin(202, body, payment, now)
+    assertNotNull(handler)
+    assertTrue(handler!!.phase is ScaPhase.Biometric)
+    assertEquals("challenge-payload", (handler.phase as ScaPhase.Biometric).challenge.payload)
+    assertNull(handler.resubmission())
+
+    val passcode = handler.biometricUnavailableOrFailed(now)
+    assertTrue(passcode.phase is ScaPhase.Passcode)
+    assertEquals(payment, passcode.payment)
+    assertNull(passcode.resubmission())
+
+    val rejected = passcode.passcodeRejected(now)
+    assertTrue(rejected.phase is ScaPhase.Passcode)
+    assertEquals(ScaStepUp.FAILURE_MESSAGE, (rejected.phase as ScaPhase.Passcode).message)
+    assertEquals("northline-studio", rejected.payment.recipientId)
+    assertEquals(4500, rejected.payment.amountMinor)
+    assertEquals(payment.idempotencyKey, rejected.payment.idempotencyKey)
+    assertNull(rejected.resubmission())
+  }
+
+  @Test
+  fun testScaPasscodeSuccessResubmitsOriginalKeyAndMethod() {
+    val body = paymentResponse(
+      """
+      {
+        "ok": false,
+        "code": "SCA_STEP_UP_REQUIRED",
+        "challengePayload": "opaque-payload",
+        "expirationTimestamp": "2099-06-01T12:00:00Z",
+        "scaChallengeToken": "token-from-gateway"
+      }
+      """.trimIndent(),
+    )
+    val payment = samplePayment()
+    val now = 1_700_000_000_000L
+    val ready = ScaChallengeHandler.begin(202, body, payment, now)!!
+      .biometricUnavailableOrFailed(now)
+      .passcodeVerified(now)
+    val retry = ready.resubmission()
+    assertNotNull(retry)
+    assertEquals(payment.idempotencyKey, retry!!.idempotencyKey)
+    assertEquals(PaymentMethod.card, retry.method)
+    assertEquals(4500, retry.amountMinor)
+    assertEquals("northline-studio", retry.recipientId)
+    assertEquals("token-from-gateway", retry.scaChallengeToken)
+    assertTrue(RehearsalPasscode.matches("135790", "135790"))
+    assertFalse(RehearsalPasscode.matches("000000", "135790"))
+    assertFalse(RehearsalPasscode.matches("13579", "135790"))
+  }
+
+  @Test
+  fun testExpiredScaChallengeKeepsPaymentAndDoesNotResubmit() {
+    val body = paymentResponse(
+      """
+      {
+        "ok": false,
+        "code": "SCA_STEP_UP_REQUIRED",
+        "challenge": "stale-payload",
+        "expiresAt": "2000-01-01T00:00:00Z",
+        "scaChallengeToken": "stale-token"
+      }
+      """.trimIndent(),
+    )
+    val payment = samplePayment()
+    val handler = ScaChallengeHandler.begin(202, body, payment, System.currentTimeMillis())
+    assertNotNull(handler)
+    assertTrue(handler!!.phase is ScaPhase.Failed)
+    assertEquals(ScaStepUp.FAILURE_MESSAGE, (handler.phase as ScaPhase.Failed).message)
+    assertEquals(payment, handler.payment)
+    assertNull(handler.resubmission())
+    assertNull(ScaChallengeHandler.begin(202, paymentResponse("""{"ok":false,"code":"PAYMENT_PENDING"}"""), payment, 0))
+    assertNull(ScaChallengeHandler.begin(400, body, payment, 0))
+  }
+
+  @Test
+  fun testPaymentRequestOmitsTokenUntilPresent() {
+    val without = mapper.writeValueAsString(
+      PaymentRequest("northline-studio", 4500, "card", "Lunch", "success"),
+    )
+    assertFalse(without.contains("scaChallengeToken"))
+    val withToken = mapper.readTree(
+      mapper.writeValueAsString(
+        PaymentRequest("northline-studio", 4500, "card", "Lunch", "success", "token-123"),
+      ),
+    )
+    assertEquals("token-123", withToken.get("scaChallengeToken").asText())
+    assertEquals("card", withToken.get("method").asText())
+    assertEquals(4500, withToken.get("amountMinor").asInt())
+  }
+
+  @Test
+  fun testScaStepUpResubmitsOriginalIdempotencyKey() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    val baseUrl = "http://127.0.0.1:$port/api/v1"
+    val bodies = mutableListOf<String>()
+    val keys = mutableListOf<String>()
+
+    server.createContext("/api/v1/payments") { exchange ->
+      val sessionHeader = exchange.requestHeaders.getFirst("X-Rehearsal-Session")
+      assertEquals("sca-room", sessionHeader)
+      val idempotencyKey = exchange.requestHeaders.getFirst("Idempotency-Key")
+      keys.add(idempotencyKey)
+      val requestBody = exchange.requestBody.bufferedReader().use { it.readText() }
+      bodies.add(requestBody)
+      val responseBody = if (bodies.size == 1) {
+        """{"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"challenge-payload","expiresAt":"2099-01-01T00:00:00Z","scaChallengeToken":"token-123"}}"""
+      } else {
+        """{"ok":true,"paymentId":"pay-sca"}"""
+      }
+      val status = if (bodies.size == 1) 202 else 200
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(status, responseBody.toByteArray().size.toLong())
+      exchange.responseBody.write(responseBody.toByteArray())
+      exchange.close()
+    }
+
+    server.start()
+    try {
+      val client = MeridianClient(baseUrl, "sca-room")
+      val key = "idem-sca-1"
+      val first = runBlocking {
+        client.submitPayment(
+          recipientId = "northline-studio",
+          amountMinor = 4500,
+          method = PaymentMethod.card,
+          note = "European rehearsal",
+          idempotencyKey = key,
+        )
+      }
+      val payment = InFlightPayment(
+        "northline-studio",
+        4500,
+        PaymentMethod.card,
+        "European rehearsal",
+        Scenario.success,
+        key,
+      )
+      val now = System.currentTimeMillis()
+      val ready = ScaChallengeHandler.begin(first.statusCode, first.body, payment, now)!!
+        .biometricSucceeded(now)
+      val retry = ready.resubmission()!!
+      assertEquals(PaymentMethod.card, retry.method)
+      val second = runBlocking {
+        client.submitPayment(
+          recipientId = retry.recipientId,
+          amountMinor = retry.amountMinor,
+          method = retry.method,
+          note = retry.note,
+          scenario = retry.scenario,
+          idempotencyKey = retry.idempotencyKey,
+          scaChallengeToken = retry.scaChallengeToken,
+        )
+      }
+      assertEquals(200, second.statusCode)
+      assertTrue(second.body.ok)
+      assertEquals(listOf(key, key), keys)
+      val firstJson = mapper.readTree(bodies[0])
+      val secondJson = mapper.readTree(bodies[1])
+      assertFalse(firstJson.has("scaChallengeToken"))
+      assertEquals("token-123", secondJson.get("scaChallengeToken").asText())
+      assertEquals("card", secondJson.get("method").asText())
+      assertEquals(4500, secondJson.get("amountMinor").asInt())
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  private fun paymentResponse(json: String): PaymentResponse =
+    mapper.readValue(json, PaymentResponse::class.java)
+
+  private fun samplePayment() = InFlightPayment(
+    recipientId = "northline-studio",
+    amountMinor = 4500,
+    method = PaymentMethod.card,
+    note = "Studio supplies",
+    scenario = Scenario.success,
+    idempotencyKey = "idem-original",
+  )
 }

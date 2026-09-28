@@ -405,6 +405,22 @@ legend {
   font-size: 11px;
   margin-top: 20px !important;
 }
+.sca-panel {
+  margin-top: 8px;
+  padding: 16px;
+  border: 1px solid #d7ded0;
+  border-radius: 9px;
+  background: #f7f8f4;
+}
+.sca-panel h2 {
+  font-size: 15px;
+  line-height: 1.45;
+  margin-bottom: 8px;
+}
+.sca-panel .preview-label {
+  text-align: left;
+  margin-bottom: 10px;
+}
 @media (max-width: 480px) {
   .rehearsal-background {
     padding: 0;
