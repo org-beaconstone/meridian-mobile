@@ -42,14 +42,22 @@ import MeridianSDK
           }
           TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
-          Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          // Allowlist stays Adyen card and Worldpay bank. Catalog availability only hides one of those two.
+          if let catalog, !catalog.activeProviders.isEmpty {
+            Picker("Method", selection: $method) {
+              ForEach(catalog.activeProviders, id: \.id) { provider in
+                Text(ProviderBaseline.label(for: provider.id)).tag(provider.methods[0])
+              }
+            }.disabled(review || busy)
+          } else if catalog != nil {
+            Text("No payment method is available right now.")
+          }
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
             Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; guard catalog?.activeProviders.contains(where: { $0.methods.contains(method) }) == true else { message="That payment method is unavailable."; return }; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy || catalog?.activeProviders.isEmpty != false)
           }
           Text("Recent activity").font(.title2)
           ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
@@ -68,7 +76,28 @@ import MeridianSDK
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    do {
+      let next=try await client.getState()
+      let definitions=await client.loadCatalog()
+      if started==generation && !busy {
+        state=next
+        catalog=definitions.catalog
+        let offered=definitions.catalog.activeProviders.contains { $0.methods.contains(method) }
+        let wasReview=review
+        if !offered {
+          if review { key=UUID().uuidString }
+          review=false
+          if let fallback=definitions.catalog.activeProviders.first?.methods.first { method=fallback }
+        }
+        if definitions.catalog.activeProviders.isEmpty {
+          message="No payment method is available right now."
+        } else if !offered && wasReview {
+          message="That payment method is unavailable. Review the payment again."
+        } else {
+          message = definitions.origin == .network || definitions.origin == .cache ? "Connected to shared Java API" : "Connected to shared Java API. Using saved provider catalog."
+        }
+      }
+    } catch { if started==generation {message="API unavailable: \(error)"} }
   }
   private func pay() async {
     guard let client, !busy else {return}; busy=true; generation += 1
@@ -76,6 +105,12 @@ import MeridianSDK
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
+      if let catalog, !catalog.activeProviders.contains(where: { $0.methods.contains(method) }) {
+        review=false
+        key=UUID().uuidString
+        message="That payment method is unavailable."
+        return
+      }
       let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
       if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
       else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}

@@ -134,17 +134,86 @@ public struct Provider: Codable, Hashable {
   public let name: String
   public let description: String
   public let methods: [PaymentMethod]
+  public let available: Bool
 
   public init(
     id: ProviderId,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [PaymentMethod],
+    available: Bool = true
   ) {
     self.id = id
     self.name = name
     self.description = description
     self.methods = methods
+    self.available = available
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id, name, description, methods, available
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(ProviderId.self, forKey: .id)
+    name = try container.decode(String.self, forKey: .name)
+    description = try container.decode(String.self, forKey: .description)
+    methods = try container.decode([PaymentMethod].self, forKey: .methods)
+    available = try container.decodeIfPresent(Bool.self, forKey: .available) ?? true
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(name, forKey: .name)
+    try container.encode(description, forKey: .description)
+    try container.encode(methods, forKey: .methods)
+    try container.encode(available, forKey: .available)
+  }
+}
+
+public struct Corridor: Codable, Hashable {
+  public let id: String
+  public let provider: ProviderId
+  public let method: PaymentMethod
+  public let currency: String
+  public let available: Bool
+
+  public init(
+    id: String,
+    provider: ProviderId,
+    method: PaymentMethod,
+    currency: String,
+    available: Bool = true
+  ) {
+    self.id = id
+    self.provider = provider
+    self.method = method
+    self.currency = currency
+    self.available = available
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id, provider, method, currency, available
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    provider = try container.decode(ProviderId.self, forKey: .provider)
+    method = try container.decode(PaymentMethod.self, forKey: .method)
+    currency = try container.decodeIfPresent(String.self, forKey: .currency) ?? "GBP"
+    available = try container.decodeIfPresent(Bool.self, forKey: .available) ?? true
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(provider, forKey: .provider)
+    try container.encode(method, forKey: .method)
+    try container.encode(currency, forKey: .currency)
+    try container.encode(available, forKey: .available)
   }
 }
 
@@ -160,6 +229,110 @@ public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
   public let providers: [Provider]
+  public let corridors: [Corridor]
+
+  public init(
+    demoDate: String,
+    recipients: [Recipient],
+    providers: [Provider],
+    corridors: [Corridor] = []
+  ) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+    self.corridors = corridors
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case demoDate, recipients, providers, corridors
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    demoDate = try container.decode(String.self, forKey: .demoDate)
+    recipients = try container.decode([Recipient].self, forKey: .recipients)
+    providers = try container.decode([Provider].self, forKey: .providers)
+    corridors = try container.decodeIfPresent([Corridor].self, forKey: .corridors) ?? []
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(demoDate, forKey: .demoDate)
+    try container.encode(recipients, forKey: .recipients)
+    try container.encode(providers, forKey: .providers)
+    try container.encode(corridors, forKey: .corridors)
+  }
+
+  /// Baseline methods the native UI may present. Unavailable entries are omitted.
+  public var activeProviders: [Provider] {
+    providers.filter { $0.available && ProviderBaseline.matches($0) }
+  }
+}
+
+/// Compiled Adyen card and Worldpay bank allowlist. Catalog payloads are dynamic,
+/// but an unrecognized provider id is rejected so it is never presented or stored.
+public enum ProviderBaseline {
+  public static func matches(_ provider: Provider) -> Bool {
+    switch provider.id {
+    case .adyen:
+      return provider.methods == [.card]
+    case .worldpay:
+      return provider.methods == [.bank]
+    }
+  }
+
+  public static func label(for id: ProviderId) -> String {
+    switch id {
+    case .adyen:
+      return "Debit card · Adyen"
+    case .worldpay:
+      return "Bank payment · Worldpay"
+    }
+  }
+
+  public static func accept(_ catalog: CatalogResponse) -> CatalogResponse? {
+    guard !catalog.providers.isEmpty else { return nil }
+    let ids = catalog.providers.map(\.id)
+    guard Set(ids).count == ids.count else { return nil }
+    guard catalog.providers.allSatisfy(matches) else { return nil }
+    for corridor in catalog.corridors {
+      guard corridor.currency == "GBP" else { return nil }
+      switch (corridor.provider, corridor.method) {
+      case (.adyen, .card), (.worldpay, .bank):
+        continue
+      default:
+        return nil
+      }
+    }
+    return catalog
+  }
+
+  public static func fallbackCatalog() -> CatalogResponse {
+    CatalogResponse(
+      demoDate: "",
+      recipients: [],
+      providers: [
+        Provider(
+          id: .adyen,
+          name: "Adyen",
+          description: "Card payment processor",
+          methods: [.card],
+          available: true
+        ),
+        Provider(
+          id: .worldpay,
+          name: "Worldpay",
+          description: "Bank payment processor",
+          methods: [.bank],
+          available: true
+        ),
+      ],
+      corridors: [
+        Corridor(id: "gb-card", provider: .adyen, method: .card, currency: "GBP"),
+        Corridor(id: "gb-bank", provider: .worldpay, method: .bank, currency: "GBP"),
+      ]
+    )
+  }
 }
 
 public struct PaymentResponse: Codable {
