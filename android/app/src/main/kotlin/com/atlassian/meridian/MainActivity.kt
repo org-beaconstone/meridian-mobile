@@ -10,6 +10,8 @@ import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -32,6 +34,7 @@ class MainActivity : ComponentActivity() {
   var amount by remember { mutableStateOf("") }
   var note by remember { mutableStateOf("") }
   var method by remember { mutableStateOf(PaymentMethod.card) }
+  var showMethods by remember { mutableStateOf(false) }
   var review by remember { mutableStateOf(false) }
   var busy by remember { mutableStateOf(false) }
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
@@ -42,12 +45,24 @@ class MainActivity : ComponentActivity() {
     while(current!=null) {
       val started=revision
       if(!busy) try {
-        val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
+        val fresh=current.getState()
+        if(current===client && started==revision && !busy) {state=fresh; if(catalog==null) message="Loading payment methods…"}
+        val definitions=current.getCatalog()
+        if(current===client && started==revision && !busy) {catalog=definitions;message="Connected to shared Java API"}
       } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
       delay(2000)
     }
   }
+  val rails = catalog?.providers?.let(::resolvePaymentRails)
+  val selectedRail = rails?.firstOrNull { it.method == method }
+  val methodLabel = when {
+    catalog == null -> "Loading payment methods…"
+    selectedRail != null -> selectedRail.badge
+    method == PaymentMethod.card -> "Debit card · Adyen"
+    else -> "Bank payment · Worldpay"
+  }
+  val railReady = selectedRail?.available == true
+  Box(Modifier.fillMaxSize()) {
   Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),verticalArrangement=Arrangement.spacedBy(14.dp)) {
     Text("meridian",style=MaterialTheme.typography.h4)
     Text("Native Android · simulated GBP payments",style=MaterialTheme.typography.caption)
@@ -55,7 +70,7 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;showMethods=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -68,24 +83,34 @@ class MainActivity : ComponentActivity() {
       }
       OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
       OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
-      // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      OutlinedButton(
+        onClick={showMethods=true},
+        enabled=!review&&!busy,
+        modifier=Modifier.fillMaxWidth().semantics { contentDescription = "Payment method, $methodLabel. Opens the payment method sheet" },
+      ) { Text(methodLabel) }
+      if(!review) Button(onClick={
+        val parsed=parseAmount(amount)
+        if(parsed.first==null) message=parsed.second?:"Invalid amount"
+        else if(!railReady) message=if(catalog==null) "Loading payment methods…" else PAYMENT_RAIL_REGION_UNAVAILABLE
+        else {showMethods=false;review=true;paymentKey=UUID.randomUUID().toString()}
+      },enabled=!busy && railReady){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
+        if(!railReady) Text(PAYMENT_RAIL_REGION_UNAVAILABLE, color=Color(0xFF8D2517))
+        Button(onClick={val active=client;val minor=parseAmount(amount).first;val rail=rails?.firstOrNull{it.method==method};if(rail==null||!rail.available){message=PAYMENT_RAIL_REGION_UNAVAILABLE} else if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
           try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
             if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
             else message=result.error?:"Awaiting confirmation. Retry the same payment."
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
-        }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
-        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
+        }}},enabled=!busy && railReady){Text(if(busy)"Confirming…" else "Confirm payment")}
+        TextButton(onClick={review=false;showMethods=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
       current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
       Text("Budgets",style=MaterialTheme.typography.h6)
       current.budgets.forEach {budget->Text("${budget.category} · ${money(budget.limit)}")}
     }
+  }
+  if(showMethods) PaymentMethodSheet(method, rails, {method=it;showMethods=false}, {showMethods=false})
   }
 }

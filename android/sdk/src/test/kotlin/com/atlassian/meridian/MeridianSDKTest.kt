@@ -374,4 +374,65 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  @Test
+  fun testCatalogResolvesBaselineRailsInOrder() {
+    val options = resolvePaymentRails(
+      listOf(
+        Provider("worldpay", "Worldpay", "Bank transfer processor", listOf("bank")),
+        Provider("adyen", "Adyen", "Card payment processor", listOf("card")),
+        Provider("other", "Extra Rail", "Should not render", listOf("card")),
+      ),
+    )
+    assertEquals(listOf(PaymentMethod.card, PaymentMethod.bank), options.map { it.method })
+    assertEquals("Debit card · Adyen (Card payment processor)", options[0].badge)
+    assertEquals("Bank payment · Worldpay (Bank transfer processor)", options[1].badge)
+    assertTrue(options.all { it.available && it.warning == null })
+    assertEquals("Select Debit card, radio button, 1 of 2", options[0].accessibilityAnnouncement(1, options.size))
+    assertEquals("Select Bank payment, radio button, 2 of 2", options[1].accessibilityAnnouncement(2, options.size))
+    assertFalse(options.joinToString { it.badge + it.title }.contains("Extra"))
+  }
+
+  @Test
+  fun testMissingRailIsDisabledWithRegionalWarning() {
+    val options = resolvePaymentRails(
+      listOf(Provider("adyen", "Adyen", "Card payment processor", listOf("card"))),
+    )
+    val bank = options.single { it.method == PaymentMethod.bank }
+    assertEquals(2, options.size)
+    assertTrue(options.first().available)
+    assertFalse(bank.available)
+    assertEquals("Bank payment · Worldpay", bank.badge)
+    assertEquals(PAYMENT_RAIL_REGION_UNAVAILABLE, bank.warning)
+    assertEquals(
+      "Select Bank payment, radio button, 2 of 2. $PAYMENT_RAIL_REGION_UNAVAILABLE",
+      bank.accessibilityAnnouncement(2, options.size),
+    )
+  }
+
+  @Test
+  fun testProviderWithoutExpectedMethodStaysDisabled() {
+    val options = resolvePaymentRails(
+      listOf(
+        Provider("adyen", "Adyen Cards", "Card payment processor", emptyList()),
+        Provider("worldpay", "Worldpay", "Bank transfer processor", listOf("bank", "wallet")),
+      ),
+    )
+    val card = options.single { it.method == PaymentMethod.card }
+    assertFalse(card.available)
+    assertEquals("Debit card · Adyen Cards", card.badge)
+    assertFalse(card.badge.contains("Card payment processor"))
+    assertEquals(PAYMENT_RAIL_REGION_UNAVAILABLE, card.warning)
+    assertEquals(2, options.size)
+    assertTrue(options.single { it.method == PaymentMethod.bank }.available)
+    assertFalse(options.joinToString { it.badge }.contains("wallet"))
+  }
+
+  @Test
+  fun testBlankDescriptionOmitsParentheses() {
+    val options = resolvePaymentRails(
+      listOf(Provider("adyen", "Adyen", "  ", listOf("card"))),
+    )
+    assertEquals("Debit card · Adyen", options.first().badge)
+  }
 }
