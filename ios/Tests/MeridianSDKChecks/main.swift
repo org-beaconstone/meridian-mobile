@@ -341,10 +341,113 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let sessionNow = Date(timeIntervalSince1970: 1_700_000_000)
+
+    // CHECK 21: Session phase boundaries, including the 5 minute warning
+    print("21. Session phase boundaries...")
+    let activePhase = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow.addingTimeInterval(SessionTiming.warningWindow + 1), activeElsewhere: false)
+    let expiringEdge = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow.addingTimeInterval(SessionTiming.warningWindow), activeElsewhere: false)
+    let expiringInside = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow.addingTimeInterval(30), activeElsewhere: false)
+    let expiredPhase = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow, activeElsewhere: false)
+    if activePhase == .active && expiringEdge == .expiringSoon && expiringInside == .expiringSoon && expiredPhase == .expired && SessionTiming.warningWindow == 300 {
+      print("  ✓ Active, expiring soon (within 5 minutes), and expired")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected session phases")
+      failed += 1
+    }
+
+    // CHECK 22: Active elsewhere stays visible until the session is expired
+    print("22. Active elsewhere session phase...")
+    let elsewhere = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow.addingTimeInterval(600), activeElsewhere: true)
+    let elsewhereExpiring = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow.addingTimeInterval(60), activeElsewhere: true)
+    let elsewhereExpired = resolveSessionPhase(now: sessionNow, expiresAt: sessionNow.addingTimeInterval(-1), activeElsewhere: true)
+    if elsewhere == .activeElsewhere && elsewhereExpiring == .activeElsewhere && elsewhereExpired == .expired {
+      print("  ✓ Active elsewhere yields only after expiry")
+      passed += 1
+    } else {
+      print("  ✗ Active elsewhere priority is wrong")
+      failed += 1
+    }
+
+    // CHECK 23: Approved banner copy
+    print("23. Approved session banner copy...")
+    if SessionBannerCopy.text(for: .active) == "Connected to secure payments platform"
+      && SessionBannerCopy.text(for: .expiringSoon) == "Session expiring soon. Tap to extend."
+      && SessionBannerCopy.text(for: .activeElsewhere) == "Session active on another device."
+      && SessionBannerCopy.text(for: .expired) == "Session expired. Please re-authenticate to confirm this transfer." {
+      print("  ✓ Banner copy matches the approved strings")
+      passed += 1
+    } else {
+      print("  ✗ Banner copy drifted from the approved strings")
+      failed += 1
+    }
+
+    // CHECK 24: Contrast and distinct colours for all four states
+    print("24. Session banner contrast...")
+    let blackWhite = contrastRatio(SessionColor(red: 0, green: 0, blue: 0), SessionColor(red: 255, green: 255, blue: 255))
+    var contrastOk = blackWhite >= 20.9
+    var backgrounds = Set<SessionColor>()
+    for phase in SessionPhase.allCases {
+      let tokens = sessionBannerTokens(phase)
+      backgrounds.insert(tokens.background)
+      let textContrast = contrastRatio(tokens.foreground, tokens.background)
+      let indicatorContrast = contrastRatio(tokens.indicator, tokens.background)
+      if textContrast < 4.5 || indicatorContrast < 4.5 { contrastOk = false }
+    }
+    let expiringBackground = sessionBannerTokens(.expiringSoon).background
+    let amber = expiringBackground.red > 220 && expiringBackground.green > 160 && expiringBackground.blue < 120
+    if contrastOk && backgrounds.count == 4 && amber {
+      print("  ✓ Four states, amber warning, text contrast at least 4.5:1")
+      passed += 1
+    } else {
+      print("  ✗ Banner contrast or amber warning is below the WCAG target")
+      failed += 1
+    }
+
+    // CHECK 25: Tap target and interaction blocking
+    print("25. Session banner interaction rules...")
+    if SessionTiming.minimumTapTarget == 48
+      && !sessionBlocksInteraction(.active)
+      && !sessionBlocksInteraction(.expiringSoon)
+      && !sessionBlocksInteraction(.activeElsewhere)
+      && sessionBlocksInteraction(.expired)
+      && sessionOffersExtend(.expiringSoon)
+      && !sessionOffersExtend(.active)
+      && !sessionOffersExtend(.activeElsewhere)
+      && !sessionOffersExtend(.expired) {
+      print("  ✓ 48pt target, extend only while expiring, block only when expired")
+      passed += 1
+    } else {
+      print("  ✗ Interaction rules do not match the session banner")
+      failed += 1
+    }
+
+    // CHECK 26: In-place refresh keeps the payment draft and idempotency key
+    print("26. In-place session refresh preserves the draft...")
+    let draft = InFlightPaymentDraft(
+      recipientId: "northline-studio",
+      amount: "12.50",
+      reference: "Invoice 14",
+      method: .bank,
+      reviewing: true,
+      idempotencyKey: "payment-key-keep"
+    )
+    let refreshed = refreshSessionInPlace(draft: draft, now: sessionNow)
+    if refreshed.draft == draft
+      && refreshed.draft.idempotencyKey == "payment-key-keep"
+      && refreshed.expiresAt == sessionNow.addingTimeInterval(SessionTiming.lifetime) {
+      print("  ✓ Refresh keeps the draft and moves the expiry forward")
+      passed += 1
+    } else {
+      print("  ✗ Refresh changed the in-flight payment")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(passed + failed)")
+    print("Failed: \(failed)/\(passed + failed)")
 
     if failed > 0 {
       exit(1)

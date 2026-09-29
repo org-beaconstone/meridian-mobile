@@ -37,6 +37,35 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  var sessionExpiresAt by remember { mutableStateOf<Long?>(null) }
+  var sessionActiveElsewhere by remember { mutableStateOf(false) }
+  var sessionActionBusy by remember { mutableStateOf(false) }
+  var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+  val phase = sessionExpiresAt?.let { resolveSessionPhase(nowMs, it, sessionActiveElsewhere) }
+  val sessionBlocked = phase?.let { sessionBlocksInteraction(it) } == true
+  fun renewSession() {
+    val activeClient = client
+    if (activeClient == null || sessionActionBusy) return
+    sessionActionBusy = true
+    scope.launch {
+      try {
+        activeClient.getHealth()
+        val draft = InFlightPaymentDraft(recipient, amount, note, method, review, paymentKey)
+        sessionExpiresAt = refreshSessionInPlace(draft, System.currentTimeMillis()).expiresAtMillis
+        nowMs = System.currentTimeMillis()
+      } catch (e: Exception) {
+        message = "Could not refresh the session: ${e.message}. Payment details are unchanged."
+      } finally {
+        sessionActionBusy = false
+      }
+    }
+  }
+  LaunchedEffect(Unit) {
+    while (true) {
+      nowMs = System.currentTimeMillis()
+      delay(1000)
+    }
+  }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
@@ -55,32 +84,50 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {
+        client=MeridianClient(base,room)
+        state=null
+        catalog=null
+        review=false
+        revision++
+        paymentKey=UUID.randomUUID().toString()
+        sessionActiveElsewhere=false
+        nowMs=System.currentTimeMillis()
+        sessionExpiresAt=nowMs+SessionTiming.lifetimeMillis
+      }catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
+    phase?.let { currentPhase ->
+      SessionStatusBanner(
+        phase = currentPhase,
+        actionEnabled = !sessionActionBusy,
+        onExtend = { if (phase?.let { sessionOffersExtend(it) } == true) renewSession() },
+        onReauthenticate = { if (phase?.let { sessionBlocksInteraction(it) } == true) renewSession() },
+      )
+    }
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
       }
       Text("Make a payment",style=MaterialTheme.typography.h6)
       catalog?.recipients?.forEach { person ->
-        Row {RadioButton(selected=recipient==person.id,onClick={recipient=person.id},enabled=!review&&!busy);Text(person.name,Modifier.padding(top=12.dp))}
+        Row {RadioButton(selected=recipient==person.id,onClick={recipient=person.id},enabled=!review&&!busy&&!sessionBlocked);Text(person.name,Modifier.padding(top=12.dp))}
       }
-      OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
-      OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
+      OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy&&!sessionBlocked)
+      OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy&&!sessionBlocked)
       // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy&&!sessionBlocked);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
+      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy&&!sessionBlocked);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      if(!review) Button(onClick={if(sessionBlocked){message=SessionBannerCopy.expired} else {val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}}},enabled=!busy&&!sessionBlocked){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
+        Button(onClick={if(sessionBlocked){message=SessionBannerCopy.expired;return@Button};val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
           try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
             if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
             else message=result.error?:"Awaiting confirmation. Retry the same payment."
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
-        }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
-        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
+        }}},enabled=!busy&&!sessionBlocked){Text(if(busy)"Confirming…" else "Confirm payment")}
+        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy&&!sessionBlocked){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
       current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
