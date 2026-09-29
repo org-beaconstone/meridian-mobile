@@ -101,6 +101,10 @@ data class PaymentResponse(
   val code: String? = null,
   @JsonProperty("paymentId")
   val paymentId: String? = null,
+  /** Present when [code] == `"SCA_STEP_UP_REQUIRED"`. Pass to [ScaChallengeHandler]. */
+  val scaChallengeToken: String? = null,
+  /** ISO 8601 expiration timestamp of the SCA challenge window. */
+  val challengeExpiresAt: String? = null,
 ) : Serializable
 
 data class BudgetResponse(
@@ -139,6 +143,29 @@ data class BudgetRequest(
   val category: String,
   val limitMinor: Int,
 ) : Serializable
+
+// MARK: - SCA (PSD2 Strong Customer Authentication) Types
+
+/** Payment request body that includes a PSD2 SCA challenge token for step-up re-dispatch. */
+data class ScaPaymentRequest(
+  val recipientId: String,
+  val amountMinor: Int,
+  val method: String,
+  val note: String,
+  val scenario: String,
+  /** Token extracted from the [SCA_STEP_UP_REQUIRED] gateway response. */
+  val scaChallengeToken: String,
+) : Serializable
+
+/** Outcome returned by [ScaChallengeHandler.handle]. */
+sealed class ScaOutcome {
+  /** Authentication succeeded and the payment was re-dispatched successfully. */
+  data class Success(val response: PaymentResponse) : ScaOutcome()
+  /** Both biometric and passcode authentication failed. */
+  data class AuthenticationFailed(val message: String) : ScaOutcome()
+  /** The challenge window expired before or during authentication. */
+  data class ChallengeExpired(val message: String) : ScaOutcome()
+}
 
 // MARK: - Error Types
 

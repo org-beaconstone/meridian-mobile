@@ -374,4 +374,313 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - SCA Challenge Handler Tests
+
+  private val mapper2 = ObjectMapper().registerKotlinModule()
+
+  /** Starts a stub HTTP server that returns [body] with [statusCode] for every /payments call. */
+  private fun makeScaServer(body: String, statusCode: Int = 200):
+    Pair<com.sun.net.httpserver.HttpServer, String> {
+    val server =
+      com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    val baseUrl = "http://127.0.0.1:$port/api/v1"
+    server.createContext("/api/v1/payments") { exchange ->
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(statusCode, body.length.toLong())
+      exchange.responseBody.write(body.toByteArray())
+      exchange.close()
+    }
+    server.start()
+    return Pair(server, baseUrl)
+  }
+
+  private fun mockBiometric(available: Boolean, succeeds: Boolean): ScaBiometricAuthenticator =
+    object : ScaBiometricAuthenticator {
+      override fun canAuthenticate() = available
+      override suspend fun authenticate(prompt: String) = succeeds
+    }
+
+  private fun mockPasscode(succeeds: Boolean): ScaPasscodeVerifier =
+    object : ScaPasscodeVerifier {
+      override suspend fun verifyPasscode() = succeeds
+    }
+
+  @Test
+  fun testScaPaymentResponseDecoding() {
+    val json =
+      """
+      {
+        "ok": false,
+        "error": "SCA authentication required",
+        "code": "SCA_STEP_UP_REQUIRED",
+        "scaChallengeToken": "sca-tok-abc123",
+        "challengeExpiresAt": "2099-12-31T23:59:59Z"
+      }
+    """.trimIndent()
+
+    val response = mapper2.readValue(json, PaymentResponse::class.java)
+
+    assertFalse(response.ok)
+    assertEquals("SCA_STEP_UP_REQUIRED", response.code)
+    assertEquals("sca-tok-abc123", response.scaChallengeToken)
+    assertEquals("2099-12-31T23:59:59Z", response.challengeExpiresAt)
+  }
+
+  @Test
+  fun testScaPaymentRequestSerialization() {
+    val req = ScaPaymentRequest(
+      recipientId = "rec-1",
+      amountMinor = 15000,
+      method = "card",
+      note = "test",
+      scenario = "success",
+      scaChallengeToken = "tok-xyz",
+    )
+    val json = mapper2.writeValueAsString(req)
+
+    assertTrue("JSON should contain scaChallengeToken key", json.contains("scaChallengeToken"))
+    assertTrue("JSON should contain the token value", json.contains("tok-xyz"))
+  }
+
+  @Test
+  fun testScaChallengeHandlerBiometricSuccess() {
+    val successBody =
+      """{"ok":true,"state":{"version":1,"balance":990000,"transactions":[],"budgets":[]},"transaction":null}"""
+    val (server, baseUrl) = makeScaServer(successBody)
+    try {
+      val client = MeridianClient(baseUrl, "test-session")
+      val handler = ScaChallengeHandler(
+        client = client,
+        biometricAuthenticator = mockBiometric(available = true, succeeds = true),
+        passcodeVerifier = mockPasscode(succeeds = false),
+      )
+
+      val outcome = runBlocking {
+        handler.handle(
+          scaChallengeToken = "tok-bio",
+          challengeExpiresAt = "2099-12-31T23:59:59Z",
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          note = "test",
+          scenario = Scenario.success,
+          idempotencyKey = "key-1",
+        )
+      }
+
+      assertTrue("Expected Success outcome", outcome is ScaOutcome.Success)
+      assertTrue("Payment should be ok", (outcome as ScaOutcome.Success).response.ok)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testScaChallengeHandlerBiometricUnavailablePasscodeSuccess() {
+    val successBody =
+      """{"ok":true,"state":{"version":1,"balance":990000,"transactions":[],"budgets":[]},"transaction":null}"""
+    val (server, baseUrl) = makeScaServer(successBody)
+    try {
+      val client = MeridianClient(baseUrl, "test-session")
+      val handler = ScaChallengeHandler(
+        client = client,
+        biometricAuthenticator = mockBiometric(available = false, succeeds = false),
+        passcodeVerifier = mockPasscode(succeeds = true),
+      )
+
+      val outcome = runBlocking {
+        handler.handle(
+          scaChallengeToken = "tok-pc",
+          challengeExpiresAt = "2099-12-31T23:59:59Z",
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          note = "test",
+          scenario = Scenario.success,
+          idempotencyKey = "key-2",
+        )
+      }
+
+      assertTrue("Expected Success outcome via passcode", outcome is ScaOutcome.Success)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testScaChallengeHandlerBiometricFailPasscodeSuccess() {
+    val successBody =
+      """{"ok":true,"state":{"version":1,"balance":990000,"transactions":[],"budgets":[]},"transaction":null}"""
+    val (server, baseUrl) = makeScaServer(successBody)
+    try {
+      val client = MeridianClient(baseUrl, "test-session")
+      val handler = ScaChallengeHandler(
+        client = client,
+        biometricAuthenticator = mockBiometric(available = true, succeeds = false),
+        passcodeVerifier = mockPasscode(succeeds = true),
+      )
+
+      val outcome = runBlocking {
+        handler.handle(
+          scaChallengeToken = "tok-fallback",
+          challengeExpiresAt = "2099-12-31T23:59:59Z",
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          note = "test",
+          scenario = Scenario.success,
+          idempotencyKey = "key-3",
+        )
+      }
+
+      assertTrue("Expected Success via passcode fallback", outcome is ScaOutcome.Success)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testScaChallengeHandlerBothFail() {
+    val (server, baseUrl) = makeScaServer("{}", 200)
+    try {
+      val client = MeridianClient(baseUrl, "test-session")
+      val handler = ScaChallengeHandler(
+        client = client,
+        biometricAuthenticator = mockBiometric(available = true, succeeds = false),
+        passcodeVerifier = mockPasscode(succeeds = false),
+      )
+
+      val outcome = runBlocking {
+        handler.handle(
+          scaChallengeToken = "tok-fail",
+          challengeExpiresAt = "2099-12-31T23:59:59Z",
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          note = "test",
+          scenario = Scenario.success,
+          idempotencyKey = "key-4",
+        )
+      }
+
+      assertTrue("Expected AuthenticationFailed", outcome is ScaOutcome.AuthenticationFailed)
+      assertEquals(
+        ScaChallengeHandler.FAILURE_MESSAGE,
+        (outcome as ScaOutcome.AuthenticationFailed).message,
+      )
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testScaChallengeHandlerExpiredChallenge() {
+    val (server, baseUrl) = makeScaServer("{}", 200)
+    try {
+      val client = MeridianClient(baseUrl, "test-session")
+      val handler = ScaChallengeHandler(
+        client = client,
+        biometricAuthenticator = mockBiometric(available = true, succeeds = true),
+        passcodeVerifier = mockPasscode(succeeds = true),
+      )
+
+      val outcome = runBlocking {
+        handler.handle(
+          scaChallengeToken = "tok-expired",
+          challengeExpiresAt = "2000-01-01T00:00:00Z", // already expired
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          note = "test",
+          scenario = Scenario.success,
+          idempotencyKey = "key-5",
+        )
+      }
+
+      assertTrue("Expected ChallengeExpired", outcome is ScaOutcome.ChallengeExpired)
+      assertEquals(
+        ScaChallengeHandler.FAILURE_MESSAGE,
+        (outcome as ScaOutcome.ChallengeExpired).message,
+      )
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testHttpTransportWithScaStepUp() {
+    val server =
+      com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    val baseUrl = "http://127.0.0.1:$port/api/v1"
+
+    var requestCount = 0
+
+    server.createContext("/api/v1/payments") { exchange ->
+      requestCount++
+      assertEquals("POST", exchange.requestMethod)
+
+      val bodyStr = String(exchange.requestBody.readBytes())
+      val (statusCode, body) =
+        if (requestCount == 1) {
+          // Initial payment – gateway requires SCA step-up
+          202 to
+            """{"ok":false,"code":"SCA_STEP_UP_REQUIRED","scaChallengeToken":"tok-sca-xyz","challengeExpiresAt":"2099-12-31T23:59:59Z","error":"SCA required"}"""
+        } else {
+          // Re-dispatch with scaChallengeToken
+          assertTrue(
+            "Re-dispatch must include scaChallengeToken",
+            bodyStr.contains("scaChallengeToken"),
+          )
+          assertTrue("Re-dispatch must include token value", bodyStr.contains("tok-sca-xyz"))
+          val sessionHeader = exchange.requestHeaders.getFirst("X-Rehearsal-Session")
+          assertEquals("test-session", sessionHeader)
+          val idempotencyKey = exchange.requestHeaders.getFirst("Idempotency-Key")
+          assertEquals("sca-idempotency-key", idempotencyKey)
+          200 to
+            """{"ok":true,"state":{"version":1,"balance":990000,"transactions":[],"budgets":[]},"transaction":null}"""
+        }
+
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(statusCode, body.length.toLong())
+      exchange.responseBody.write(body.toByteArray())
+      exchange.close()
+    }
+
+    server.start()
+    try {
+      val client = MeridianClient(baseUrl, "test-session")
+
+      // Initial payment returns SCA_STEP_UP_REQUIRED
+      val initial = runBlocking {
+        client.submitPayment(
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          idempotencyKey = "sca-idempotency-key",
+        )
+      }
+      assertFalse(initial.ok)
+      assertEquals("SCA_STEP_UP_REQUIRED", initial.code)
+      assertEquals("tok-sca-xyz", initial.scaChallengeToken)
+      assertNotNull(initial.challengeExpiresAt)
+
+      // Re-dispatch with scaChallengeToken under the original idempotency key
+      val resubmit = runBlocking {
+        client.submitScaPayment(
+          recipientId = "rec-1",
+          amountMinor = 15000,
+          method = PaymentMethod.card,
+          idempotencyKey = "sca-idempotency-key",
+          scaChallengeToken = initial.scaChallengeToken!!,
+        )
+      }
+      assertTrue(resubmit.ok)
+      assertEquals(2, requestCount)
+    } finally {
+      server.stop(0)
+    }
+  }
 }

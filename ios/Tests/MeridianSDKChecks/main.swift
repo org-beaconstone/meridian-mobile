@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,10 +341,251 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // MARK: - SCA Challenge Handler Tests
+
+    // Mock URLProtocol for stubbing HTTP responses
+    final class MockURLProtocol: URLProtocol, @unchecked Sendable {
+      static var handler: ((URLRequest) -> (Int, Data))?
+
+      override class func canInit(with request: URLRequest) -> Bool { true }
+      override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+      override func startLoading() {
+        let (statusCode, data) = MockURLProtocol.handler?(request) ?? (200, Data())
+        let response = HTTPURLResponse(
+          url: request.url!,
+          statusCode: statusCode,
+          httpVersion: nil,
+          headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+      }
+
+      override func stopLoading() {}
+    }
+
+    func makeStubClient(handler: @escaping (URLRequest) -> (Int, Data)) throws -> MeridianClient {
+      MockURLProtocol.handler = handler
+      let config = URLSessionConfiguration.ephemeral
+      config.protocolClasses = [MockURLProtocol.self]
+      let stubSession = URLSession(configuration: config)
+      return try MeridianClient(
+        baseURL: "http://stub.local",
+        sessionId: "test-sca",
+        urlSession: stubSession
+      )
+    }
+
+    struct MockBiometricAuthenticator: ScaBiometricAuthenticator {
+      let available: Bool
+      let succeeds: Bool
+      func canAuthenticate() -> Bool { available }
+      func authenticate(reason: String) async throws -> Bool { succeeds }
+    }
+
+    struct MockPasscodeVerifier: ScaPasscodeVerifier {
+      let succeeds: Bool
+      func verifyPasscode() async -> Bool { succeeds }
+    }
+
+    // CHECK 21: SCA_STEP_UP_REQUIRED response decoding
+    print("21. SCA_STEP_UP_REQUIRED response decoding...")
+    let scaJson = """
+    {
+      "ok": false,
+      "error": "SCA authentication required",
+      "code": "SCA_STEP_UP_REQUIRED",
+      "scaChallengeToken": "sca-tok-abc123",
+      "challengeExpiresAt": "2099-12-31T23:59:59Z",
+      "state": null,
+      "transaction": null
+    }
+    """
+    do {
+      let response = try JSONDecoder().decode(
+        PaymentResponse.self,
+        from: scaJson.data(using: .utf8)!
+      )
+      if !response.ok && response.code == "SCA_STEP_UP_REQUIRED"
+        && response.scaChallengeToken == "sca-tok-abc123"
+        && response.challengeExpiresAt == "2099-12-31T23:59:59Z"
+      {
+        print("  ✓ SCA_STEP_UP_REQUIRED decoded: token=\(response.scaChallengeToken!)")
+        passed += 1
+      } else {
+        print("  ✗ SCA response fields mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ SCA decoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 22: ScaPaymentRequest encodes scaChallengeToken
+    print("22. ScaPaymentRequest encodes scaChallengeToken...")
+    do {
+      let req = ScaPaymentRequest(
+        recipientId: "rec-1",
+        amountMinor: 15000,
+        method: .card,
+        note: "test",
+        scenario: .success,
+        scaChallengeToken: "tok-xyz"
+      )
+      let encoded = try JSONEncoder().encode(req)
+      let json = String(data: encoded, encoding: .utf8) ?? ""
+      if json.contains("\"scaChallengeToken\"") && json.contains("tok-xyz") {
+        print("  ✓ ScaPaymentRequest encodes scaChallengeToken")
+        passed += 1
+      } else {
+        print("  ✗ scaChallengeToken missing from encoded JSON: \(json)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ ScaPaymentRequest encoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 23: ScaChallengeHandler – biometric succeeds → .success
+    print("23. ScaChallengeHandler biometric success → .success...")
+    do {
+      let successBody = """
+      {"ok":true,"state":{"version":1,"balance":990000,"transactions":[],"budgets":[]},"transaction":null}
+      """
+      let client23 = try makeStubClient { _ in (200, successBody.data(using: .utf8)!) }
+      let handler23 = ScaChallengeHandler(
+        client: client23,
+        biometricAuthenticator: MockBiometricAuthenticator(available: true, succeeds: true),
+        passcodeVerifier: MockPasscodeVerifier(succeeds: false)
+      )
+      let outcome23 = await handler23.handle(
+        scaChallengeToken: "tok-bio",
+        challengeExpiresAt: "2099-12-31T23:59:59Z",
+        recipientId: "rec-1",
+        amountMinor: 15000,
+        method: .card,
+        note: "test",
+        scenario: .success,
+        idempotencyKey: "key-1"
+      )
+      if case .success(let resp) = outcome23, resp.ok {
+        print("  ✓ Biometric success produces .success outcome")
+        passed += 1
+      } else {
+        print("  ✗ Expected .success, got: \(outcome23)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Test setup failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 24: ScaChallengeHandler – biometric fails → passcode succeeds → .success
+    print("24. ScaChallengeHandler biometric fail → passcode → .success...")
+    do {
+      let successBody = """
+      {"ok":true,"state":{"version":1,"balance":990000,"transactions":[],"budgets":[]},"transaction":null}
+      """
+      let client24 = try makeStubClient { _ in (200, successBody.data(using: .utf8)!) }
+      let handler24 = ScaChallengeHandler(
+        client: client24,
+        biometricAuthenticator: MockBiometricAuthenticator(available: true, succeeds: false),
+        passcodeVerifier: MockPasscodeVerifier(succeeds: true)
+      )
+      let outcome24 = await handler24.handle(
+        scaChallengeToken: "tok-pc",
+        challengeExpiresAt: "2099-12-31T23:59:59Z",
+        recipientId: "rec-1",
+        amountMinor: 15000,
+        method: .card,
+        note: "test",
+        scenario: .success,
+        idempotencyKey: "key-2"
+      )
+      if case .success(let resp) = outcome24, resp.ok {
+        print("  ✓ Biometric fail + passcode success produces .success outcome")
+        passed += 1
+      } else {
+        print("  ✗ Expected .success, got: \(outcome24)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Test setup failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: ScaChallengeHandler – both fail → .authenticationFailed
+    print("25. ScaChallengeHandler both fail → .authenticationFailed...")
+    do {
+      let client25 = try makeStubClient { _ in (200, Data()) }
+      let handler25 = ScaChallengeHandler(
+        client: client25,
+        biometricAuthenticator: MockBiometricAuthenticator(available: true, succeeds: false),
+        passcodeVerifier: MockPasscodeVerifier(succeeds: false)
+      )
+      let outcome25 = await handler25.handle(
+        scaChallengeToken: "tok-fail",
+        challengeExpiresAt: "2099-12-31T23:59:59Z",
+        recipientId: "rec-1",
+        amountMinor: 15000,
+        method: .card,
+        note: "test",
+        scenario: .success,
+        idempotencyKey: "key-3"
+      )
+      if case .authenticationFailed(let msg) = outcome25,
+        msg == "Authentication challenge failed. Please verify with your passcode."
+      {
+        print("  ✓ Both fail produces .authenticationFailed with correct message")
+        passed += 1
+      } else {
+        print("  ✗ Expected .authenticationFailed, got: \(outcome25)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Test setup failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 26: ScaChallengeHandler – expired challenge → .challengeExpired
+    print("26. ScaChallengeHandler expired challenge → .challengeExpired...")
+    do {
+      let client26 = try makeStubClient { _ in (200, Data()) }
+      let handler26 = ScaChallengeHandler(
+        client: client26,
+        biometricAuthenticator: MockBiometricAuthenticator(available: true, succeeds: true),
+        passcodeVerifier: MockPasscodeVerifier(succeeds: true)
+      )
+      let outcome26 = await handler26.handle(
+        scaChallengeToken: "tok-exp",
+        challengeExpiresAt: "2000-01-01T00:00:00Z",  // already expired
+        recipientId: "rec-1",
+        amountMinor: 15000,
+        method: .card,
+        note: "test",
+        scenario: .success,
+        idempotencyKey: "key-4"
+      )
+      if case .challengeExpired(let msg) = outcome26,
+        msg == "Authentication challenge failed. Please verify with your passcode."
+      {
+        print("  ✓ Expired challenge produces .challengeExpired with correct message")
+        passed += 1
+      } else {
+        print("  ✗ Expected .challengeExpired, got: \(outcome26)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Test setup failed: \(error)")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/26")
+    print("Failed: \(failed)/26")
 
     if failed > 0 {
       exit(1)

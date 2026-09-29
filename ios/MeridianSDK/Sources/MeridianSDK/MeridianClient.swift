@@ -162,4 +162,38 @@ public actor MeridianClient {
   public func getEvents() async throws -> EventsResponse {
     return try await request(method: "GET", path: "/events")
   }
+
+  /// POST /payments - Re-submit a payment with an SCA challenge token (PSD2 step-up).
+  ///
+  /// Called by `ScaChallengeHandler` after successful biometric or passcode
+  /// verification. The original `idempotencyKey` is reused so the gateway can
+  /// correlate the re-dispatch with the initial attempt.
+  ///
+  /// - Parameters:
+  ///   - scaChallengeToken: Token obtained from the `SCA_STEP_UP_REQUIRED` response.
+  ///   - idempotencyKey: The original idempotency key from the first payment attempt.
+  public func submitScaPayment(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = .success,
+    idempotencyKey: String,
+    scaChallengeToken: String
+  ) async throws -> PaymentResponse {
+    let payload = ScaPaymentRequest(
+      recipientId: recipientId,
+      amountMinor: amountMinor,
+      method: method,
+      note: note,
+      scenario: scenario,
+      scaChallengeToken: scaChallengeToken
+    )
+    return try await request(
+      method: "POST",
+      path: "/payments",
+      body: payload,
+      additionalHeaders: ["Idempotency-Key": idempotencyKey]
+    )
+  }
 }
