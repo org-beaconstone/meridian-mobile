@@ -15,11 +15,6 @@ public enum PaymentMethod: String, Codable, Hashable {
   case bank
 }
 
-public enum ProviderId: String, Codable, Hashable {
-  case adyen
-  case worldpay
-}
-
 public enum Scenario: String, Codable {
   case success
   case declined
@@ -68,7 +63,7 @@ public struct Transaction: Codable, Hashable {
   public let category: Category
   public let amount: Int // integer GBP pence, positive (outgoing)
   public let date: String // ISO 8601
-  public let provider: ProviderId
+  public let provider: String  // provider id as returned by the server catalog
   public let method: PaymentMethod
   public let status: TransactionStatus
   public let note: String
@@ -81,7 +76,7 @@ public struct Transaction: Codable, Hashable {
     category: Category,
     amount: Int,
     date: String,
-    provider: ProviderId,
+    provider: String,
     method: PaymentMethod,
     status: TransactionStatus,
     note: String
@@ -130,13 +125,13 @@ public struct BankState: Codable, Hashable {
 }
 
 public struct Provider: Codable, Hashable {
-  public let id: ProviderId
+  public let id: String  // server-assigned identifier, e.g. "adyen", "worldpay"
   public let name: String
   public let description: String
   public let methods: [PaymentMethod]
 
   public init(
-    id: ProviderId,
+    id: String,
     name: String,
     description: String,
     methods: [PaymentMethod]
