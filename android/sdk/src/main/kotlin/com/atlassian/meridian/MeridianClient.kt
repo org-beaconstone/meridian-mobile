@@ -29,13 +29,32 @@ class MeridianClient(
 
   // MARK: - Internal Request Method
 
+  private data class RawHttp(val statusCode: Int, val body: String)
+
   private suspend fun <T> request(
     method: String,
     path: String,
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
+  ): T {
+    val raw = exchange(method, path, body, additionalHeaders)
+    return try {
+      mapper.readValue(raw.body, responseType)
+    } catch (e: Exception) {
+      if (raw.statusCode >= 200 && raw.statusCode < 300) {
+        throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
+      }
+      throw MeridianError.HttpError(raw.statusCode, raw.body.ifEmpty { "Unknown error" })
+    }
+  }
+
+  private suspend fun exchange(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+  ): RawHttp = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
@@ -47,12 +66,10 @@ class MeridianClient(
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
 
-      // Add additional headers (e.g., Idempotency-Key)
       additionalHeaders.forEach { (key, value) ->
         connection.setRequestProperty(key, value)
       }
 
-      // Write body if present
       if (body != null) {
         val bodyJson = mapper.writeValueAsString(body)
         connection.doOutput = true
@@ -62,45 +79,25 @@ class MeridianClient(
         }
       }
 
-      // Read response
       val statusCode = connection.responseCode
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
       } else {
         connection.inputStream
       }
-
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
 
-      // Check HTTP status and handle errors
-      when {
-        statusCode >= 200 && statusCode < 300 -> {
-          // Success
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
-          }
-        }
-
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
-          // These are expected error statuses, parse the response
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.HttpError(
-              statusCode,
-              responseBody.ifEmpty { "Unknown error" }
-            )
-          }
-        }
-
-        else -> {
-          throw MeridianError.HttpError(
-            statusCode,
-            responseBody.ifEmpty { "Unknown error" }
-          )
-        }
+      if (
+        statusCode >= 200 && statusCode < 300 ||
+        statusCode == 202 ||
+        statusCode == 400 ||
+        statusCode == 409 ||
+        statusCode == 422 ||
+        statusCode == 503
+      ) {
+        RawHttp(statusCode, responseBody)
+      } else {
+        throw MeridianError.HttpError(statusCode, responseBody.ifEmpty { "Unknown error" })
       }
     } finally {
       connection.disconnect()
@@ -134,7 +131,8 @@ class MeridianClient(
    * @param method Payment method (card or bank)
    * @param note Optional note (max 200 chars)
    * @param scenario Simulation scenario
-   * @param idempotencyKey Unique key for idempotency
+   * @param idempotencyKey Unique key for idempotency. Reuse it for SCA resubmit and uncertain retries.
+   * @param scaChallengeToken Set only after local biometric or passcode verification. Omitted on the first submit.
    */
   suspend fun submitPayment(
     recipientId: String,
@@ -143,22 +141,39 @@ class MeridianClient(
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
-  ): PaymentResponse {
+    scaChallengeToken: String? = null,
+  ): PaymentCall {
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
       method = method.name,
       note = note,
       scenario = scenario.name,
+      scaChallengeToken = scaChallengeToken,
     )
 
-    return request(
+    val raw = exchange(
       "POST",
       "/payments",
       payload,
       mapOf("Idempotency-Key" to idempotencyKey),
-      PaymentResponse::class.java,
     )
+    val decoded = try {
+      mapper.readValue(raw.body, PaymentResponse::class.java)
+    } catch (_: Exception) {
+      null
+    }
+    if (decoded != null) {
+      return PaymentCall(raw.statusCode, decoded, raw.body)
+    }
+    return when (ScaInterpreter.intercept(raw.statusCode, raw.body)) {
+      is ScaIntercept.NotStepUp -> throw MeridianError.DecodingError("Payment response could not be decoded")
+      else -> PaymentCall(
+        raw.statusCode,
+        PaymentResponse(ok = false, error = ScaCopy.FAILURE_MESSAGE, code = ScaCopy.STEP_UP_CODE),
+        raw.body,
+      )
+    }
   }
 
   /**

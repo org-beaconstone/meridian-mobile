@@ -1,9 +1,12 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +344,205 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    await runScaChecks(passed: &passed, failed: &failed)
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
+  }
+
+  static func runScaChecks(passed: inout Int, failed: inout Int) async {
+    let tally = CheckTally(passed: passed, failed: failed)
+    defer {
+      passed = tally.passed
+      failed = tally.failed
+    }
+    func check(_ name: String, _ condition: Bool) { tally.check(name, condition) }
+
+    let now = ISO8601DateFormatter().date(from: "2026-09-29T00:00:00Z")!
+    let future = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"ch_abc","expiresAt":"2099-01-01T00:00:00Z","token":"tok_1"}}
+    """.data(using: .utf8)!
+    let intercept = ScaInterpreter.intercept(statusCode: 202, body: future, now: now)
+    if case let .required(challenge) = intercept {
+      check("SCA 202 extracts payload, expiry and token", challenge.payload == "ch_abc" && challenge.token == "tok_1" && !challenge.isExpired(at: now))
+    } else {
+      check("SCA 202 extracts payload, expiry and token", false)
+    }
+
+    let pending = """
+    {"ok":false,"code":"PAYMENT_PENDING","paymentId":"pay-1"}
+    """.data(using: .utf8)!
+    check(
+      "PAYMENT_PENDING is not an SCA step-up",
+      ScaInterpreter.intercept(statusCode: 202, body: pending, now: now) == .notStepUp
+    )
+    let not202 = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"ch","expiresAt":"2099-01-01T00:00:00Z"}}
+    """.data(using: .utf8)!
+    check("non-202 SCA body is ignored", ScaInterpreter.intercept(statusCode: 400, body: not202, now: now) == .notStepUp)
+
+    let missing = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"expiresAt":"2099-01-01T00:00:00Z"}}
+    """.data(using: .utf8)!
+    check("incomplete challenge is invalid", ScaInterpreter.intercept(statusCode: 202, body: missing, now: now) == .invalid)
+
+    let expiredBody = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challengePayload":"ch_old","expiresAt":"2000-01-01T00:00:00Z"}
+    """.data(using: .utf8)!
+    if case .expired = ScaInterpreter.intercept(statusCode: 202, body: expiredBody, now: now) {
+      check("expired challenge is reported", true)
+    } else {
+      check("expired challenge is reported", false)
+    }
+
+    let draft = PaymentDraft(
+      recipientId: "northline-studio",
+      amountMinor: 4000,
+      method: .card,
+      note: "Studio",
+      scenario: .success,
+      idempotencyKey: "same-key"
+    )
+    guard case let .required(live) = ScaInterpreter.intercept(statusCode: 202, body: future, now: now) else {
+      check("step-up session can start", false)
+      return
+    }
+    var session = ScaSession(draft: draft, challenge: live, now: now)
+    check("biometric failure keeps the payment and opens passcode", {
+      session = session.afterBiometric(.failed, now: now)
+      return session.phase == .passcode && session.resubmitToken == nil && session.draft.amountMinor == 4000 && session.draft.method == .card && session.draft.idempotencyKey == "same-key"
+    }())
+    check("wrong passcode shows the failure copy and keeps the draft", {
+      session = session.afterPasscode("000000", now: now)
+      return session.message == ScaCopy.failureMessage && session.resubmitToken == nil && session.draft.recipientId == "northline-studio"
+    }())
+    check("rehearsal passcode releases the original token", {
+      session = session.afterPasscode(ScaCopy.rehearsalPasscode, now: now)
+      return session.resubmitToken == "tok_1"
+    }())
+    check("passcode is not the rehearsal value when mistyped", !RehearsalPasscode.matches("135791"))
+
+    let plain = PaymentRequest(recipientId: "northline-studio", amountMinor: 4000, method: .card, note: "Studio", scenario: .success)
+    let plainJson = String(data: try! JSONEncoder().encode(plain), encoding: .utf8)!
+    check("first payment omits scaChallengeToken and the passcode", !plainJson.contains("scaChallengeToken") && !plainJson.contains(ScaCopy.rehearsalPasscode) && plainJson.contains("\"method\":\"card\""))
+    let stepped = PaymentRequest(recipientId: "northline-studio", amountMinor: 4000, method: .bank, note: "Studio", scenario: .success, scaChallengeToken: "tok_1")
+    let steppedJson = String(data: try! JSONEncoder().encode(stepped), encoding: .utf8)!
+    check("resubmit keeps bank method and adds only the token", steppedJson.contains("\"method\":\"bank\"") && steppedJson.contains("\"scaChallengeToken\":\"tok_1\"") && !steppedJson.contains(ScaCopy.rehearsalPasscode))
+
+    await checkTransport(tally: tally)
+  }
+
+  static func checkTransport(tally: CheckTally) async {
+    let number = tally.passed + tally.failed + 1
+    print("\(number). SCA resubmit keeps session, key and card method...")
+    let script = ScaScript()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ScaURLProtocol.self]
+    configuration.timeoutIntervalForRequest = 5
+    ScaURLProtocol.script = script
+    defer { ScaURLProtocol.script = nil }
+    do {
+      let session = URLSession(configuration: configuration)
+      let client = try MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "sca-room", urlSession: session)
+      let key = "idem-sca-1"
+      let first = try await client.submitPayment(recipientId: "northline-studio", amountMinor: 4000, method: .card, note: "Studio", idempotencyKey: key)
+      let intercept = ScaInterpreter.intercept(statusCode: first.statusCode, body: first.body)
+      guard case let .required(challenge) = intercept else {
+        print("  ✗ expected step-up, got \(first.statusCode) \(first.code ?? "")")
+        tally.failed += 1
+        return
+      }
+      var flow = ScaSession(draft: PaymentDraft(recipientId: "northline-studio", amountMinor: 4000, method: .card, note: "Studio", scenario: .success, idempotencyKey: key), challenge: challenge)
+      flow = flow.afterBiometric(.unavailable)
+      flow = flow.afterPasscode("000000")
+      let failedCopy = flow.message == ScaCopy.failureMessage && flow.resubmitToken == nil
+      flow = flow.afterPasscode(ScaCopy.rehearsalPasscode)
+      let token = flow.resubmitToken
+      let second = try await client.submitPayment(recipientId: "northline-studio", amountMinor: 4000, method: .card, note: "Studio", idempotencyKey: key, scaChallengeToken: token)
+      let bodies = script.bodies.joined(separator: "\n")
+      let ok = first.statusCode == 202 && second.ok && failedCopy && token == "ch_http" && script.keys == [key, key] && script.sessions == ["sca-room", "sca-room"] && !script.bodies[0].contains("scaChallengeToken") && script.bodies[1].contains("\"scaChallengeToken\":\"ch_http\"") && script.bodies[0].contains("\"method\":\"card\"") && script.bodies[1].contains("\"method\":\"card\"") && !bodies.contains(ScaCopy.rehearsalPasscode)
+      if ok {
+        print("  ✓ SCA resubmit keeps session, key and card method")
+        tally.passed += 1
+      } else {
+        print("  ✗ transport script mismatch keys=\(script.keys) sessions=\(script.sessions) bodies=\(script.bodies)")
+        tally.failed += 1
+      }
+    } catch {
+      print("  ✗ transport failed: \(error)")
+      tally.failed += 1
+    }
+  }
+}
+
+final class CheckTally {
+  var passed: Int
+  var failed: Int
+  init(passed: Int, failed: Int) {
+    self.passed = passed
+    self.failed = failed
+  }
+  func check(_ name: String, _ condition: Bool) {
+    let number = passed + failed + 1
+    print("\(number). \(name)...")
+    if condition {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+}
+
+final class ScaScript: @unchecked Sendable {
+  var bodies: [String] = []
+  var keys: [String] = []
+  var sessions: [String] = []
+}
+
+final class ScaURLProtocol: URLProtocol, @unchecked Sendable {
+  static var script: ScaScript?
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    let script = Self.script
+    let body = Self.bodyText(request)
+    script?.bodies.append(body)
+    script?.keys.append(request.value(forHTTPHeaderField: "Idempotency-Key") ?? "")
+    script?.sessions.append(request.value(forHTTPHeaderField: "X-Rehearsal-Session") ?? "")
+    let hasToken = body.contains("scaChallengeToken")
+    let payload = hasToken
+      ? #"{"ok":true,"paymentId":"tx-sca"}"#
+      : #"{"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"ch_http","expiresAt":"2099-01-01T00:00:00Z"}}"#
+    let data = Data(payload.utf8)
+    let response = HTTPURLResponse(url: request.url!, statusCode: hasToken ? 200 : 202, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: data)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+
+  private static func bodyText(_ request: URLRequest) -> String {
+    if let body = request.httpBody, let text = String(data: body, encoding: .utf8) { return text }
+    guard let stream = request.httpBodyStream else { return "" }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 1024)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+      let count = stream.read(buffer, maxLength: 1024)
+      if count <= 0 { break }
+      data.append(buffer, count: count)
+    }
+    return String(data: data, encoding: .utf8) ?? ""
   }
 }

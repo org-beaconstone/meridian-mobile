@@ -25,6 +25,19 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  BIOMETRIC_PROMPT,
+  FAILURE_MESSAGE,
+  afterBiometric,
+  afterPasscode,
+  interpretSca,
+  paymentBody,
+  sessionToken,
+  showsPasscode,
+  startSession,
+  type PaymentDraft,
+  type ScaSession,
+} from './domain/sca';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -55,7 +68,7 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
   const data = await response.json();
   if (!response.ok)
     throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
-  return data;
+  return { ...data, httpStatus: response.status as number };
 }
 function bankState(value: unknown): State {
   const v = value as State;
@@ -84,7 +97,9 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
-  const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
+  const [step, setStep] = useState<'details' | 'review' | 'sca' | 'done'>('details');
+  const [sca, setSca] = useState<ScaSession | null>(null);
+  const [passcode, setPasscode] = useState('');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<Transaction | null>(null);
@@ -159,12 +174,16 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
+    setSca(null);
+    setPasscode('');
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
+    setSca(null);
+    setPasscode('');
     paymentKey.current = crypto.randomUUID();
   }
   function review() {
@@ -180,19 +199,78 @@ export default function App() {
     setError('');
     setStep('review');
   }
+  function currentDraft(): PaymentDraft | null {
+    const amountMinor = pence(amount);
+    if (amountMinor === null) return null;
+    return {
+      recipientId: recipient,
+      amountMinor,
+      method,
+      note,
+      scenario,
+      idempotencyKey: paymentKey.current,
+    };
+  }
+  async function settle(draft: PaymentDraft, token?: string | null) {
+    const result = await mutate(
+      '/payments',
+      'POST',
+      paymentBody(draft, token),
+      draft.idempotencyKey,
+    );
+    const intercept = interpretSca(result.httpStatus, result);
+    if (intercept.kind === 'required' && !token) {
+      const session = afterBiometric(startSession(draft, intercept.challenge), 'unavailable');
+      setSca(session);
+      setStep('sca');
+      setError('');
+      return;
+    }
+    if (
+      intercept.kind === 'expired' ||
+      intercept.kind === 'invalid' ||
+      (intercept.kind === 'required' && token)
+    ) {
+      setError(FAILURE_MESSAGE);
+      return;
+    }
+    if (result.ok) {
+      setReceipt(result.transaction);
+      setSca(null);
+      setPasscode('');
+      setStep('done');
+      setError('');
+    } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+  }
   async function confirm() {
+    const draft = currentDraft();
+    if (!draft) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
     try {
       setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
-      if (result.ok) {
-        setReceipt(result.transaction);
-        setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      await settle(draft);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Payment failed');
+    }
+  }
+  async function verifyPasscode() {
+    if (!sca) return;
+    const next = afterPasscode(sca, passcode);
+    setPasscode('');
+    setSca(next);
+    const token = sessionToken(next);
+    if (!token) {
+      setError(next.message || FAILURE_MESSAGE);
+      return;
+    }
+    await sendVerified(next.draft, token);
+  }
+  async function sendVerified(draft: PaymentDraft, token: string) {
+    try {
+      setError('');
+      await settle(draft, token);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
     }
@@ -380,6 +458,65 @@ export default function App() {
                         Back to details
                       </button>
                     </>
+                  )}
+                  {step === 'sca' && sca && (
+                    <div className="sca-panel" data-testid="sca-challenge">
+                      <p className="sca-label">
+                        Browser companion stand-in. This is not Face ID, Touch ID, or Android
+                        BiometricPrompt.
+                      </p>
+                      <h2>{BIOMETRIC_PROMPT}</h2>
+                      <div className="mobile-review">
+                        <span data-testid="sca-recipient">To {selected?.name}</span>
+                        <strong data-testid="sca-amount">{money(sca.draft.amountMinor)}</strong>
+                        <p>
+                          {providers.find((p) => p.method === sca.draft.method)?.name} ·{' '}
+                          {sca.draft.note || 'No reference'}
+                        </p>
+                      </div>
+                      {sessionToken(sca) ? (
+                        <button
+                          className="primary"
+                          type="button"
+                          disabled={busy || !connected}
+                          onClick={() => {
+                            const token = sessionToken(sca);
+                            if (token) void sendVerified(sca.draft, token);
+                          }}
+                        >
+                          {busy ? 'Confirming…' : 'Retry payment'}
+                        </button>
+                      ) : (
+                        showsPasscode(sca) && (
+                          <form
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              void verifyPasscode();
+                            }}
+                          >
+                            <p>
+                              In-app passcode. It stays in this browser companion and is not sent to the
+                              API.
+                            </p>
+                            <label htmlFor="mobile-passcode">Security passcode</label>
+                            <input
+                              id="mobile-passcode"
+                              type="password"
+                              inputMode="numeric"
+                              autoComplete="off"
+                              value={passcode}
+                              onChange={(event) => setPasscode(event.target.value)}
+                            />
+                            <button className="primary" type="submit" disabled={busy || !connected}>
+                              {busy ? 'Confirming…' : 'Verify passcode'}
+                            </button>
+                          </form>
+                        )
+                      )}
+                      <button className="secondary" disabled={busy} onClick={editPayment}>
+                        Back to details
+                      </button>
+                    </div>
                   )}
                   {step === 'done' && receipt && (
                     <div className="mobile-success">

@@ -14,4 +14,6 @@ dependencies {
   implementation("androidx.compose.material:material:1.5.4")
   implementation("androidx.compose.ui:ui:1.5.4")
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+  implementation("androidx.fragment:fragment-ktx:1.6.2")
+  implementation("androidx.biometric:biometric:1.1.0")
 }
