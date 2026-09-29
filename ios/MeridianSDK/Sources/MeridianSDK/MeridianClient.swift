@@ -100,6 +100,58 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/catalog")
   }
 
+  /// GET /api/v2/payment-methods — dynamic method catalog for one account scope, corridor, and currency.
+  /// Amounts stay GBP pence. This call does not select a fallback provider.
+  public func getPaymentMethods(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP"
+  ) async throws -> PaymentMethodsCatalog {
+    try await fetchPaymentMethods(
+      accountScope: accountScope,
+      corridor: corridor,
+      currency: currency
+    ).catalog
+  }
+
+  /// Same fetch as `getPaymentMethods`, retaining the raw JSON so the cache can store it unchanged.
+  public func fetchPaymentMethods(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP"
+  ) async throws -> PaymentMethodsFetch {
+    let scope = try CatalogScope.parse(
+      accountScope: accountScope,
+      corridor: corridor,
+      currency: currency
+    )
+    let url = try paymentMethodsURL(baseURL: baseURL.absoluteString, scope: scope)
+    let data = try await getData(absoluteURL: url)
+    guard data.count <= maxCatalogBytes else {
+      throw MeridianError.validationError("Payment method catalog is too large")
+    }
+    let catalog = try parsePaymentMethodsCatalog(data, expected: scope)
+    return PaymentMethodsFetch(catalog: catalog, rawJSON: data)
+  }
+
+  private func getData(absoluteURL: URL) async throws -> Data {
+    var request = URLRequest(url: absoluteURL)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 15
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
+
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw MeridianError.networkError("Invalid response type")
+    }
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw MeridianError.httpError(statusCode: httpResponse.statusCode, message: message)
+    }
+    return data
+  }
+
   /// GET /state - Fetch current bank state
   public func getState() async throws -> BankState {
     return try await request(method: "GET", path: "/state")
