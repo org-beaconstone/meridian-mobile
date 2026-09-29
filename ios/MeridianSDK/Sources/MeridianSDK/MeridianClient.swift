@@ -1,9 +1,13 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private var latestHeaders: [String: String] = [:]
 
   /// Initialize Meridian API client
   /// - Parameters:
@@ -70,6 +74,12 @@ public actor MeridianClient {
       throw MeridianError.networkError("Invalid response type")
     }
 
+    var captured: [String: String] = [:]
+    for (key, value) in httpResponse.allHeaderFields {
+      captured[String(describing: key).lowercased()] = String(describing: value)
+    }
+    latestHeaders = captured
+
     // Check HTTP status
     guard httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 || httpResponse.statusCode == 202 || httpResponse.statusCode == 400 || httpResponse.statusCode == 409 || httpResponse.statusCode == 422 || httpResponse.statusCode == 503
     else {
@@ -93,6 +103,23 @@ public actor MeridianClient {
   /// GET /health - Check service health
   public func getHealth() async throws -> HealthResponse {
     return try await request(method: "GET", path: "/health")
+  }
+
+  /// GET /health on the already selected rehearsal session.
+  /// A timeout or HTTP error throws. Callers keep the payment draft and do not switch provider.
+  public func refreshSession() async throws -> SessionProbePayload {
+    _ = try await getHealth()
+    return SessionProbePayload(
+      healthy: true,
+      activeElsewhere: headerFlag("x-meridian-session-elsewhere")
+    )
+  }
+
+  private func headerFlag(_ name: String) -> Bool {
+    let raw = latestHeaders[name]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    return raw == "true" || raw == "1" || raw == "yes"
   }
 
   /// GET /catalog - Fetch recipients and providers
