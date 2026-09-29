@@ -13,7 +13,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.UUID
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -34,7 +33,7 @@ class MainActivity : ComponentActivity() {
   var method by remember { mutableStateOf(PaymentMethod.card) }
   var review by remember { mutableStateOf(false) }
   var busy by remember { mutableStateOf(false) }
-  var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
+  var paymentKey by remember { mutableStateOf(newPaymentIdempotencyKey()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
   LaunchedEffect(client) {
@@ -55,7 +54,7 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=newPaymentIdempotencyKey()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -71,16 +70,53 @@ class MainActivity : ComponentActivity() {
       // Intentional two-provider native baseline; changing it requires an app release.
       Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
       Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=newPaymentIdempotencyKey()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
-            if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
-            else message=result.error?:"Awaiting confirmation. Retry the same payment."
-          }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
-        }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
-        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
+        Text("A gateway timeout retries this payment with the same key and method.",style=MaterialTheme.typography.caption)
+        Button(onClick={
+          val active=client
+          val minor=parseAmount(amount).first
+          val paymentMethod=method
+          val attemptKey=paymentKey
+          if(active!=null && minor!=null && !busy){
+            busy=true
+            revision++
+            val startedRevision=revision
+            scope.launch {
+              try {
+                val result=PaymentOrchestrator(active).submit(
+                  recipientId=recipient,
+                  amountMinor=minor,
+                  method=paymentMethod,
+                  note=note,
+                  idempotencyKey=attemptKey,
+                ) { _, _ ->
+                  message="Gateway timed out. Retrying this payment with the same key and method."
+                }
+                if(startedRevision!=revision) return@launch
+                if(result.ok){
+                  state=result.state
+                  review=false
+                  amount=""
+                  note=""
+                  paymentKey=newPaymentIdempotencyKey()
+                  message="Demo payment complete"
+                } else message=result.error?:"Awaiting confirmation. Retry the same payment with the same key."
+              } catch(e:MeridianError.HttpError) {
+                if(startedRevision==revision) {
+                  message=if(GatewayRetry.isTimeout(e.statusCode)) e.message?:"" else "Outcome may be unknown: ${e.message}. Retry keeps the same key and method."
+                }
+              } catch(e:Exception) {
+                if(startedRevision==revision) message="Outcome may be unknown: ${e.message}. Retry keeps the same key and method."
+              } finally {
+                revision++
+                busy=false
+              }
+            }
+          }
+        },enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
+        TextButton(onClick={review=false;paymentKey=newPaymentIdempotencyKey()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
       current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}

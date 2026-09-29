@@ -14,7 +14,7 @@ import MeridianSDK
   @State private var amount = ""
   @State private var reference = ""
   @State private var method: PaymentMethod = .card
-  @State private var key = UUID().uuidString
+  @State private var key = newPaymentIdempotencyKey()
   @State private var review = false
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
@@ -46,10 +46,11 @@ import MeridianSDK
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
+            Text("A gateway timeout retries this payment with the same key and method.").font(.caption)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
-            Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
+            Button("Edit details") { review=false; key=newPaymentIdempotencyKey() }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=newPaymentIdempotencyKey(); review=true; message="Review before confirming. No real money moves." }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
           ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
@@ -63,7 +64,7 @@ import MeridianSDK
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
+    generation += 1; state=nil; catalog=nil; review=false; key=newPaymentIdempotencyKey()
     do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
@@ -71,14 +72,38 @@ import MeridianSDK
     do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
   }
   private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
+    guard let client, !busy else {return}
+    busy=true
+    generation += 1
+    let started=generation
+    let paymentKey=key
+    let paymentMethod=method
     defer {busy=false}
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
-    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+      let result=try await PaymentOrchestrator(client: client).submit(
+        recipientId:recipient,
+        amountMinor:minor,
+        method:paymentMethod,
+        note:reference,
+        scenario:.success,
+        idempotencyKey:paymentKey
+      ) { _, _ in
+        await MainActor.run {
+          message="Gateway timed out. Retrying this payment with the same key and method."
+        }
+      }
+      guard started==generation else {return}
+      if result.ok {state=result.state;review=false;amount="";reference="";key=newPaymentIdempotencyKey();message="Demo payment completed. Other clients will refresh."}
+      else {message=result.error ?? "Payment pending. Retry the same payment with the same key."}
+    } catch {
+      guard started==generation else {return}
+      if case let MeridianError.httpError(statusCode, gatewayMessage) = error, GatewayRetry.isTimeout(statusCode) {
+        message=gatewayMessage
+      } else {
+        message="Outcome may be unknown: \(error). Retry keeps the same key and method."
+      }
+    }
   }
 }

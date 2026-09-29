@@ -25,14 +25,24 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import { newPaymentIdempotencyKey, orchestratePayment } from './domain/paymentOrchestrator';
 class RequestError extends Error {
   constructor(
     message: string,
     public code: string,
+    public status?: number,
   ) {
     super(message);
   }
 }
+type ApiRecord = {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  state?: unknown;
+  transaction?: Transaction;
+  recipients?: Recipient[];
+};
 async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
   let response: Response;
   try {
@@ -52,9 +62,21 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
       'NETWORK_ERROR',
     );
   }
-  const data = await response.json();
+  const text = await response.text();
+  let data: ApiRecord = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as ApiRecord;
+    } catch {
+      throw new RequestError(`HTTP ${response.status}`, 'HTTP_ERROR', response.status);
+    }
+  }
   if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+    throw new RequestError(
+      data.error || `HTTP ${response.status}`,
+      data.code || 'HTTP_ERROR',
+      response.status,
+    );
   return data;
 }
 function bankState(value: unknown): State {
@@ -93,7 +115,7 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef(newPaymentIdempotencyKey());
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -116,7 +138,7 @@ export default function App() {
             !mutating.current
           ) {
             setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            if (catalog.recipients) setRecipients(catalog.recipients);
             setConnected(true);
           }
         }
@@ -159,13 +181,13 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
-    paymentKey.current = crypto.randomUUID();
+    paymentKey.current = newPaymentIdempotencyKey();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
-    paymentKey.current = crypto.randomUUID();
+    paymentKey.current = newPaymentIdempotencyKey();
   }
   function review() {
     const value = pence(amount);
@@ -181,20 +203,65 @@ export default function App() {
     setStep('review');
   }
   async function confirm() {
+    const amountMinor = pence(amount);
+    if (amountMinor === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    const idempotencyKey = paymentKey.current;
+    const paymentMethod = method;
+    const sessionId = room;
+    const generation = epoch.current;
+    if (mutating.current || !connected) {
+      setError('Wait for API connection before submitting.');
+      return;
+    }
+    mutating.current = true;
+    setBusy(true);
+    revision.current += 1;
     try {
       setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
-      if (result.ok) {
+      const result = await orchestratePayment({
+        idempotencyKey,
+        method: paymentMethod,
+        sessionId,
+        onRetry: () =>
+          setNotice('Gateway timed out. Retrying this payment with the same key and method.'),
+        post: (attempt) => {
+          if (generation !== epoch.current || attempt.sessionId !== sessionId) {
+            throw new Error('Room changed before the payment finished.');
+          }
+          return request(
+            attempt.sessionId,
+            '/payments',
+            'POST',
+            {
+              recipientId: recipient,
+              amountMinor,
+              method: attempt.method,
+              note,
+              scenario,
+            },
+            attempt.idempotencyKey,
+          );
+        },
+      });
+      if (generation !== epoch.current) throw new Error('Room changed before the payment finished.');
+      if (result.state) setState(bankState(result.state));
+      if (result.ok && result.transaction) {
         setReceipt(result.transaction);
         setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+        setNotice('');
+      } else if (result.ok) {
+        setNotice('Payment completed. The shared room will refresh.');
+        setStep('details');
+      } else setError(result.error || 'Payment pending confirmation. Retry the same payment with the same key.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
+    } finally {
+      revision.current += 1;
+      mutating.current = false;
+      setBusy(false);
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
@@ -372,6 +439,7 @@ export default function App() {
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
                         </p>
+                        <p>A gateway timeout retries this payment with the same key and method.</p>
                       </div>
                       <button className="primary" onClick={confirm} disabled={busy || !connected}>
                         {busy ? 'Confirming…' : 'Confirm payment'}
