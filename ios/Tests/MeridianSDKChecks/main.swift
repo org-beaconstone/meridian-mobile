@@ -341,10 +341,197 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let future = "2099-01-01T00:00:00Z"
+    let past = "2000-01-01T00:00:00Z"
+    let now = ISO8601DateFormatter().date(from: "2026-09-29T00:00:00Z")!
+
+    // CHECK 21: HTTP 202 SCA extracts payload and expiry
+    print("21. SCA 202 challenge extraction...")
+    let scaJson = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"ch_abc","expiresAt":"\(future)","token":"tok_1"}}
+    """.data(using: .utf8)!
+    if case .required(let challenge) = ScaInterpreter.intercept(statusCode: 202, body: scaJson, now: now),
+      challenge.payload == "ch_abc",
+      challenge.resubmitToken == "tok_1",
+      challenge.expiresAt == ISO8601DateFormatter().date(from: future) {
+      print("  ✓ payload and token extracted")
+      passed += 1
+    } else {
+      print("  ✗ SCA challenge was not extracted")
+      failed += 1
+    }
+
+    // CHECK 22: pending 202 is not SCA
+    print("22. PAYMENT_PENDING is not SCA...")
+    let pendingBody = """
+    {"ok":false,"code":"PAYMENT_PENDING","error":"Payment pending confirmation","paymentId":"pay-1"}
+    """.data(using: .utf8)!
+    if case .notStepUp = ScaInterpreter.intercept(statusCode: 202, body: pendingBody, now: now) {
+      print("  ✓ pending response left unchanged")
+      passed += 1
+    } else {
+      print("  ✗ pending was treated as SCA")
+      failed += 1
+    }
+
+    // CHECK 23: non-202 is not a step-up
+    print("23. non-202 SCA code is ignored...")
+    if case .notStepUp = ScaInterpreter.intercept(statusCode: 400, body: scaJson, now: now) {
+      print("  ✓ status other than 202 is not a step-up")
+      passed += 1
+    } else {
+      print("  ✗ non-202 was treated as SCA")
+      failed += 1
+    }
+
+    // CHECK 24: missing payload is invalid
+    print("24. SCA without payload...")
+    let missingPayload = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"expiresAt":"\(future)"}}
+    """.data(using: .utf8)!
+    if case .invalid = ScaInterpreter.intercept(statusCode: 202, body: missingPayload, now: now) {
+      print("  ✓ incomplete challenge rejected")
+      passed += 1
+    } else {
+      print("  ✗ incomplete challenge was accepted")
+      failed += 1
+    }
+
+    // CHECK 25: expired challenge
+    print("25. expired SCA challenge...")
+    let expiredBody = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challengePayload":"ch_old","expiresAt":"\(past)"}
+    """.data(using: .utf8)!
+    if case .expired = ScaInterpreter.intercept(statusCode: 202, body: expiredBody, now: now) {
+      print("  ✓ expired challenge detected")
+      passed += 1
+    } else {
+      print("  ✗ expired challenge was not detected")
+      failed += 1
+    }
+
+    let draft = PaymentDraft(
+      recipientId: "northline-studio",
+      amountMinor: 4500,
+      method: .card,
+      note: "Studio",
+      scenario: .success,
+      idempotencyKey: "idem-sca-1"
+    )
+    let liveChallenge = ScaChallenge(
+      payload: "ch_live",
+      expiresAt: ISO8601DateFormatter().date(from: future)!,
+      token: nil
+    )
+
+    // CHECK 26: biometric failure keeps the draft and opens passcode
+    print("26. biometric fallback keeps payment draft...")
+    var fallback = ScaSession(draft: draft, challenge: liveChallenge, now: now)
+    fallback.completeBiometric(.unavailable, now: now)
+    if fallback.showsPasscode,
+      fallback.draft.idempotencyKey == "idem-sca-1",
+      fallback.draft.amountMinor == 4500,
+      fallback.draft.recipientId == "northline-studio",
+      fallback.draft.method == .card {
+      print("  ✓ passcode fallback retained recipient, amount, method and key")
+      passed += 1
+    } else {
+      print("  ✗ biometric fallback changed the draft")
+      failed += 1
+    }
+
+    // CHECK 27: wrong passcode shows the required message and keeps the draft
+    print("27. failed passcode message...")
+    fallback.submitPasscode("000000", now: now)
+    if case .failed(let message) = fallback.phase,
+      message == "Authentication challenge failed. Please verify with your passcode.",
+      fallback.draft.amountMinor == 4500,
+      fallback.draft.recipientId == "northline-studio" {
+      print("  ✓ failure copy retained recipient and amount")
+      passed += 1
+    } else {
+      print("  ✗ passcode failure did not keep the draft")
+      failed += 1
+    }
+
+    // CHECK 28: successful passcode resubmits the original key and token
+    print("28. passcode success resubmits original key...")
+    var verified = ScaSession(draft: draft, challenge: liveChallenge, now: now)
+    verified.completeBiometric(.failed, now: now)
+    verified.submitPasscode(ScaCopy.rehearsalPasscode, now: now)
+    if case .readyToResubmit(let token) = verified.phase,
+      token == "ch_live",
+      verified.draft.idempotencyKey == draft.idempotencyKey,
+      verified.draft.method == .card {
+      print("  ✓ scaChallengeToken uses the challenge payload and the original key")
+      passed += 1
+    } else {
+      print("  ✗ verified passcode did not produce a resubmit token")
+      failed += 1
+    }
+
+    // CHECK 29: biometric success skips passcode
+    print("29. biometric success...")
+    var biometric = ScaSession(
+      draft: PaymentDraft(
+        recipientId: draft.recipientId,
+        amountMinor: draft.amountMinor,
+        method: .bank,
+        note: draft.note,
+        scenario: draft.scenario,
+        idempotencyKey: draft.idempotencyKey
+      ),
+      challenge: liveChallenge,
+      now: now
+    )
+    biometric.completeBiometric(.success, now: now)
+    if case .readyToResubmit(let token) = biometric.phase,
+      token == "ch_live",
+      !biometric.showsPasscode,
+      biometric.draft.method == .bank {
+      print("  ✓ biometric success is ready to resubmit on the original bank method")
+      passed += 1
+    } else {
+      print("  ✗ biometric success did not resubmit")
+      failed += 1
+    }
+
+    // CHECK 30: payment JSON omits a nil SCA token
+    print("30. payment body omits empty SCA token...")
+    let plain = PaymentRequest(recipientId: "northline-studio", amountMinor: 4500, method: .card, note: "", scenario: .success)
+    let plainJson = String(data: (try? JSONEncoder().encode(plain)) ?? Data(), encoding: .utf8) ?? ""
+    if !plainJson.contains("scaChallengeToken") && plainJson.contains("\"method\":\"card\"") {
+      print("  ✓ first submit stays on card without scaChallengeToken")
+      passed += 1
+    } else {
+      print("  ✗ unexpected payment JSON: \(plainJson)")
+      failed += 1
+    }
+
+    // CHECK 31: payment JSON includes the token for the same method
+    print("31. payment body includes SCA token...")
+    let stepped = PaymentRequest(
+      recipientId: "northline-studio",
+      amountMinor: 4500,
+      method: .card,
+      note: "",
+      scenario: .success,
+      scaChallengeToken: "ch_live"
+    )
+    let steppedJson = String(data: (try? JSONEncoder().encode(stepped)) ?? Data(), encoding: .utf8) ?? ""
+    if steppedJson.contains("\"scaChallengeToken\":\"ch_live\"") && steppedJson.contains("\"method\":\"card\"") {
+      print("  ✓ resubmit keeps card and includes scaChallengeToken")
+      passed += 1
+    } else {
+      print("  ✗ resubmit JSON missing token: \(steppedJson)")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

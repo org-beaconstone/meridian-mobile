@@ -25,6 +25,17 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  BIOMETRIC_PROMPT,
+  FAILURE_MESSAGE,
+  REHEARSAL_PASSCODE,
+  afterBiometric,
+  afterPasscode,
+  interpretSca,
+  showsPasscode,
+  startSession,
+  type ScaSession,
+} from './domain/sca';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -52,10 +63,18 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
       'NETWORK_ERROR',
     );
   }
-  const data = await response.json();
+  const data: unknown = await response.json();
+  const record =
+    data !== null && typeof data === 'object' && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : null;
   if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
-  return data;
+    throw new RequestError(
+      String(record?.error || `HTTP ${response.status}`),
+      String(record?.code || 'HTTP_ERROR'),
+    );
+  if (!record) throw new RequestError('Invalid API response', 'HTTP_ERROR');
+  return { status: response.status, data: record };
 }
 function bankState(value: unknown): State {
   const v = value as State;
@@ -84,10 +103,12 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
-  const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
+  const [step, setStep] = useState<'details' | 'review' | 'sca' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<Transaction | null>(null);
+  const [sca, setSca] = useState<ScaSession | null>(null);
+  const [passcode, setPasscode] = useState('');
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
   const epoch = useRef(0),
@@ -115,8 +136,8 @@ export default function App() {
             version === revision.current &&
             !mutating.current
           ) {
-            setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            setState(bankState(raw.data));
+            setRecipients(catalog.data.recipients as Recipient[]);
             setConnected(true);
           }
         }
@@ -145,7 +166,7 @@ export default function App() {
     try {
       const result = await request(room, path, httpMethod, body, key);
       if (generation !== epoch.current) throw new Error('Room changed');
-      if (result.state) setState(bankState(result.state));
+      if (result.data.state) setState(bankState(result.data.state));
       return result;
     } finally {
       revision.current++;
@@ -159,12 +180,16 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
+    setSca(null);
+    setPasscode('');
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
+    setSca(null);
+    setPasscode('');
     paymentKey.current = crypto.randomUUID();
   }
   function review() {
@@ -180,6 +205,51 @@ export default function App() {
     setError('');
     setStep('review');
   }
+  function applyPayment(
+    result: { status: number; data: Record<string, unknown> },
+    allowStepUp: boolean,
+  ) {
+    const intercept = interpretSca(result.status, result.data);
+    if (intercept.kind === 'invalid' || intercept.kind === 'expired') {
+      setError(FAILURE_MESSAGE);
+      return;
+    }
+    if (intercept.kind === 'required') {
+      if (!allowStepUp) {
+        setError(FAILURE_MESSAGE);
+        return;
+      }
+      const minor = pence(amount);
+      if (minor === null) {
+        setError(FAILURE_MESSAGE);
+        return;
+      }
+      setSca(
+        startSession(
+          {
+            recipientId: recipient,
+            amountMinor: minor,
+            method,
+            note,
+            scenario,
+            idempotencyKey: paymentKey.current,
+          },
+          intercept.challenge,
+        ),
+      );
+      setStep('sca');
+      setError('');
+      return;
+    }
+    if (result.data.ok) {
+      setReceipt(result.data.transaction as Transaction);
+      setSca(null);
+      setStep('done');
+    } else
+      setError(
+        String(result.data.error || 'Payment pending confirmation. Do not create a new payment.'),
+      );
+  }
   async function confirm() {
     try {
       setError('');
@@ -189,10 +259,31 @@ export default function App() {
         { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
         paymentKey.current,
       );
-      if (result.ok) {
-        setReceipt(result.transaction);
-        setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      applyPayment(result, true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Payment failed');
+    }
+  }
+  async function resubmit(token: string, session: ScaSession) {
+    if (Date.now() >= session.challenge.expiresAt) {
+      setError(FAILURE_MESSAGE);
+      return;
+    }
+    try {
+      const result = await mutate(
+        '/payments',
+        'POST',
+        {
+          recipientId: session.draft.recipientId,
+          amountMinor: session.draft.amountMinor,
+          method: session.draft.method,
+          note: session.draft.note,
+          scenario: session.draft.scenario,
+          scaChallengeToken: token,
+        },
+        session.draft.idempotencyKey,
+      );
+      applyPayment(result, false);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
     }
@@ -366,8 +457,8 @@ export default function App() {
                   {step === 'review' && (
                     <>
                       <div className="mobile-review">
-                        <span>To {selected?.name}</span>
-                        <strong>{money(pence(amount) || 0)}</strong>
+                        <span data-testid="sca-recipient">To {selected?.name}</span>
+                        <strong data-testid="sca-amount">{money(pence(amount) || 0)}</strong>
                         <p>
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
@@ -376,6 +467,77 @@ export default function App() {
                       <button className="primary" onClick={confirm} disabled={busy || !connected}>
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
+                      <button className="secondary" disabled={busy} onClick={editPayment}>
+                        Back to details
+                      </button>
+                    </>
+                  )}
+                  {step === 'sca' && sca && (
+                    <>
+                      <p className="fine-print">
+                        Browser companion rehearsal. This is not Face ID, Touch ID, or Android
+                        BiometricPrompt.
+                      </p>
+                      <h2>{BIOMETRIC_PROMPT}</h2>
+                      <div className="mobile-review">
+                        <span data-testid="sca-recipient">To {selected?.name}</span>
+                        <strong data-testid="sca-amount">{money(sca.draft.amountMinor)}</strong>
+                        <p>
+                          {sca.draft.method === 'card' ? 'Adyen' : 'Worldpay'} ·{' '}
+                          {sca.draft.note || 'No reference'}
+                        </p>
+                      </div>
+                      {sca.phase === 'biometric' && (
+                        <>
+                          <button
+                            className="primary"
+                            disabled={busy || !connected}
+                            onClick={() => {
+                              const next = afterBiometric(sca, 'success');
+                              setSca(next);
+                              if (next.token) void resubmit(next.token, next);
+                            }}
+                          >
+                            Simulate successful biometric
+                          </button>
+                          <button
+                            className="secondary"
+                            disabled={busy}
+                            onClick={() => setSca(afterBiometric(sca, 'unavailable'))}
+                          >
+                            Use security passcode
+                          </button>
+                        </>
+                      )}
+                      {showsPasscode(sca) && (
+                        <>
+                          <label htmlFor="mobile-passcode">Security passcode</label>
+                          <input
+                            id="mobile-passcode"
+                            type="password"
+                            value={passcode}
+                            onChange={(e) => setPasscode(e.target.value)}
+                            autoComplete="off"
+                          />
+                          <p>
+                            Rehearsal passcode {REHEARSAL_PASSCODE}. It stays in this browser and is
+                            not sent to the API.
+                          </p>
+                          <button
+                            className="primary"
+                            disabled={busy || !connected}
+                            onClick={() => {
+                              const next = afterPasscode(sca, passcode);
+                              setPasscode('');
+                              setSca(next);
+                              if (next.token) void resubmit(next.token, next);
+                              else setError(next.message || FAILURE_MESSAGE);
+                            }}
+                          >
+                            Verify passcode
+                          </button>
+                        </>
+                      )}
                       <button className="secondary" disabled={busy} onClick={editPayment}>
                         Back to details
                       </button>
