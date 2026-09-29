@@ -25,6 +25,19 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  BIOMETRIC_PROMPT,
+  FAILURE_MESSAGE,
+  REHEARSAL_PASSCODE,
+  afterBiometric,
+  afterPasscode,
+  interpretSca,
+  resubmit,
+  showsPasscode,
+  startSession,
+  type PaymentDraft,
+  type ScaSession,
+} from './domain/sca';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -55,6 +68,9 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
   const data = await response.json();
   if (!response.ok)
     throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    return { ...data, httpStatus: response.status };
+  }
   return data;
 }
 function bankState(value: unknown): State {
@@ -84,7 +100,9 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
-  const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
+  const [step, setStep] = useState<'details' | 'review' | 'sca' | 'done'>('details');
+  const [sca, setSca] = useState<ScaSession | null>(null);
+  const [passcodeEntry, setPasscodeEntry] = useState('');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<Transaction | null>(null);
@@ -159,12 +177,16 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
+    setSca(null);
+    setPasscodeEntry('');
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
+    setSca(null);
+    setPasscodeEntry('');
     paymentKey.current = crypto.randomUUID();
   }
   function review() {
@@ -180,18 +202,98 @@ export default function App() {
     setError('');
     setStep('review');
   }
-  async function confirm() {
+  function inflight(amountMinor: number): PaymentDraft {
+    return {
+      recipientId: recipient,
+      amountMinor,
+      method,
+      note,
+      scenario,
+      idempotencyKey: paymentKey.current,
+    };
+  }
+  async function finishVerified(session: ScaSession) {
+    const retry = resubmit(session);
+    if (!retry) {
+      setSca(session);
+      if (session.message) setError(session.message);
+      return;
+    }
     try {
       setError('');
       const result = await mutate(
         '/payments',
         'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
+        {
+          recipientId: retry.recipientId,
+          amountMinor: retry.amountMinor,
+          method: retry.method,
+          note: retry.note,
+          scenario: retry.scenario,
+          scaChallengeToken: retry.scaChallengeToken,
+        },
+        retry.idempotencyKey,
       );
+      const again = interpretSca(result.httpStatus, result);
+      if (again.kind !== 'notStepUp') {
+        setSca(null);
+        setPasscodeEntry('');
+        setStep('review');
+        setError(FAILURE_MESSAGE);
+        return;
+      }
       if (result.ok) {
         setReceipt(result.transaction);
         setStep('done');
+        setSca(null);
+        setPasscodeEntry('');
+      } else {
+        setSca(session);
+        setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      }
+    } catch (e) {
+      setSca(session);
+      setError(e instanceof Error ? e.message : 'Payment failed');
+    }
+  }
+  async function confirm() {
+    const amountMinor = pence(amount);
+    if (amountMinor === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    const payment = inflight(amountMinor);
+    try {
+      setError('');
+      const result = await mutate(
+        '/payments',
+        'POST',
+        {
+          recipientId: payment.recipientId,
+          amountMinor: payment.amountMinor,
+          method: payment.method,
+          note: payment.note,
+          scenario: payment.scenario,
+        },
+        payment.idempotencyKey,
+      );
+      const intercept = interpretSca(result.httpStatus, result);
+      if (intercept.kind === 'required') {
+        setSca(startSession(payment, intercept.challenge));
+        setPasscodeEntry('');
+        setStep('sca');
+        return;
+      }
+      if (intercept.kind === 'expired' || intercept.kind === 'invalid') {
+        setSca(null);
+        setStep('review');
+        setError(FAILURE_MESSAGE);
+        return;
+      }
+      if (result.ok) {
+        setReceipt(result.transaction);
+        setStep('done');
+        setSca(null);
       } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
@@ -363,11 +465,112 @@ export default function App() {
                       </button>
                     </form>
                   )}
+                  {step === 'sca' && sca && (
+                    <>
+                      <div className="mobile-review">
+                        <span data-testid="sca-recipient">To {selected?.name || recipient}</span>
+                        <strong data-testid="sca-amount">{money(pence(amount) || 0)}</strong>
+                        <p>
+                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {note || 'No reference'}
+                        </p>
+                      </div>
+                      <div className="sca-panel" data-testid="sca-challenge">
+                        <p className="preview-label">
+                          Browser companion rehearsal. Face ID, Touch ID, and BiometricPrompt run in
+                          the native apps. This screen is not a device biometric prompt.
+                        </p>
+                        <h2>{BIOMETRIC_PROMPT}</h2>
+                        {sca.phase === 'biometric' && (
+                          <>
+                            <button
+                              className="primary"
+                              type="button"
+                              disabled={busy || !connected}
+                              onClick={() => {
+                                const next = afterBiometric(sca, 'success');
+                                setSca(next);
+                                if (next.phase === 'ready') void finishVerified(next);
+                                else if (next.message) setError(next.message);
+                              }}
+                            >
+                              Rehearse biometric success
+                            </button>
+                            <button
+                              className="secondary"
+                              type="button"
+                              onClick={() => {
+                                const next = afterBiometric(sca, 'unavailable');
+                                setSca(next);
+                                if (next.message) setError(next.message);
+                              }}
+                            >
+                              Use security passcode
+                            </button>
+                          </>
+                        )}
+                        {showsPasscode(sca) && (
+                          <form
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              const next = afterPasscode(sca, passcodeEntry);
+                              setPasscodeEntry('');
+                              setSca(next);
+                              if (next.phase === 'ready') void finishVerified(next);
+                              else if (next.message) setError(next.message);
+                            }}
+                          >
+                            <label htmlFor="sca-passcode">Security passcode</label>
+                            <input
+                              id="sca-passcode"
+                              type="password"
+                              inputMode="numeric"
+                              autoComplete="off"
+                              value={passcodeEntry}
+                              maxLength={6}
+                              onChange={(event) =>
+                                setPasscodeEntry(event.target.value.replace(/\D/g, '').slice(0, 6))
+                              }
+                            />
+                            <p className="fine-print">
+                              Rehearsal passcode {REHEARSAL_PASSCODE}. Checked in this browser
+                              companion and not sent to the API.
+                            </p>
+                            <button className="primary" type="submit" disabled={busy || !connected}>
+                              Verify passcode
+                            </button>
+                          </form>
+                        )}
+                        {sca.phase === 'ready' && (
+                          <button
+                            className="primary"
+                            type="button"
+                            disabled={busy || !connected}
+                            onClick={() => void finishVerified(sca)}
+                          >
+                            Retry settlement
+                          </button>
+                        )}
+                        <button
+                          className="secondary"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
+                            setSca(null);
+                            setPasscodeEntry('');
+                            setStep('review');
+                          }}
+                        >
+                          Back to review
+                        </button>
+                      </div>
+                    </>
+                  )}
                   {step === 'review' && (
                     <>
                       <div className="mobile-review">
-                        <span>To {selected?.name}</span>
-                        <strong>{money(pence(amount) || 0)}</strong>
+                        <span data-testid="sca-recipient">To {selected?.name}</span>
+                        <strong data-testid="sca-amount">{money(pence(amount) || 0)}</strong>
                         <p>
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}

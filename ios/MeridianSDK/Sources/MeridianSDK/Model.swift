@@ -210,19 +210,47 @@ public struct PaymentRequest: Codable {
   public let method: PaymentMethod
   public let note: String
   public let scenario: Scenario
+  /// Set only after local biometric or passcode verification. Omitted on the first submit.
+  public let scaChallengeToken: String?
+
+  enum CodingKeys: String, CodingKey {
+    case recipientId, amountMinor, method, note, scenario, scaChallengeToken
+  }
 
   public init(
     recipientId: String,
     amountMinor: Int,
     method: PaymentMethod,
     note: String,
-    scenario: Scenario
+    scenario: Scenario,
+    scaChallengeToken: String? = nil
   ) {
     self.recipientId = recipientId
     self.amountMinor = amountMinor
     self.method = method
     self.note = note
     self.scenario = scenario
+    self.scaChallengeToken = scaChallengeToken
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    recipientId = try container.decode(String.self, forKey: .recipientId)
+    amountMinor = try container.decode(Int.self, forKey: .amountMinor)
+    method = try container.decode(PaymentMethod.self, forKey: .method)
+    note = try container.decode(String.self, forKey: .note)
+    scenario = try container.decode(Scenario.self, forKey: .scenario)
+    scaChallengeToken = try container.decodeIfPresent(String.self, forKey: .scaChallengeToken)
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(recipientId, forKey: .recipientId)
+    try container.encode(amountMinor, forKey: .amountMinor)
+    try container.encode(method, forKey: .method)
+    try container.encode(note, forKey: .note)
+    try container.encode(scenario, forKey: .scenario)
+    try container.encodeIfPresent(scaChallengeToken, forKey: .scaChallengeToken)
   }
 }
 

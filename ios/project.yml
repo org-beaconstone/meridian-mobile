@@ -17,6 +17,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Meridian
         INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        INFOPLIST_KEY_NSFaceIDUsageDescription: Confirm with Face ID / Fingerprint to authorize European payment
     dependencies:
       - package: MeridianSDK
         product: MeridianSDK

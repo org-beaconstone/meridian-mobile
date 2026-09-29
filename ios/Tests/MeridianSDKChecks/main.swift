@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
@@ -341,13 +344,294 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: first payment body omits the challenge token
+    print("21. Payment body omits SCA token until verified...")
+    do {
+      let encoder = JSONEncoder()
+      let firstPayment = PaymentRequest(
+        recipientId: "northline-studio",
+        amountMinor: 4500,
+        method: .card,
+        note: "Studio materials",
+        scenario: .success
+      )
+      let secondPayment = PaymentRequest(
+        recipientId: "northline-studio",
+        amountMinor: 4500,
+        method: .card,
+        note: "Studio materials",
+        scenario: .success,
+        scaChallengeToken: "token-eu"
+      )
+      let firstData = try encoder.encode(firstPayment)
+      let secondData = try encoder.encode(secondPayment)
+      let firstJSON = try JSONSerialization.jsonObject(with: firstData) as? [String: Any]
+      let secondJSON = try JSONSerialization.jsonObject(with: secondData) as? [String: Any]
+      let secondText = String(data: secondData, encoding: .utf8) ?? ""
+      if firstJSON?["scaChallengeToken"] == nil,
+        secondJSON?["scaChallengeToken"] as? String == "token-eu",
+        firstJSON?["method"] as? String == "card",
+        secondJSON?["method"] as? String == "card",
+        !secondText.contains("135790") {
+        print("  ✓ Token is omitted, then sent on the original card payment")
+        passed += 1
+      } else {
+        print("  ✗ Payment encoding did not keep the token off the first body")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Payment encoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 22: HTTP 202 step-up extraction
+    print("22. HTTP 202 SCA_STEP_UP_REQUIRED extraction...")
+    let stepUp = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"payload-eu","expiresAt":"2099-06-01T12:00:00Z","scaChallengeToken":"token-eu"}}
+    """.data(using: .utf8)!
+    let pending = """
+    {"ok":false,"code":"PAYMENT_PENDING","paymentId":"pay-1","error":"Payment pending confirmation"}
+    """.data(using: .utf8)!
+    let missing = """
+    {"ok":false,"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"only"}}
+    """.data(using: .utf8)!
+    let expiredBody = """
+    {"code":"SCA_STEP_UP_REQUIRED","challengePayload":"payload-eu","expirationTimestamp":"2000-01-01T00:00:00Z","scaChallengeToken":"token-eu"}
+    """.data(using: .utf8)!
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let extracted = ScaInterpreter.intercept(statusCode: 202, body: stepUp, now: now)
+    let expiredIntercept = ScaInterpreter.intercept(statusCode: 202, body: expiredBody, now: now)
+    let expiredMatches: Bool
+    if case .expired = expiredIntercept { expiredMatches = true } else { expiredMatches = false }
+    if case .required(let challenge) = extracted,
+      challenge.payload == "payload-eu",
+      challenge.token == "token-eu",
+      ScaInterpreter.intercept(statusCode: 202, body: pending, now: now) == .notStepUp,
+      ScaInterpreter.intercept(statusCode: 200, body: stepUp, now: now) == .notStepUp,
+      ScaInterpreter.intercept(statusCode: 202, body: missing, now: now) == .invalid,
+      expiredMatches {
+      print("  ✓ Step-up payload and expiry extracted; pending stays separate")
+      passed += 1
+    } else {
+      print("  ✗ Step-up intercept mismatch")
+      failed += 1
+    }
+
+    // CHECK 23: biometric failure keeps the draft and passcode stays local
+    print("23. Biometric fallback and passcode resubmit...")
+    let draft = PaymentDraft(
+      recipientId: "northline-studio",
+      amountMinor: 4500,
+      method: .card,
+      note: "Studio materials",
+      scenario: .success,
+      idempotencyKey: "idem-sca-1"
+    )
+    let challenge = ScaChallenge(
+      payload: "payload-eu",
+      expiresAt: Date(timeIntervalSince1970: 4_102_444_800),
+      token: "token-eu"
+    )
+    var session = ScaSession(draft: draft, challenge: challenge, now: Date(timeIntervalSince1970: 0))
+    session.completeBiometric(.failed, now: Date(timeIntervalSince1970: 0))
+    let afterFailure = session
+    session.submitPasscode("111111", now: Date(timeIntervalSince1970: 0))
+    let wrong = session
+    session.submitPasscode(ScaCopy.rehearsalPasscode, now: Date(timeIntervalSince1970: 0))
+    let verified = session.resubmit()
+    var expired = ScaSession(draft: draft, challenge: challenge, now: Date(timeIntervalSince1970: 0))
+    expired.completeBiometric(.unavailable, now: Date(timeIntervalSince1970: 0))
+    expired.submitPasscode(ScaCopy.rehearsalPasscode, now: challenge.expiresAt)
+    if afterFailure.phase == .passcode,
+      afterFailure.draft == draft,
+      wrong.message == ScaCopy.failureMessage,
+      wrong.draft.recipientId == "northline-studio",
+      wrong.draft.amountMinor == 4500,
+      wrong.resubmit() == nil,
+      verified?.scaChallengeToken == "token-eu",
+      verified?.idempotencyKey == "idem-sca-1",
+      verified?.method == .card,
+      expired.message == ScaCopy.failureMessage,
+      expired.draft.amountMinor == 4500,
+      ScaCopy.biometricPrompt == "Confirm with Face ID / Fingerprint to authorize European payment",
+      ScaCopy.failureMessage == "Authentication challenge failed. Please verify with your passcode." {
+      print("  ✓ Fallback keeps recipient, amount and key; token follows verification")
+      passed += 1
+    } else {
+      print("  ✗ Challenge session did not keep the payment draft")
+      failed += 1
+    }
+
+    // CHECK 24: client keeps status 202 and replays the original key with the token
+    print("24. Client intercepts step-up and resubmits the original key...")
+    let outcome = awaitPaymentRoundTrip()
+    if outcome.passed {
+      print("  ✓ \(outcome.detail)")
+      passed += 1
+    } else {
+      print("  ✗ \(outcome.detail)")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(passed + failed)")
+    print("Failed: \(failed)/\(passed + failed)")
 
     if failed > 0 {
       exit(1)
     }
+  }
+}
+
+private struct RoundTrip {
+  let passed: Bool
+  let detail: String
+}
+
+private func awaitPaymentRoundTrip() -> RoundTrip {
+  final class Box: @unchecked Sendable {
+    var result = RoundTrip(passed: false, detail: "Timed out")
+  }
+  ScriptedURLProtocol.gate.lock()
+  ScriptedURLProtocol.steps = [
+    ScriptedURLProtocol.Step(
+      status: 202,
+      body: Data("""
+      {"code":"SCA_STEP_UP_REQUIRED","challenge":{"payload":"payload-eu","expiresAt":"2099-06-01T12:00:00Z","scaChallengeToken":"token-eu"}}
+      """.utf8)
+    ),
+    ScriptedURLProtocol.Step(
+      status: 200,
+      body: Data("{\"ok\":true,\"paymentId\":\"pay-sca\"}".utf8)
+    ),
+  ]
+  ScriptedURLProtocol.seen = []
+  ScriptedURLProtocol.gate.unlock()
+  let box = Box()
+  let done = DispatchSemaphore(value: 0)
+  Task {
+    box.result = await paymentRoundTrip()
+    done.signal()
+  }
+  _ = done.wait(timeout: .now() + 10)
+  return box.result
+}
+
+private final class ScriptedURLProtocol: URLProtocol, @unchecked Sendable {
+    struct Step { let status: Int; let body: Data }
+    static let gate = NSLock()
+    static var steps: [Step] = []
+    static var seen: [(session: String?, key: String?, body: String)] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+      let step: Step? = {
+        Self.gate.lock()
+        defer { Self.gate.unlock() }
+        Self.seen.append((
+          request.value(forHTTPHeaderField: "X-Rehearsal-Session"),
+          request.value(forHTTPHeaderField: "Idempotency-Key"),
+          Self.payload(request)
+        ))
+        guard !Self.steps.isEmpty else { return nil }
+        return Self.steps.removeFirst()
+      }()
+      guard let step, let url = request.url,
+        let response = HTTPURLResponse(url: url, statusCode: step.status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])
+      else {
+        client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+        return
+      }
+      client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+      client?.urlProtocol(self, didLoad: step.body)
+      client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+
+    static func payload(_ request: URLRequest) -> String {
+      if let body = request.httpBody, !body.isEmpty {
+        return String(data: body, encoding: .utf8) ?? ""
+      }
+      guard let stream = request.httpBodyStream else { return "" }
+      stream.open()
+      defer { stream.close() }
+      var data = Data()
+      let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+      defer { buffer.deallocate() }
+      while stream.hasBytesAvailable {
+        let count = stream.read(buffer, maxLength: 4096)
+        if count <= 0 { break }
+        data.append(buffer, count: count)
+      }
+      return String(data: data, encoding: .utf8) ?? ""
+    }
+  }
+
+private func paymentRoundTrip() async -> RoundTrip {
+  let configuration = URLSessionConfiguration.ephemeral
+  configuration.protocolClasses = [ScriptedURLProtocol.self]
+  let session = URLSession(configuration: configuration)
+  do {
+    let client = try MeridianClient(
+      baseURL: "http://127.0.0.1:9/api/v1",
+      sessionId: "sca-room",
+      urlSession: session
+    )
+    let key = "idem-sca-1"
+    let first = try await client.submitPayment(
+      recipientId: "northline-studio",
+      amountMinor: 4500,
+      method: .card,
+      note: "Studio materials",
+      idempotencyKey: key
+    )
+    guard first.statusCode == 202, first.code == ScaCopy.stepUpCode else {
+      return RoundTrip(passed: false, detail: "Expected HTTP 202 step-up, got \(first.statusCode) \(first.code ?? "")")
+    }
+    guard case .required(let challenge) = ScaInterpreter.intercept(statusCode: first.statusCode, body: first.body, now: Date(timeIntervalSince1970: 0)) else {
+      return RoundTrip(passed: false, detail: "Challenge payload was not extracted")
+    }
+    let draft = PaymentDraft(
+      recipientId: "northline-studio",
+      amountMinor: 4500,
+      method: .card,
+      note: "Studio materials",
+      scenario: .success,
+      idempotencyKey: key
+    )
+    var sca = ScaSession(draft: draft, challenge: challenge, now: Date(timeIntervalSince1970: 0))
+    sca.completeBiometric(.cancelled, now: Date(timeIntervalSince1970: 0))
+    sca.submitPasscode(ScaCopy.rehearsalPasscode, now: Date(timeIntervalSince1970: 0))
+    guard let retry = sca.resubmit() else {
+      return RoundTrip(passed: false, detail: "Verified session did not produce a resubmit")
+    }
+    let second = try await client.submitPayment(
+      recipientId: retry.recipientId,
+      amountMinor: retry.amountMinor,
+      method: retry.method,
+      note: retry.note,
+      scenario: retry.scenario,
+      idempotencyKey: retry.idempotencyKey,
+      scaChallengeToken: retry.scaChallengeToken
+    )
+    guard second.ok else {
+      return RoundTrip(passed: false, detail: "Resubmit was not accepted")
+    }
+    let seen = ScriptedURLProtocol.seen
+    guard seen.count == 2,
+      seen.allSatisfy({ $0.session == "sca-room" && $0.key == key }),
+      !seen[0].body.contains("scaChallengeToken"),
+      !seen[0].body.contains(ScaCopy.rehearsalPasscode),
+      seen[1].body.contains("\"scaChallengeToken\":\"token-eu\""),
+      seen[1].body.contains("\"method\":\"card\""),
+      !seen[1].body.contains(ScaCopy.rehearsalPasscode)
+    else {
+      return RoundTrip(passed: false, detail: "Headers or body were not retained: \(seen)")
+    }
+    return RoundTrip(passed: true, detail: "Original room and idempotency key carried the challenge token")
+  } catch {
+    return RoundTrip(passed: false, detail: "Transport failed: \(error)")
   }
 }
