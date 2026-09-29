@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val timeoutMillis: Int = 15_000,
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
@@ -41,8 +42,8 @@ class MeridianClient(
 
     val connection = url.openConnection() as HttpURLConnection
     try {
-      connection.connectTimeout = 15000
-      connection.readTimeout = 15000
+      connection.connectTimeout = timeoutMillis
+      connection.readTimeout = timeoutMillis
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
@@ -102,6 +103,10 @@ class MeridianClient(
           )
         }
       }
+    } catch (error: MeridianError) {
+      throw error
+    } catch (error: Exception) {
+      throw MeridianError.NetworkError(error.message ?: "Network failure", error)
     } finally {
       connection.disconnect()
     }

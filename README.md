@@ -17,13 +17,15 @@ Web opens at port 5175, mobile browser companion at 5176, Java API at 8080. All 
 ```sh
 cd ios
 swift build
+swift test
 swift run MeridianSDKChecks
 swift run MeridianDesktop
 # Against a running Java API:
+MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift test --filter testLiveContainerWhenConfigured
 MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks
 ```
 
-Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, 20 executable SDK assertions, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated.
+The executable SDK checks were previously verified on macOS, including SwiftUI desktop compilation. `swift test` is the XCTest rehearsal suite. On Linux it passed against an in-process contract double and, with `MERIDIAN_TEST_API` set, against the Spring Boot API. SwiftUI was not launched in that run. No iOS simulator or device run is claimed.
 
 For an iOS project, install Xcode and XcodeGen, then `cd ios && xcodegen generate`. `project.yml` builds `App/MeridianApp.swift` with the local SDK package. No iOS simulator/device build was run on the authoring machine because full Xcode was unavailable. Local network HTTP is for the rehearsal only; use HTTPS for any shared hosted endpoint.
 
@@ -36,7 +38,9 @@ mvn clean verify
 gradle :app:assembleDebug
 ```
 
-`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 22 tests including an actual local HTTP transport check for session/idempotency headers and HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
+`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. `mvn verify` runs the JUnit rehearsal suite on the JVM: catalogue hydration, GBP pence bounds from 0.01 to 10,000.00, settlement, idempotency, HTTP 202 pending confirmation, provider-unavailable retry, and transport failure. With `MERIDIAN_TEST_API` set, the same journey runs against the Spring Boot API. Robolectric, the Android Gradle build, and device builds were not run. `android/app` contains the native Compose customer UI.
+
+Set `MERIDIAN_TEST_API` (for example `http://127.0.0.1:8080/api/v1`) to include the live container case in `mvn verify` and `swift test`. Amounts stay integer GBP pence. Card stays on Adyen and bank stays on Worldpay; a timeout retries the same idempotency key and method.
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
 

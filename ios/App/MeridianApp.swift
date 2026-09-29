@@ -1,3 +1,4 @@
+#if canImport(SwiftUI)
 import SwiftUI
 import MeridianSDK
 
@@ -8,6 +9,7 @@ import MeridianSDK
   @State private var endpoint = "http://127.0.0.1:8080/api/v1"
   @State private var room = "meridian-rehearsal"
   @State private var client: MeridianClient?
+  @State private var rehearsal: RehearsalClient?
   @State private var state: BankState?
   @State private var catalog: CatalogResponse?
   @State private var recipient = "northline-studio"
@@ -64,21 +66,63 @@ import MeridianSDK
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
     generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
+    do {
+      let api=try MeridianClient(baseURL:endpoint,sessionId:room)
+      client=api
+      rehearsal=RehearsalClient(api:api)
+      await refresh()
+    } catch { message=String(describing:error) }
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    do {
+      let next=try await client.getState()
+      if started==generation && !busy {state=next}
+    } catch {
+      if started==generation {message="API unavailable: \(error)"}
+      return
+    }
+    guard let rehearsal else {return}
+    do {
+      let definitions=try await rehearsal.hydrateCatalog()
+      if started==generation && !busy {
+        catalog=definitions
+        let fallback=await rehearsal.usingCatalogFallback
+        message=fallback ? "Showing the last catalogue from the Java API." : "Connected to shared Java API"
+      }
+    } catch {
+      if started==generation {message="Catalogue unavailable: \(error)"}
+    }
   }
   private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
+    guard let rehearsal, !busy else {return}; busy=true; generation += 1
     defer {busy=false}
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
-    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+      let result=try await rehearsal.submit(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
+      switch result {
+      case let .settled(response, _, _):
+        state=response.state; review=false; amount=""; reference=""; key=UUID().uuidString
+        message="Demo payment completed. Other clients will refresh."
+      case let .pending(response, _, _):
+        message=response.error ?? "Payment pending confirmation. Retry the same payment, not a new one."
+      case let .declined(response, _, _):
+        message=response.error ?? "Payment declined. No debit was made."
+      case let .unavailable(response, _, _):
+        message=response.error ?? "Provider unavailable. Retry keeps the same payment and provider."
+      case let .uncertain(_, _, detail):
+        message="Outcome may be unknown: \(detail). Retry keeps the same key and provider."
+      case let .rejected(response, _, _, detail):
+        message=response?.error ?? detail
+      }
+    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key and provider."}
   }
 }
+#else
+@main struct MeridianDesktop {
+  static func main() {
+    print("Meridian desktop UI requires SwiftUI on Apple platforms.")
+  }
+}
+#endif

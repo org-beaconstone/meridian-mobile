@@ -1,19 +1,25 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let timeout: TimeInterval
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - timeout: Request timeout in seconds
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    timeout: TimeInterval = 15
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,6 +42,7 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.timeout = timeout
   }
 
   // MARK: - Internal Request Method
@@ -50,6 +57,7 @@ public actor MeridianClient {
 
     var request = URLRequest(url: url)
     request.httpMethod = method
+    request.timeoutInterval = timeout
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
 
@@ -64,7 +72,13 @@ public actor MeridianClient {
       request.httpBody = try encoder.encode(body)
     }
 
-    let (data, response) = try await session.data(for: request)
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await session.data(for: request)
+    } catch {
+      throw MeridianError.networkError(error.localizedDescription)
+    }
 
     guard let httpResponse = response as? HTTPURLResponse else {
       throw MeridianError.networkError("Invalid response type")
