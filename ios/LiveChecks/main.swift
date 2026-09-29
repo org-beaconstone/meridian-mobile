@@ -12,11 +12,11 @@ import MeridianSDK
     guard catalog.providers.count==2 else {throw CheckError.failed("provider count")}
     let key=UUID().uuidString
     let payment=try await api.submitPayment(recipientId:"northline-studio",amountMinor:2599,method:.card,note:"Swift native transport check",idempotencyKey:key)
-    guard payment.ok, payment.state?.balance==1245451, payment.transaction != nil else {throw CheckError.failed("payment response")}
+    guard payment.response.ok, payment.response.state?.balance==1245451, payment.response.transaction != nil else {throw CheckError.failed("payment response")}
     let duplicate=try await api.submitPayment(recipientId:"northline-studio",amountMinor:2599,method:.card,note:"Swift native transport check",idempotencyKey:key)
-    guard duplicate.ok, duplicate.state?.balance==1245451 else {throw CheckError.failed("idempotency")}
+    guard duplicate.response.ok, duplicate.response.state?.balance==1245451 else {throw CheckError.failed("idempotency")}
     let pending=try await api.submitPayment(recipientId:"northline-studio",amountMinor:100,method:.card,note:"pending",scenario:.pending,idempotencyKey:UUID().uuidString)
-    guard !pending.ok,pending.code=="PAYMENT_PENDING",pending.paymentId != nil else {throw CheckError.failed("pending")}
+    guard !pending.response.ok,pending.response.code=="PAYMENT_PENDING",pending.response.paymentId != nil, pending.statusCode==202 else {throw CheckError.failed("pending")}
     let unchanged=try await api.getState()
     guard unchanged.balance==1245451 else {throw CheckError.failed("pending balance")}
     let reset=try await api.reset()
