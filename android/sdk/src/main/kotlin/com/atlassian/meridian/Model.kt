@@ -150,6 +150,7 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
   class ValidationError(msg: String) : MeridianError(msg)
+  class CatalogUnavailable(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
 }
 
 // MARK: - Amount Formatting
