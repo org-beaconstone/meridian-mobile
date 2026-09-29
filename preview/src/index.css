@@ -66,6 +66,7 @@ a {
   margin-bottom: 15px;
 }
 .mobile-shell {
+  position: relative;
   max-width: 440px;
   margin: auto;
   background: #f8f9f6;
@@ -274,7 +275,8 @@ footer {
   color: #607058;
   background: #fff;
 }
-label {
+label,
+#mobile-method-label {
   display: block;
   font-size: 12px;
   font-weight: 600;
@@ -311,6 +313,118 @@ legend {
 .mobile-method.selected {
   background: #edf4ff;
   border-color: #1868db;
+}
+button.mobile-method {
+  width: 100%;
+  text-align: left;
+  background: #fff;
+  color: inherit;
+  font-weight: 600;
+}
+button.mobile-method.unavailable {
+  background: #fff6f4;
+  border-color: #ecc6be;
+  cursor: not-allowed;
+}
+.method-trigger {
+  width: 100%;
+  min-height: 44px;
+  text-align: left;
+  border: 1px solid #8b9588;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fff;
+  color: #142c35;
+}
+.sheet-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: flex-end;
+  background: #142c3575;
+}
+.sheet-panel {
+  width: 100%;
+  background: #f8f9f6;
+  border-radius: 18px 18px 0 0;
+  padding: 12px 18px 22px;
+  animation: sheet-up 220ms ease-out;
+}
+.sheet-handle {
+  width: 36px;
+  height: 4px;
+  margin: 4px auto 12px;
+  border-radius: 2px;
+  background: #b7c0b6;
+}
+.sheet-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.sheet-heading h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.sheet-close {
+  min-height: 36px;
+  border: 0;
+  background: none;
+  color: #1868db;
+  font-weight: 600;
+  font-size: 12px;
+}
+.sheet-note {
+  margin: 8px 0 4px;
+  font-size: 11px;
+}
+.rail-mark {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  border: 2px solid #1868db;
+  border-radius: 50%;
+}
+.mobile-method.selected .rail-mark {
+  background: radial-gradient(circle, #1868db 0 5px, transparent 6px);
+}
+.mobile-method.unavailable .rail-mark {
+  border-color: #8d2517;
+}
+.rail-warning {
+  color: #8d2517;
+}
+.rail-skeleton {
+  height: 72px;
+  border-radius: 12px;
+  margin-top: 12px;
+  background: linear-gradient(90deg, #e4ebe3 25%, #f7faf6 50%, #e4ebe3 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.2s linear infinite;
+}
+@keyframes sheet-up {
+  from {
+    transform: translateY(24px);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sheet-panel,
+  .rail-skeleton {
+    animation: none;
+  }
 }
 .mobile-method input {
   accent-color: #1868db;

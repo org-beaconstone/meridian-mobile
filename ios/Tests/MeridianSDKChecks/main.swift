@@ -341,10 +341,77 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let adyen = Provider(id: .adyen, name: "Adyen", description: "Card payment processor", methods: [.card])
+    let worldpay = Provider(id: .worldpay, name: "Worldpay", description: "Bank transfer processor", methods: [.bank])
+
+    // CHECK 21: Catalog rails become descriptive sheet options
+    print("21. Catalog resolves Adyen card and Worldpay bank...")
+    let resolved = resolvePaymentRails(from: [worldpay, adyen])
+    let card = resolved.first { $0.method == .card }
+    let bank = resolved.first { $0.method == .bank }
+    if resolved.count == 2 && resolved.map(\.method) == [.card, .bank]
+      && card?.available == true && bank?.available == true
+      && card?.badge == "Debit card · Adyen (Card payment processor)"
+      && bank?.badge == "Bank payment · Worldpay (Bank transfer processor)"
+      && card?.accessibilityAnnouncement(position: 1, total: 2) == "Select Debit card, radio button, 1 of 2"
+      && bank?.accessibilityAnnouncement(position: 2, total: 2) == "Select Bank payment, radio button, 2 of 2"
+    {
+      print("  ✓ Sheet options follow the catalog with indexed announcements")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected rails: \(resolved)")
+      failed += 1
+    }
+
+    // CHECK 22: Missing baseline rail is disabled with the regional warning
+    print("22. Missing bank rail is unavailable...")
+    let partial = resolvePaymentRails(from: [adyen])
+    let missingBank = partial.first { $0.method == .bank }
+    if partial.count == 2 && partial.first?.available == true
+      && missingBank?.available == false
+      && missingBank?.warning == PaymentRailCopy.regionUnavailable
+      && missingBank?.badge == "Bank payment · Worldpay"
+      && missingBank?.accessibilityAnnouncement(position: 2, total: 2) == "Select Bank payment, radio button, 2 of 2. \(PaymentRailCopy.regionUnavailable)"
+    {
+      print("  ✓ Unavailable rail keeps its index and warning")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected unavailable rail: \(String(describing: missingBank))")
+      failed += 1
+    }
+
+    // CHECK 23: Baseline rail without its method uses the catalog name and stays disabled
+    print("23. Adyen without card is disabled...")
+    let namelessMethod = Provider(id: .adyen, name: "Adyen Cards", description: "Card payment processor", methods: [])
+    let disabledCard = resolvePaymentRails(from: [namelessMethod, worldpay]).first { $0.method == .card }
+    if disabledCard?.available == false
+      && disabledCard?.badge == "Debit card · Adyen Cards"
+      && disabledCard?.badge.contains("Card payment processor") == false
+      && disabledCard?.warning == PaymentRailCopy.regionUnavailable
+    {
+      print("  ✓ Method-less catalog entry cannot be selected")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected disabled card: \(String(describing: disabledCard))")
+      failed += 1
+    }
+
+    // CHECK 24: Blank description omits empty parentheses
+    print("24. Blank catalog description...")
+    let blank = Provider(id: .adyen, name: "Adyen", description: "  ", methods: [.card])
+    if resolvePaymentRails(from: [blank]).first?.badge == "Debit card · Adyen" {
+      print("  ✓ Blank description is omitted from the badge")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected blank-description badge")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    let total = passed + failed
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

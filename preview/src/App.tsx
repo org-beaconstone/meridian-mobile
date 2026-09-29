@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import PaymentMethodSheet from './PaymentMethodSheet';
+import {
+  REGION_UNAVAILABLE,
+  readProviders,
+  resolvePaymentRails,
+  type CatalogProvider,
+  type PaymentMethodId,
+} from './domain/paymentRails';
 
-type Method = 'card' | 'bank';
+type Method = PaymentMethodId;
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
 type Transaction = {
   id: string;
@@ -20,10 +28,6 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
 import { money, parsePence as pence } from './domain/currency';
 class RequestError extends Error {
   constructor(
@@ -76,6 +80,8 @@ export default function App() {
   const [roomInput, setRoomInput] = useState(room);
   const [state, setState] = useState<State | null>(null);
   const [recipients, setRecipients] = useState<Recipient[]>([]);
+  const [providers, setProviders] = useState<CatalogProvider[] | null>(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -94,13 +100,18 @@ export default function App() {
     revision = useRef(0),
     mutating = useRef(false),
     paymentKey = useRef(crypto.randomUUID());
+  const methodButtonRef = useRef<HTMLButtonElement>(null);
+  const rails = providers === null ? null : resolvePaymentRails(providers);
+  const selectedRail = rails?.find((rail) => rail.method === method) ?? null;
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
     setState(null);
+    setProviders(null);
     setConnected(false);
     setError('');
+    setSheetOpen(false);
     async function poll() {
       const version = revision.current;
       try {
@@ -117,6 +128,7 @@ export default function App() {
           ) {
             setState(bankState(raw));
             setRecipients(catalog.recipients);
+            setProviders(readProviders(catalog));
             setConnected(true);
           }
         }
@@ -167,6 +179,10 @@ export default function App() {
     setError('');
     paymentKey.current = crypto.randomUUID();
   }
+  function closeSheet() {
+    setSheetOpen(false);
+    requestAnimationFrame(() => methodButtonRef.current?.focus());
+  }
   function review() {
     const value = pence(amount);
     if (value === null) {
@@ -177,10 +193,19 @@ export default function App() {
       setError('Insufficient balance');
       return;
     }
+    if (!selectedRail?.available) {
+      setError(providers === null ? 'Payment methods are still loading.' : REGION_UNAVAILABLE);
+      return;
+    }
     setError('');
+    setSheetOpen(false);
     setStep('review');
   }
   async function confirm() {
+    if (!selectedRail?.available) {
+      setError(providers === null ? 'Payment methods are still loading.' : REGION_UNAVAILABLE);
+      return;
+    }
     try {
       setError('');
       const result = await mutate(
@@ -336,29 +361,28 @@ export default function App() {
                         onChange={(e) => setNote(e.target.value)}
                         placeholder="What’s it for?"
                       />
-                      <fieldset>
-                        <legend>Payment method</legend>
-                        {providers.map((provider) => (
-                          <label
-                            className={
-                              'mobile-method ' + (method === provider.method ? 'selected' : '')
-                            }
-                            key={provider.id}
-                          >
-                            <input
-                              type="radio"
-                              name="method"
-                              checked={method === provider.method}
-                              onChange={() => setMethod(provider.method)}
-                            />
-                            <span>
-                              {provider.method === 'card' ? 'Debit card' : 'Bank payment'}
-                              <small>{provider.name} simulation</small>
-                            </span>
-                          </label>
-                        ))}
-                      </fieldset>
-                      <button className="primary" disabled={!connected || busy} type="submit">
+                      <span id="mobile-method-label">Payment method</span>
+                      <button
+                        id="mobile-method"
+                        ref={methodButtonRef}
+                        className="method-trigger"
+                        type="button"
+                        aria-haspopup="dialog"
+                        aria-busy={rails === null}
+                        aria-labelledby="mobile-method-label mobile-method-value"
+                        onClick={() => setSheetOpen(true)}
+                      >
+                        <span id="mobile-method-value">
+                          {rails === null
+                            ? 'Loading payment methods…'
+                            : (selectedRail?.badge ?? 'Choose a payment method')}
+                        </span>
+                      </button>
+                      <button
+                        className="primary"
+                        disabled={!connected || busy || !selectedRail?.available}
+                        type="submit"
+                      >
                         Review payment
                       </button>
                     </form>
@@ -369,11 +393,17 @@ export default function App() {
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
-                          {note || 'No reference'}
+                          {selectedRail?.badge ?? 'Payment method'} · {note || 'No reference'}
                         </p>
+                        {!selectedRail?.available && (
+                          <p className="rail-warning">{REGION_UNAVAILABLE}</p>
+                        )}
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      <button
+                        className="primary"
+                        onClick={confirm}
+                        disabled={busy || !connected || !selectedRail?.available}
+                      >
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
                       <button className="secondary" disabled={busy} onClick={editPayment}>
@@ -519,6 +549,7 @@ export default function App() {
               onClick={() => {
                 setPage(item);
                 setNotice('');
+                setSheetOpen(false);
               }}
             >
               {item}
@@ -526,6 +557,18 @@ export default function App() {
           ))}
         </nav>
         <footer>Fictional Meridian Bank · GBP simulation</footer>
+        {sheetOpen && (
+          <PaymentMethodSheet
+            method={method}
+            rails={rails}
+            onSelect={setMethod}
+            onCommit={(next) => {
+              setMethod(next);
+              closeSheet();
+            }}
+            onClose={closeSheet}
+          />
+        )}
       </div>
     </div>
   );
