@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -87,6 +88,21 @@ data class HealthResponse(
   val simulation: Boolean,
 ) : Serializable
 
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class SessionHealthResponse(
+  val status: String? = null,
+  val connection: String? = null,
+  val corridors: List<CorridorHealth>? = null,
+) : Serializable
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CorridorHealth(
+  val id: String? = null,
+  val provider: String? = null,
+  val state: String? = null,
+  val status: String? = null,
+) : Serializable
+
 data class CatalogResponse(
   val demoDate: String,
   val recipients: List<Recipient>,
@@ -143,10 +159,10 @@ data class BudgetRequest(
 // MARK: - Error Types
 
 sealed class MeridianError(message: String?, cause: Throwable? = null) : Exception(message, cause) {
-  class NetworkError(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
+  class NetworkError(msg: String, cause: Throwable? = null) : MeridianError(Sanitizer.sanitize(msg), cause)
   class InvalidURL(msg: String = "Invalid URL") : MeridianError(msg)
-  class DecodingError(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
-  class HttpError(val statusCode: Int, msg: String) : MeridianError("HTTP $statusCode: $msg")
+  class DecodingError(msg: String, cause: Throwable? = null) : MeridianError(Sanitizer.sanitize(msg), cause)
+  class HttpError(val statusCode: Int, msg: String) : MeridianError("HTTP $statusCode: ${Sanitizer.sanitize(msg)}")
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
   class ValidationError(msg: String) : MeridianError(msg)

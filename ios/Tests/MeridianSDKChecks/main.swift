@@ -1,9 +1,12 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +344,249 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    await runTelemetryChecks(passed: &passed, failed: &failed)
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+
+  static func check(_ name: String, _ condition: Bool, passed: inout Int, failed: inout Int) {
+    if condition {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+
+  static func runTelemetryChecks(passed: inout Int, failed: inout Int) async {
+    print("21. sanitizer redacts PAN and IBAN...")
+    let pan = "4111111111111111"
+    let iban = "GB82WEST12345698765432"
+    let cleaned = Sanitizer.sanitize("pay \(pan) and 4111-1111-1111-1111 to \(iban) / GB82 WEST 1234 5698 7654 32")
+    check(
+      "sanitizer redacts PAN and IBAN",
+      !cleaned.contains(pan) && !cleaned.contains("4111-1111") && !cleaned.contains(iban) && !cleaned.contains("WEST 1234")
+        && cleaned.contains("[REDACTED_PAN]") && cleaned.contains("[REDACTED_IBAN]")
+        && Sanitizer.sanitize("Insufficient balance") == "Insufficient balance"
+        && Sanitizer.sanitize("4111111111111112") == "4111111111111112",
+      passed: &passed,
+      failed: &failed
+    )
+
+    print("22. local biometric span...")
+    let log = TelemetryLog()
+    let biometricClient = try? MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "bio", telemetry: log)
+    let biometric = await biometricClient?.resolveBiometricPrompt(sensorAvailable: false)
+    let biometricSpan = log.spans().first { $0.name == "biometric.prompt" }
+    let biometricEvent = log.events().first { $0.code == "SCA_FALLBACK" }
+    check(
+      "biometric prompt records duration and SCA fallback",
+      biometric?.code == "SCA_FALLBACK" && biometricSpan?.status == "error" && (biometricSpan?.durationMillis ?? -1) >= 0
+        && biometricEvent?.stage == "biometric" && !(biometricEvent?.message.contains(pan) ?? true),
+      passed: &passed,
+      failed: &failed
+    )
+
+    print("23. traceparent, spans, and corridor telemetry...")
+    do {
+      let server = try await CaptureServer()
+      let wire = TelemetryLog()
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:\(server.port)/api/v1",
+        sessionId: "trace-room",
+        telemetry: wire
+      )
+      let catalog = try await client.getCatalog()
+      let fallback = await client.resolveBiometricPrompt(sensorAvailable: false)
+      let payment = try await client.submitPayment(
+        recipientId: "northline-studio",
+        amountMinor: 1000,
+        method: .card,
+        note: "Rent \(iban)",
+        idempotencyKey: "idem-trace-1"
+      )
+      _ = try await client.getState()
+      let first = await client.checkSessionHealth()
+      let second = await client.checkSessionHealth()
+      let captured = try await server.dump()
+      await server.stop()
+
+      let paths = Set(captured.map(\.path))
+      let required = ["/api/v1/catalog", "/api/v1/payments", "/api/v1/session/health", "/api/v1/state"]
+      let headersOk = required.allSatisfy { path in
+        guard let header = captured.first(where: { $0.path == path })?.traceparent else { return false }
+        return TraceIds.isTraceparent(header) && captured.first(where: { $0.path == path })?.session == "trace-room"
+      }
+      let paymentCapture = captured.first { $0.path == "/api/v1/payments" }
+      let gateway = wire.spans().first { $0.name == "payment.gateway" }
+      let parse = wire.spans().first { $0.name == "catalog.parse" }
+      let headerMatchesSpan = gateway != nil && (paymentCapture?.traceparent?.contains(gateway!.traceId) ?? false)
+        && (paymentCapture?.traceparent?.contains(gateway!.spanId) ?? false)
+      let dump = (wire.events().map { "\($0.code) \($0.stage) \($0.message) \($0.attributes)" } + wire.spans().map { "\($0.attributes)" }).joined(separator: " ")
+      let redacted = !dump.contains(pan) && !dump.contains(iban) && !dump.contains("GB82 WEST") && !dump.contains("unlisted")
+      let corridor = wire.events().filter { $0.name == "corridor.degraded" }
+      check(
+        "W3C traceparent on catalog, payments, and session health",
+        catalog.providers.isEmpty && paths.isSuperset(of: required) && headersOk && paymentCapture?.idempotency == "idem-trace-1"
+          && (paymentCapture?.body.contains(iban) ?? false) && headerMatchesSpan
+          && parse?.status == "ok" && (parse?.durationMillis ?? -1) >= 0
+          && gateway?.status == "error" && (gateway?.durationMillis ?? -1) >= 0
+          && fallback.code == "SCA_FALLBACK"
+          && payment.code == "DECLINED" && !(payment.error?.contains(pan) ?? true) && !(payment.error?.contains("WEST") ?? true)
+          && first.connection == "connected" && second.connection == "degraded"
+          && second.corridors.contains { $0.id == "adyen-card" && $0.state == "degraded" }
+          && second.corridors.contains { $0.id == "corridor" && $0.state == "down" }
+          && corridor.count == 2
+          && wire.events().contains { $0.code == "DECLINED" && $0.stage == "gateway" }
+          && wire.events().contains { $0.name == "connection.state" && $0.attributes["connection"] == "degraded" }
+          && redacted,
+        passed: &passed,
+        failed: &failed
+      )
+    } catch {
+      print("  detail: \(error)")
+      check("W3C traceparent on catalog, payments, and session health", false, passed: &passed, failed: &failed)
+    }
+  }
+}
+
+private struct CaptureRecord: Decodable {
+  let path: String
+  let traceparent: String?
+  let session: String?
+  let idempotency: String?
+  let body: String
+}
+
+private actor CaptureServer {
+  let port: Int
+  private let process: Process
+
+  init() async throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    process.arguments = ["-c", CaptureServer.script]
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    let handle = output.fileHandleForReading
+    var collected = Data()
+    while true {
+      let chunk = handle.availableData
+      if chunk.isEmpty { throw CheckFailure("python server exited") }
+      collected.append(chunk)
+      if let text = String(data: collected, encoding: .utf8), let line = text.split(separator: "\n").first, line.hasPrefix("PORT ") {
+        let number = Int(line.dropFirst(5))
+        guard let number else { throw CheckFailure("missing port") }
+        self.port = number
+        self.process = process
+        return
+      }
+    }
+  }
+
+  func dump() async throws -> [CaptureRecord] {
+    let url = URL(string: "http://127.0.0.1:\(port)/__dump")!
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 5
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+      throw CheckFailure("dump failed")
+    }
+    return try JSONDecoder().decode([CaptureRecord].self, from: data)
+  }
+
+  func stop() async {
+    guard let url = URL(string: "http://127.0.0.1:\(port)/__shutdown") else { return }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 5
+    _ = try? await URLSession.shared.data(for: request)
+    process.waitUntilExit()
+  }
+
+  private static let script = #"""
+import json, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+captured = []
+health_calls = {"n": 0}
+lock = threading.Lock()
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        self.route(b"")
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        self.route(self.rfile.read(length) if length else b"")
+    def do_PATCH(self):
+        self.do_POST()
+    def route(self, raw):
+        path = self.path.split("?", 1)[0]
+        if path == "/__dump":
+            self._send(200, json.dumps(captured).encode())
+            return
+        if path == "/__shutdown":
+            self._send(200, b"{}")
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        body = raw.decode("utf-8", "replace")
+        with lock:
+            if path.endswith("/session/health"):
+                health_calls["n"] += 1
+            attempt = health_calls["n"]
+            captured.append({
+                "path": path,
+                "traceparent": self.headers.get("traceparent"),
+                "session": self.headers.get("X-Rehearsal-Session"),
+                "idempotency": self.headers.get("Idempotency-Key"),
+                "body": body,
+            })
+        if path.endswith("/catalog"):
+            payload = b'{"demoDate":"2026-09-18","recipients":[],"providers":[]}'
+            status = 200
+        elif path.endswith("/payments"):
+            payload = b'{"ok":false,"code":"DECLINED","error":"declined 4111111111111111 GB82WEST12345698765432"}'
+            status = 422
+        elif path.endswith("/session/health"):
+            if attempt == 1:
+                payload = b'{"status":"UP","connection":"connected","corridors":[{"id":"adyen-card","state":"healthy"},{"id":"worldpay-bank","state":"healthy"}]}'
+            else:
+                payload = b'{"status":"UP","connection":"connected","corridors":[{"id":"adyen-card","state":"degraded"},{"id":"unlisted","state":"down"}]}'
+            status = 200
+        elif path.endswith("/state"):
+            payload = b'{"version":1,"balance":1,"transactions":[],"budgets":[]}'
+            status = 200
+        else:
+            payload = b"{}"
+            status = 404
+        self._send(status, payload)
+    def _send(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self, fmt, *args):
+        return
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+print("PORT %s" % server.server_address[1], flush=True)
+server.serve_forever()
+"""#
+
+}
+
+private struct CheckFailure: Error, CustomStringConvertible {
+  let description: String
+  init(_ description: String) { self.description = description }
 }

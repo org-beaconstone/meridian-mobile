@@ -25,6 +25,17 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  emptyHealthMemory,
+  healthSummary,
+  openSpan,
+  probeSessionHealth,
+  recordError,
+  reduceHealth,
+  resolveBiometric,
+  sanitize,
+  spanNameFor,
+} from './domain/telemetry';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -34,6 +45,7 @@ class RequestError extends Error {
   }
 }
 async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
+  const span = openSpan(spanNameFor(path));
   let response: Response;
   try {
     response = await fetch('/api/v1' + path, {
@@ -41,20 +53,76 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
       headers: {
         'Content-Type': 'application/json',
         'X-Rehearsal-Session': room,
+        traceparent: span.traceparent,
         ...(key ? { 'Idempotency-Key': key } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(15000),
     });
   } catch {
+    span.end('error', { 'http.path': path });
+    recordError({
+      code: 'NETWORK_ERROR',
+      stage: 'network',
+      message: 'Connection lost',
+      traceId: span.traceId,
+      spanId: span.spanId,
+      attributes: { 'http.path': path },
+    });
     throw new RequestError(
       'Connection lost. Outcome may be unknown. Retry this same payment after reconnecting.',
       'NETWORK_ERROR',
     );
   }
-  const data = await response.json();
-  if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+  const text = await response.text();
+  let data: {
+    error?: string;
+    code?: string;
+    recipients?: Recipient[];
+    state?: unknown;
+    ok?: boolean;
+    transaction?: Transaction;
+  };
+  if (path === '/catalog') {
+    const parse = openSpan('catalog.parse', span.traceId, span.spanId);
+    try {
+      data = text ? JSON.parse(text) : {};
+      parse.end('ok', { recipientCount: String(data.recipients?.length ?? 0) });
+    } catch (error) {
+      parse.end('error');
+      span.end('error', { 'http.path': path });
+      recordError({
+        code: 'DECODING_ERROR',
+        stage: 'catalog_parse',
+        message: error instanceof Error ? error.message : 'Failed to parse catalog',
+        traceId: parse.traceId,
+        spanId: parse.spanId,
+      });
+      throw new RequestError('Failed to parse catalog', 'DECODING_ERROR');
+    }
+  } else {
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      span.end('error', { 'http.path': path });
+      throw new RequestError(sanitize(`HTTP ${response.status}`), 'HTTP_ERROR');
+    }
+  }
+  span.end(response.ok ? 'ok' : 'error', { 'http.status': String(response.status), 'http.path': path });
+  if (!response.ok) {
+    const code = data.code || 'HTTP_ERROR';
+    const message = sanitize(data.error || `HTTP ${response.status}`);
+    if (!(path === '/payments' && code === 'PAYMENT_PENDING')) {
+      recordError({
+        code,
+        stage: path === '/payments' ? 'gateway' : path === '/catalog' ? 'catalog' : 'network',
+        message,
+        traceId: span.traceId,
+        spanId: span.spanId,
+      });
+    }
+    throw new RequestError(message, code);
+  }
   return data;
 }
 function bankState(value: unknown): State {
@@ -90,6 +158,8 @@ export default function App() {
   const [receipt, setReceipt] = useState<Transaction | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
+  const [healthLabel, setHealthLabel] = useState('Session health pending');
+  const [biometricAvailable, setBiometricAvailable] = useState(true);
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
@@ -116,7 +186,7 @@ export default function App() {
             !mutating.current
           ) {
             setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            setRecipients(catalog.recipients ?? []);
             setConnected(true);
           }
         }
@@ -133,6 +203,27 @@ export default function App() {
     return () => {
       closed = true;
       clearTimeout(timer);
+    };
+  }, [room]);
+  useEffect(() => {
+    let closed = false;
+    let memory = emptyHealthMemory();
+    async function tick() {
+      const reading = await probeSessionHealth(room);
+      if (closed) return;
+      const reduced = reduceHealth(
+        memory,
+        reading.reading,
+        reading.errorCode ? { code: reading.errorCode, message: reading.errorMessage ?? '' } : undefined,
+      );
+      memory = reduced.memory;
+      setHealthLabel(healthSummary(reading.reading));
+    }
+    void tick();
+    const timer = setInterval(() => void tick(), 15000);
+    return () => {
+      closed = true;
+      clearInterval(timer);
     };
   }, [room]);
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
@@ -183,6 +274,10 @@ export default function App() {
   async function confirm() {
     try {
       setError('');
+      const bio = resolveBiometric(biometricAvailable);
+      if (bio.code === 'SCA_FALLBACK') {
+        setNotice('Local biometric unavailable. Continuing with the selected provider.');
+      }
       const result = await mutate(
         '/payments',
         'POST',
@@ -190,7 +285,7 @@ export default function App() {
         paymentKey.current,
       );
       if (result.ok) {
-        setReceipt(result.transaction);
+        setReceipt(result.transaction ?? null);
         setStep('done');
       } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
@@ -223,6 +318,7 @@ export default function App() {
         <div className="connection-bar">
           <span className={connected ? 'status-dot' : 'status-dot offline'} />
           <strong>{connected ? 'Connected API' : 'API unavailable'}</strong>
+          <span data-testid="session-health">{healthLabel}</span>
           <span>{room}</span>
         </div>
         <main>
@@ -373,6 +469,17 @@ export default function App() {
                           {note || 'No reference'}
                         </p>
                       </div>
+                      <label className="mobile-method">
+                        <input
+                          type="checkbox"
+                          checked={biometricAvailable}
+                          onChange={(e) => setBiometricAvailable(e.target.checked)}
+                        />
+                        <span>
+                          Local biometric sensor
+                          <small>Unavailable records an SCA fallback and keeps this provider</small>
+                        </span>
+                      </label>
                       <button className="primary" onClick={confirm} disabled={busy || !connected}>
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
