@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -127,12 +128,14 @@ data class AuditEvent(
 
 // MARK: - Request Payloads
 
+@JsonInclude(JsonInclude.Include.NON_NULL)
 data class PaymentRequest(
   val recipientId: String,
   val amountMinor: Int,
   val method: String,
   val note: String,
   val scenario: String,
+  val scaChallengeToken: String? = null,
 ) : Serializable
 
 data class BudgetRequest(

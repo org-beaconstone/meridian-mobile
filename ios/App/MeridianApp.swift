@@ -19,6 +19,8 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @State private var scaSession: ScaSession?
+  @State private var passcode = ""
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -46,10 +48,19 @@ import MeridianSDK
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
-            Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
-            Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
+            if let scaSession, scaSession.showsPasscode {
+              Text(ScaCopy.biometricPrompt).font(.callout)
+              SecureField("In-app passcode", text: $passcode).textFieldStyle(.roundedBorder).disabled(busy)
+              Text("Rehearsal passcode \(ScaCopy.rehearsalPasscode). It stays on this device and is not sent to the API.").font(.caption)
+              Button("Verify passcode") { Task { await verifyPasscode() } }.buttonStyle(.borderedProminent).disabled(busy)
+            } else if let token = scaSession?.resubmitToken {
+              Button("Confirm payment") { Task { await retryVerified(token) } }.buttonStyle(.borderedProminent).disabled(busy)
+            } else {
+              Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
+            }
+            Button("Edit details") { review=false; key=UUID().uuidString; scaSession=nil; passcode="" }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; scaSession=nil; passcode=""; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
           ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
@@ -63,7 +74,7 @@ import MeridianSDK
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
+    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString; scaSession=nil; passcode=""
     do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
@@ -76,9 +87,56 @@ import MeridianSDK
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
+      let draft=PaymentDraft(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
+      let call=try await client.submitPayment(recipientId:draft.recipientId,amountMinor:draft.amountMinor,method:draft.method,note:draft.note,scenario:draft.scenario,idempotencyKey:draft.idempotencyKey)
+      await resolve(call, draft:draft, client:client, allowStepUp:true)
+    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+  }
+  private func retryVerified(_ token: String) async {
+    guard let client, let session=scaSession, !busy else {return}
+    busy=true; generation += 1
+    defer {busy=false}
+    await resubmit(token:token, draft:session.draft, client:client)
+  }
+  private func verifyPasscode() async {
+    guard let client, var session=scaSession, !busy else {return}
+    session.submitPasscode(passcode)
+    passcode=""
+    scaSession=session
+    guard case .readyToResubmit(let token)=session.phase else {message=ScaCopy.failureMessage; return}
+    busy=true; generation += 1
+    defer {busy=false}
+    await resubmit(token:token, draft:session.draft, client:client)
+  }
+  private func resolve(_ call: PaymentCall, draft: PaymentDraft, client: MeridianClient, allowStepUp: Bool) async {
+    switch ScaInterpreter.intercept(statusCode:call.statusCode, body:call.body) {
+    case .notStepUp:
+      if call.response.ok {
+        state=call.response.state; review=false; amount=""; reference=""; key=UUID().uuidString; scaSession=nil; passcode=""
+        message="Demo payment completed. Other clients will refresh."
+      } else {
+        message=call.response.error ?? "Payment pending. Retry the same payment, not a new one."
+      }
+    case .invalid, .expired:
+      message=ScaCopy.failureMessage
+    case .required(let challenge):
+      guard allowStepUp else {message=ScaCopy.failureMessage; return}
+      var session=ScaSession(draft:draft, challenge:challenge)
+      let biometric=await LocalAuthenticationBiometric().authenticate(reason:ScaCopy.biometricPrompt)
+      session.completeBiometric(biometric)
+      scaSession=session
+      if case .readyToResubmit(let token)=session.phase {
+        await resubmit(token:token, draft:draft, client:client)
+      } else {
+        message=ScaCopy.biometricPrompt
+      }
+    }
+  }
+  private func resubmit(token: String, draft: PaymentDraft, client: MeridianClient) async {
+    if scaSession?.challenge.isExpired() == true {message=ScaCopy.failureMessage; return}
+    do {
+      let call=try await client.submitPayment(recipientId:draft.recipientId,amountMinor:draft.amountMinor,method:draft.method,note:draft.note,scenario:draft.scenario,idempotencyKey:draft.idempotencyKey,scaChallengeToken:token)
+      await resolve(call, draft:draft, client:client, allowStepUp:false)
     } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
   }
 }
