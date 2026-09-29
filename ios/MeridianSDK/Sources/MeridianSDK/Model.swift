@@ -169,6 +169,10 @@ public struct PaymentResponse: Codable {
   public let error: String?
   public let code: String?
   public let paymentId: String?
+  /// Present when `code == "SCA_STEP_UP_REQUIRED"`. Pass to `ScaChallengeHandler`.
+  public let scaChallengeToken: String?
+  /// ISO 8601 expiration timestamp of the SCA challenge window.
+  public let challengeExpiresAt: String?
 
   enum CodingKeys: String, CodingKey {
     case ok
@@ -177,6 +181,8 @@ public struct PaymentResponse: Codable {
     case error
     case code
     case paymentId
+    case scaChallengeToken
+    case challengeExpiresAt
   }
 }
 
@@ -234,6 +240,45 @@ public struct BudgetRequest: Codable {
     self.category = category
     self.limitMinor = limitMinor
   }
+}
+
+// MARK: - SCA (PSD2 Strong Customer Authentication) Types
+
+/// Payment request that includes a PSD2 SCA challenge token for step-up re-dispatch.
+public struct ScaPaymentRequest: Codable {
+  public let recipientId: String
+  public let amountMinor: Int
+  public let method: PaymentMethod
+  public let note: String
+  public let scenario: Scenario
+  /// Token extracted from the `SCA_STEP_UP_REQUIRED` gateway response.
+  public let scaChallengeToken: String
+
+  public init(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String,
+    scenario: Scenario,
+    scaChallengeToken: String
+  ) {
+    self.recipientId = recipientId
+    self.amountMinor = amountMinor
+    self.method = method
+    self.note = note
+    self.scenario = scenario
+    self.scaChallengeToken = scaChallengeToken
+  }
+}
+
+/// Outcome of an SCA challenge handled by `ScaChallengeHandler`.
+public enum ScaOutcome: Sendable {
+  /// Authentication succeeded and the payment was re-dispatched successfully.
+  case success(PaymentResponse)
+  /// Both biometric and passcode authentication failed.
+  case authenticationFailed(String)
+  /// The challenge window expired before or during authentication.
+  case challengeExpired(String)
 }
 
 // MARK: - Error Types

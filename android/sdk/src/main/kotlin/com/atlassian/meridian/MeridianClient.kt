@@ -190,4 +190,40 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  /**
+   * POST /payments - Re-submit a payment with an SCA challenge token (PSD2 step-up).
+   *
+   * Called by [ScaChallengeHandler] after successful biometric or passcode verification.
+   * The original [idempotencyKey] is reused so the gateway can correlate the re-dispatch
+   * with the initial attempt.
+   *
+   * @param scaChallengeToken Token obtained from the `SCA_STEP_UP_REQUIRED` response.
+   * @param idempotencyKey The original idempotency key from the first payment attempt.
+   */
+  suspend fun submitScaPayment(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+    idempotencyKey: String,
+    scaChallengeToken: String,
+  ): PaymentResponse {
+    val payload = ScaPaymentRequest(
+      recipientId = recipientId,
+      amountMinor = amountMinor,
+      method = method.name,
+      note = note,
+      scenario = scenario.name,
+      scaChallengeToken = scaChallengeToken,
+    )
+    return request(
+      "POST",
+      "/payments",
+      payload,
+      mapOf("Idempotency-Key" to idempotencyKey),
+      PaymentResponse::class.java,
+    )
+  }
 }
