@@ -341,10 +341,182 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: PaymentIntentStatus terminal flag
+    print("21. PaymentIntentStatus terminal flag...")
+    if !PaymentIntentStatus.pending.isTerminal
+      && PaymentIntentStatus.completed.isTerminal
+      && PaymentIntentStatus.declined.isTerminal
+      && PaymentIntentStatus.failed.isTerminal
+    {
+      print("  ✓ PaymentIntentStatus.isTerminal correct for all cases")
+      passed += 1
+    } else {
+      print("  ✗ PaymentIntentStatus.isTerminal incorrect")
+      failed += 1
+    }
+
+    // CHECK 22: PaymentIntentSnapshot pending is active
+    print("22. PaymentIntentSnapshot pending isActive...")
+    let pendingSnap = PaymentIntentSnapshot(
+      paymentIntentId: "pi-001",
+      idempotencyKey: "idem-001",
+      businessPayloadHash: "abc",
+      status: .pending,
+      createdAt: "2026-09-29T10:00:00Z"
+    )
+    if pendingSnap.isActive && !pendingSnap.isExpired {
+      print("  ✓ Pending snapshot isActive=true, isExpired=false")
+      passed += 1
+    } else {
+      print("  ✗ Pending snapshot isActive or isExpired incorrect")
+      failed += 1
+    }
+
+    // CHECK 23: PaymentIntentSnapshot completed not active
+    print("23. PaymentIntentSnapshot completed isActive=false...")
+    let completedSnap = PaymentIntentSnapshot(
+      paymentIntentId: "pi-002",
+      idempotencyKey: "idem-002",
+      businessPayloadHash: "abc",
+      status: .completed,
+      createdAt: "2026-09-29T10:00:00Z",
+      resolvedAt: "2026-09-29T10:01:00Z"
+    )
+    if !completedSnap.isActive && !completedSnap.isExpired {
+      print("  ✓ Completed snapshot isActive=false, not yet expired")
+      passed += 1
+    } else {
+      print("  ✗ Completed snapshot flags incorrect")
+      failed += 1
+    }
+
+    // CHECK 24: PaymentIntentSnapshot expired after retention window
+    print("24. PaymentIntentSnapshot isExpired after retention window...")
+    let pastDate = ISO8601DateFormatter().string(
+      from: Date().addingTimeInterval(-(PaymentIntentSnapshot.retentionWindow + 3600))
+    )
+    let expiredSnap = PaymentIntentSnapshot(
+      paymentIntentId: "pi-003",
+      idempotencyKey: "idem-003",
+      businessPayloadHash: "abc",
+      status: .completed,
+      createdAt: "2026-09-28T08:00:00Z",
+      resolvedAt: pastDate
+    )
+    if !expiredSnap.isActive && expiredSnap.isExpired {
+      print("  ✓ Snapshot correctly expired after retention window")
+      passed += 1
+    } else {
+      print("  ✗ isExpired logic incorrect for past-retention snapshot")
+      failed += 1
+    }
+
+    // CHECK 25: PaymentIntentSnapshot pending never expires
+    print("25. PaymentIntentSnapshot pending never expires...")
+    let oldPending = PaymentIntentSnapshot(
+      paymentIntentId: "pi-004",
+      idempotencyKey: "idem-004",
+      businessPayloadHash: "abc",
+      status: .pending,
+      createdAt: "2026-01-01T00:00:00Z"
+    )
+    if !oldPending.isExpired {
+      print("  ✓ Pending snapshot without resolvedAt is never expired")
+      passed += 1
+    } else {
+      print("  ✗ Pending snapshot should not expire")
+      failed += 1
+    }
+
+    // CHECK 26: businessPayloadHash is deterministic
+    print("26. businessPayloadHash deterministic...")
+    let h1 = businessPayloadHash(
+      recipientId: "northline-studio",
+      amountMinor: 2599,
+      method: .card,
+      note: "test note",
+      scenario: .success
+    )
+    let h2 = businessPayloadHash(
+      recipientId: "northline-studio",
+      amountMinor: 2599,
+      method: .card,
+      note: "test note",
+      scenario: .success
+    )
+    if h1 == h2 && !h1.isEmpty {
+      print("  ✓ businessPayloadHash deterministic: \(h1.prefix(8))…")
+      passed += 1
+    } else {
+      print("  ✗ businessPayloadHash not deterministic")
+      failed += 1
+    }
+
+    // CHECK 27: businessPayloadHash differs on amount change
+    print("27. businessPayloadHash differs on parameter change...")
+    let h3 = businessPayloadHash(
+      recipientId: "northline-studio",
+      amountMinor: 2600,
+      method: .card,
+      note: "test note",
+      scenario: .success
+    )
+    if h1 != h3 {
+      print("  ✓ businessPayloadHash differs when amount changes")
+      passed += 1
+    } else {
+      print("  ✗ businessPayloadHash should differ on amount change")
+      failed += 1
+    }
+
+    // CHECK 28: businessPayloadHash is 64-char hex
+    print("28. businessPayloadHash is 64-char hex...")
+    let h4 = businessPayloadHash(
+      recipientId: "rec",
+      amountMinor: 100,
+      method: .bank,
+      note: "",
+      scenario: .success
+    )
+    let isHex = h4.count == 64 && h4.allSatisfy { "0123456789abcdef".contains($0) }
+    if isHex {
+      print("  ✓ businessPayloadHash is 64-char lowercase hex")
+      passed += 1
+    } else {
+      print("  ✗ businessPayloadHash has unexpected format: \(h4)")
+      failed += 1
+    }
+
+    // CHECK 29: PaymentIntentSnapshot stores returnState
+    print("29. PaymentIntentSnapshot stores returnState...")
+    let bankState = BankState(version: 2, balance: 950000, transactions: [], budgets: [])
+    let snapWithState = PaymentIntentSnapshot(
+      paymentIntentId: "pi-005",
+      idempotencyKey: "idem-005",
+      businessPayloadHash: "deadbeef",
+      status: .completed,
+      returnState: bankState,
+      createdAt: "2026-09-29T12:00:00Z",
+      resolvedAt: "2026-09-29T12:00:05Z"
+    )
+    if snapWithState.returnState?.balance == 950000 {
+      print("  ✓ returnState preserved in snapshot")
+      passed += 1
+    } else {
+      print("  ✗ returnState not preserved")
+      failed += 1
+    }
+
+    // CHECK 30: PaymentIntentStore can be instantiated
+    print("30. PaymentIntentStore instantiation...")
+    let _ = PaymentIntentStore()
+    print("  ✓ PaymentIntentStore() initialised")
+    passed += 1
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/30")
+    print("Failed: \(failed)/30")
 
     if failed > 0 {
       exit(1)

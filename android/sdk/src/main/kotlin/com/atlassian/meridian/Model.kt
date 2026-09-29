@@ -152,6 +152,49 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class ValidationError(msg: String) : MeridianError(msg)
 }
 
+// MARK: - Payment Intent Snapshot
+
+enum class PaymentIntentStatus {
+  pending, completed, declined, failed;
+
+  val isTerminal: Boolean
+    get() = when (this) {
+      pending -> false
+      completed, declined, failed -> true
+    }
+}
+
+data class PaymentIntentSnapshot(
+  val paymentIntentId: String,
+  val idempotencyKey: String,
+  val businessPayloadHash: String,
+  val status: PaymentIntentStatus,
+  val returnState: BankState? = null,
+  val createdAt: String,   // ISO 8601
+  val resolvedAt: String? = null, // ISO 8601, set when terminal
+) : Serializable {
+
+  companion object {
+    /** Retention window after terminal status (24 hours in seconds). */
+    const val RETENTION_SECONDS = 86_400L
+  }
+
+  val isActive: Boolean get() = status == PaymentIntentStatus.pending
+
+  val isExpired: Boolean
+    get() {
+      if (!status.isTerminal) return false
+      val resolved = resolvedAt ?: return false
+      return try {
+        val resolvedInstant = java.time.Instant.parse(resolved)
+        val elapsed = java.time.Instant.now().epochSecond - resolvedInstant.epochSecond
+        elapsed > RETENTION_SECONDS
+      } catch (_: Exception) {
+        false
+      }
+    }
+}
+
 // MARK: - Amount Formatting
 
 fun money(pence: Int): String {

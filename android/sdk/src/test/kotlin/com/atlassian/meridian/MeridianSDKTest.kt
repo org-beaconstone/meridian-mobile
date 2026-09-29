@@ -374,4 +374,319 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - PaymentIntentStatus Tests
+
+  @Test
+  fun testPaymentIntentStatusTerminal() {
+    assertFalse(PaymentIntentStatus.pending.isTerminal)
+    assertTrue(PaymentIntentStatus.completed.isTerminal)
+    assertTrue(PaymentIntentStatus.declined.isTerminal)
+    assertTrue(PaymentIntentStatus.failed.isTerminal)
+  }
+
+  // MARK: - PaymentIntentSnapshot Tests
+
+  @Test
+  fun testSnapshotIsActivePending() {
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-001",
+      idempotencyKey = "idem-001",
+      businessPayloadHash = "abc123",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    assertTrue(snapshot.isActive)
+    assertFalse(snapshot.isExpired)
+  }
+
+  @Test
+  fun testSnapshotIsNotActiveWhenCompleted() {
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-002",
+      idempotencyKey = "idem-002",
+      businessPayloadHash = "abc123",
+      status = PaymentIntentStatus.completed,
+      createdAt = "2026-09-29T10:00:00Z",
+      resolvedAt = "2026-09-29T10:01:00Z",
+    )
+    assertFalse(snapshot.isActive)
+    assertFalse(snapshot.isExpired) // within retention window
+  }
+
+  @Test
+  fun testSnapshotIsExpiredAfterRetentionWindow() {
+    // resolvedAt is 25 hours ago (past 24-hour retention)
+    val resolvedAt = java.time.Instant.now()
+      .minusSeconds(PaymentIntentSnapshot.RETENTION_SECONDS + 3600)
+      .toString()
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-003",
+      idempotencyKey = "idem-003",
+      businessPayloadHash = "abc123",
+      status = PaymentIntentStatus.completed,
+      createdAt = "2026-09-28T08:00:00Z",
+      resolvedAt = resolvedAt,
+    )
+    assertFalse(snapshot.isActive)
+    assertTrue(snapshot.isExpired)
+  }
+
+  @Test
+  fun testSnapshotNotExpiredWithinRetentionWindow() {
+    val resolvedAt = java.time.Instant.now().minusSeconds(3600).toString() // 1 hour ago
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-004",
+      idempotencyKey = "idem-004",
+      businessPayloadHash = "abc123",
+      status = PaymentIntentStatus.declined,
+      createdAt = "2026-09-29T09:00:00Z",
+      resolvedAt = resolvedAt,
+    )
+    assertFalse(snapshot.isExpired)
+  }
+
+  @Test
+  fun testSnapshotPendingNeverExpires() {
+    // A pending snapshot has no resolvedAt, so isExpired must be false
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-005",
+      idempotencyKey = "idem-005",
+      businessPayloadHash = "abc123",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-01-01T00:00:00Z",
+    )
+    assertFalse(snapshot.isExpired)
+  }
+
+  @Test
+  fun testSnapshotIncludesReturnState() {
+    val bankState = BankState(
+      version = 2,
+      balance = 950000,
+      transactions = emptyList(),
+      budgets = emptyList(),
+    )
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-006",
+      idempotencyKey = "idem-006",
+      businessPayloadHash = "deadbeef",
+      status = PaymentIntentStatus.completed,
+      returnState = bankState,
+      createdAt = "2026-09-29T12:00:00Z",
+      resolvedAt = "2026-09-29T12:00:05Z",
+    )
+    assertNotNull(snapshot.returnState)
+    assertEquals(950000, snapshot.returnState?.balance)
+  }
+
+  // MARK: - businessPayloadHash Tests
+
+  @Test
+  fun testBusinessPayloadHashDeterministic() {
+    val h1 = businessPayloadHash("northline-studio", 2599, PaymentMethod.card, "test note", Scenario.success)
+    val h2 = businessPayloadHash("northline-studio", 2599, PaymentMethod.card, "test note", Scenario.success)
+    assertEquals(h1, h2)
+  }
+
+  @Test
+  fun testBusinessPayloadHashDiffersOnAmountChange() {
+    val h1 = businessPayloadHash("northline-studio", 2599, PaymentMethod.card, "note", Scenario.success)
+    val h2 = businessPayloadHash("northline-studio", 2600, PaymentMethod.card, "note", Scenario.success)
+    assertNotEquals(h1, h2)
+  }
+
+  @Test
+  fun testBusinessPayloadHashDiffersOnRecipientChange() {
+    val h1 = businessPayloadHash("recipient-a", 1000, PaymentMethod.bank, "", Scenario.success)
+    val h2 = businessPayloadHash("recipient-b", 1000, PaymentMethod.bank, "", Scenario.success)
+    assertNotEquals(h1, h2)
+  }
+
+  @Test
+  fun testBusinessPayloadHashDiffersOnMethodChange() {
+    val h1 = businessPayloadHash("rec", 500, PaymentMethod.card, "", Scenario.success)
+    val h2 = businessPayloadHash("rec", 500, PaymentMethod.bank, "", Scenario.success)
+    assertNotEquals(h1, h2)
+  }
+
+  @Test
+  fun testBusinessPayloadHashIsHexString() {
+    val hash = businessPayloadHash("rec", 100, PaymentMethod.card, "note", Scenario.success)
+    assertTrue("Hash should be a 64-char hex string", hash.matches(Regex("[0-9a-f]{64}")))
+  }
+
+  // MARK: - InMemoryPaymentIntentStore Tests
+
+  @Test
+  fun testStoreSaveAndLoad() {
+    val store = InMemoryPaymentIntentStore()
+    val snapshot = PaymentIntentSnapshot(
+      paymentIntentId = "pi-save-1",
+      idempotencyKey = "idem-save-1",
+      businessPayloadHash = "aabbcc",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    store.save(snapshot, "account-1")
+    val all = store.loadAll("account-1")
+    assertEquals(1, all.size)
+    assertEquals("pi-save-1", all[0].paymentIntentId)
+    assertEquals(PaymentIntentStatus.pending, all[0].status)
+  }
+
+  @Test
+  fun testStoreUpdateExisting() {
+    val store = InMemoryPaymentIntentStore()
+    val initial = PaymentIntentSnapshot(
+      paymentIntentId = "pi-upd-1",
+      idempotencyKey = "idem-upd-1",
+      businessPayloadHash = "hash",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    store.save(initial, "account-upd")
+
+    val updated = initial.copy(
+      status = PaymentIntentStatus.completed,
+      resolvedAt = "2026-09-29T10:05:00Z",
+    )
+    store.save(updated, "account-upd")
+
+    val all = store.loadAll("account-upd")
+    assertEquals(1, all.size) // still one entry
+    assertEquals(PaymentIntentStatus.completed, all[0].status)
+    assertEquals("2026-09-29T10:05:00Z", all[0].resolvedAt)
+  }
+
+  @Test
+  fun testStoreAccountIsolation() {
+    val store = InMemoryPaymentIntentStore()
+    val snap1 = PaymentIntentSnapshot(
+      paymentIntentId = "pi-iso-1",
+      idempotencyKey = "idem-iso-1",
+      businessPayloadHash = "h1",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    val snap2 = PaymentIntentSnapshot(
+      paymentIntentId = "pi-iso-2",
+      idempotencyKey = "idem-iso-2",
+      businessPayloadHash = "h2",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    store.save(snap1, "account-A")
+    store.save(snap2, "account-B")
+
+    assertEquals(1, store.loadAll("account-A").size)
+    assertEquals("pi-iso-1", store.loadAll("account-A")[0].paymentIntentId)
+    assertEquals(1, store.loadAll("account-B").size)
+    assertEquals("pi-iso-2", store.loadAll("account-B")[0].paymentIntentId)
+  }
+
+  @Test
+  fun testStoreLoadActiveIntent() {
+    val store = InMemoryPaymentIntentStore()
+    val pending = PaymentIntentSnapshot(
+      paymentIntentId = "pi-active-1",
+      idempotencyKey = "idem-active-1",
+      businessPayloadHash = "h",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    store.save(pending, "account-active")
+    val active = store.loadActiveIntent("account-active")
+    assertNotNull(active)
+    assertEquals("pi-active-1", active?.paymentIntentId)
+  }
+
+  @Test
+  fun testStoreLoadActiveIntentSkipsCompleted() {
+    val store = InMemoryPaymentIntentStore()
+    val completed = PaymentIntentSnapshot(
+      paymentIntentId = "pi-done-1",
+      idempotencyKey = "idem-done-1",
+      businessPayloadHash = "h",
+      status = PaymentIntentStatus.completed,
+      createdAt = "2026-09-29T10:00:00Z",
+      resolvedAt = "2026-09-29T10:01:00Z",
+    )
+    store.save(completed, "account-done")
+    val active = store.loadActiveIntent("account-done")
+    assertNull(active)
+  }
+
+  @Test
+  fun testStoreLoadActiveIntentSkipsExpired() {
+    val store = InMemoryPaymentIntentStore()
+    // Simulate a stale pending that was resolved long ago and is now expired
+    val resolvedAt = java.time.Instant.now()
+      .minusSeconds(PaymentIntentSnapshot.RETENTION_SECONDS + 7200)
+      .toString()
+    val expired = PaymentIntentSnapshot(
+      paymentIntentId = "pi-exp-1",
+      idempotencyKey = "idem-exp-1",
+      businessPayloadHash = "h",
+      status = PaymentIntentStatus.completed,
+      createdAt = "2026-09-28T00:00:00Z",
+      resolvedAt = resolvedAt,
+    )
+    store.save(expired, "account-exp")
+    val active = store.loadActiveIntent("account-exp")
+    assertNull(active)
+  }
+
+  @Test
+  fun testStoreDelete() {
+    val store = InMemoryPaymentIntentStore()
+    val snap = PaymentIntentSnapshot(
+      paymentIntentId = "pi-del-1",
+      idempotencyKey = "idem-del-1",
+      businessPayloadHash = "h",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    store.save(snap, "account-del")
+    store.delete("pi-del-1", "account-del")
+    assertEquals(0, store.loadAll("account-del").size)
+  }
+
+  @Test
+  fun testStorePurgeExpired() {
+    val store = InMemoryPaymentIntentStore()
+    val resolvedAt = java.time.Instant.now()
+      .minusSeconds(PaymentIntentSnapshot.RETENTION_SECONDS + 3600)
+      .toString()
+    val expired = PaymentIntentSnapshot(
+      paymentIntentId = "pi-purge-expired",
+      idempotencyKey = "idem-purge-expired",
+      businessPayloadHash = "h",
+      status = PaymentIntentStatus.failed,
+      createdAt = "2026-09-28T00:00:00Z",
+      resolvedAt = resolvedAt,
+    )
+    val active = PaymentIntentSnapshot(
+      paymentIntentId = "pi-purge-active",
+      idempotencyKey = "idem-purge-active",
+      businessPayloadHash = "h",
+      status = PaymentIntentStatus.pending,
+      createdAt = "2026-09-29T10:00:00Z",
+    )
+    store.save(expired, "account-purge")
+    store.save(active, "account-purge")
+    assertEquals(2, store.loadAll("account-purge").size)
+
+    store.purgeExpired("account-purge")
+    val remaining = store.loadAll("account-purge")
+    assertEquals(1, remaining.size)
+    assertEquals("pi-purge-active", remaining[0].paymentIntentId)
+  }
+
+  @Test
+  fun testStoreEmptyAccountReturnsEmpty() {
+    val store = InMemoryPaymentIntentStore()
+    assertEquals(0, store.loadAll("no-such-account").size)
+    assertNull(store.loadActiveIntent("no-such-account"))
+  }
 }
