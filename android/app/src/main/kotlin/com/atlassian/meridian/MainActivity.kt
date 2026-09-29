@@ -10,7 +10,12 @@ import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -37,6 +42,8 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  val fontScale = LocalDensity.current.fontScale.toDouble()
+  val touchTarget = AccessibilityCopy.minimumTouchTargetDp(fontScale).dp
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
@@ -56,11 +63,22 @@ class MainActivity : ComponentActivity() {
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
       else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
-    },enabled=!busy){Text("Connect")}
+    },enabled=!busy,modifier=Modifier.defaultMinSize(minHeight=touchTarget)){Text("Connect")}
     Text(message)
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
+        Column(Modifier.padding(22.dp)){
+          Text("Everyday account")
+          Text(
+            money(current.balance),
+            fontSize = AccessibilityCopy.balanceBaseSp.sp,
+            modifier = Modifier.semantics {
+              heading()
+              contentDescription = AccessibilityCopy.balanceLabel(money(current.balance))
+            }
+          )
+          Text("Room: $room")
+        }
       }
       Text("Make a payment",style=MaterialTheme.typography.h6)
       catalog?.recipients?.forEach { person ->
@@ -71,7 +89,7 @@ class MainActivity : ComponentActivity() {
       // Intentional two-provider native baseline; changing it requires an app release.
       Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
       Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy,modifier=Modifier.defaultMinSize(minHeight=touchTarget)){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
         Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
@@ -79,7 +97,7 @@ class MainActivity : ComponentActivity() {
             if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
             else message=result.error?:"Awaiting confirmation. Retry the same payment."
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
-        }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
+        }}},enabled=!busy,modifier=Modifier.defaultMinSize(minHeight=touchTarget).semantics{contentDescription=AccessibilityCopy.confirmTalkBack}){Text(if(busy)"Confirming…" else "Confirm payment")}
         TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)

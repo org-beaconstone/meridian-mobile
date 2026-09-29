@@ -95,7 +95,7 @@ class MeridianSDKTest {
     assertEquals("£10.50", money(1050))
     assertEquals("£1.00", money(100))
     assertEquals("£0.01", money(1))
-    assertEquals("£10000.00", money(1_000_000))
+    assertEquals("£10,000.00", money(1_000_000))
   }
 
   // MARK: - Model Deserialization

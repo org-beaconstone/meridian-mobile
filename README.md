@@ -40,6 +40,17 @@ gradle :app:assembleDebug
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
 
+## Contract and scenario suites
+
+Swift and Kotlin run the same consumer contracts and scenarios from `contracts/`. The contracts accept legacy integer GBP pence and the newer `{minorUnits, currency}` money model. Only GBP amounts are encoded for `POST /payments`. EUR values stay in the model and are not submitted. Card remains Adyen and bank remains Worldpay.
+
+The shared scenarios cover money formatting, catalog cache expiry, idempotency keys kept across process death, rejection of replayed deep links and expired return states, malformed catalog entries, and the VoiceOver, TalkBack, large-type, and RTL values bound by the native screens. These checks do not launch an iOS simulator or Android device, so they do not claim a VoiceOver or TalkBack pass on hardware.
+
+```sh
+cd android && mvn -B test
+cd ios && swift run MeridianSDKChecks
+```
+
 ## Deliberate baseline
 
 Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.

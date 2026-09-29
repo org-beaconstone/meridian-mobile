@@ -1,0 +1,52 @@
+{
+  "consumer": "meridian-mobile",
+  "provider": "meridian-api",
+  "interaction": "GET /catalog multi-currency samples alongside legacy integers",
+  "response": {
+    "status": 200,
+    "body": {
+      "demoDate": "2026-09-18",
+      "recipients": [
+        {
+          "id": "northline-studio",
+          "name": "Northline Studio",
+          "initials": "NS",
+          "detail": "Design tools",
+          "category": "Shopping",
+          "color": "#1F6F8B"
+        }
+      ],
+      "providers": [
+        {
+          "id": "adyen",
+          "name": "Adyen",
+          "description": "Card payments",
+          "methods": ["card"],
+          "currencies": ["GBP", "EUR"],
+          "sampleAmount": { "minorUnits": 1050, "currency": "GBP" }
+        },
+        {
+          "id": "worldpay",
+          "name": "Worldpay",
+          "description": "Bank payments",
+          "methods": ["bank"],
+          "currencies": ["GBP"],
+          "sampleAmount": 2599
+        }
+      ]
+    }
+  },
+  "expect": {
+    "accepted": true,
+    "providerIds": ["adyen", "worldpay"],
+    "recipientIds": ["northline-studio"],
+    "currencies": {
+      "adyen": ["GBP", "EUR"],
+      "worldpay": ["GBP"]
+    },
+    "samples": [
+      { "providerId": "adyen", "minorUnits": 1050, "currency": "GBP" },
+      { "providerId": "worldpay", "minorUnits": 2599, "currency": "GBP" }
+    ]
+  }
+}
