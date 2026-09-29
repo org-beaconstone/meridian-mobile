@@ -14,4 +14,7 @@ dependencies {
   implementation("androidx.compose.material:material:1.5.4")
   implementation("androidx.compose.ui:ui:1.5.4")
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+  implementation("androidx.security:security-crypto:1.0.0")
+  implementation("com.fasterxml.jackson.core:jackson-databind:2.16.0")
+  implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.16.0")
 }

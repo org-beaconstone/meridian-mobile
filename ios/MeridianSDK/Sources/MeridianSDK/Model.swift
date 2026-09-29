@@ -267,6 +267,64 @@ public enum MeridianError: LocalizedError {
   }
 }
 
+// MARK: - Payment Intent Snapshot
+
+public enum PaymentIntentStatus: String, Codable, Hashable {
+  case pending
+  case completed
+  case declined
+  case failed
+
+  public var isTerminal: Bool {
+    switch self {
+    case .pending: return false
+    case .completed, .declined, .failed: return true
+    }
+  }
+}
+
+public struct PaymentIntentSnapshot: Codable, Hashable {
+  public let paymentIntentId: String
+  public let idempotencyKey: String
+  public let businessPayloadHash: String
+  public let status: PaymentIntentStatus
+  public let returnState: BankState?
+  public let createdAt: String    // ISO 8601
+  public let resolvedAt: String?  // ISO 8601, set when terminal
+
+  /// Retention window in seconds after reaching a terminal status (24 hours).
+  public static let retentionWindow: TimeInterval = 86_400
+
+  /// True when the intent is still active and awaiting confirmation.
+  public var isActive: Bool { status == .pending }
+
+  /// True when a terminal snapshot has exceeded the retention window.
+  public var isExpired: Bool {
+    guard status.isTerminal, let resolved = resolvedAt else { return false }
+    let formatter = ISO8601DateFormatter()
+    guard let resolvedDate = formatter.date(from: resolved) else { return false }
+    return Date().timeIntervalSince(resolvedDate) > Self.retentionWindow
+  }
+
+  public init(
+    paymentIntentId: String,
+    idempotencyKey: String,
+    businessPayloadHash: String,
+    status: PaymentIntentStatus,
+    returnState: BankState? = nil,
+    createdAt: String,
+    resolvedAt: String? = nil
+  ) {
+    self.paymentIntentId = paymentIntentId
+    self.idempotencyKey = idempotencyKey
+    self.businessPayloadHash = businessPayloadHash
+    self.status = status
+    self.returnState = returnState
+    self.createdAt = createdAt
+    self.resolvedAt = resolvedAt
+  }
+}
+
 // MARK: - Amount Formatting
 
 public func money(_ pence: Int) -> String {
