@@ -19,6 +19,10 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @State private var biometricAvailable = true
+  @State private var healthSummary = "Session health pending"
+  @State private var healthGeneration = 0
+  @State private var healthTask: Task<Void, Never>?
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -30,6 +34,7 @@ import MeridianSDK
           Button("Connect") { Task { await connect() } }.disabled(busy)
         }.textFieldStyle(.roundedBorder)
         Text(message).font(.callout).foregroundStyle(.secondary)
+        Text(healthSummary).font(.caption).foregroundStyle(.secondary)
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
@@ -44,6 +49,7 @@ import MeridianSDK
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
           // Intentionally hardcoded baseline: new providers still require a native release.
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          Toggle("Local biometric sensor", isOn: $biometricAvailable).disabled(busy)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
@@ -64,7 +70,21 @@ import MeridianSDK
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
     generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
+    healthTask?.cancel()
+    healthSummary = "Session health pending"
+    healthGeneration += 1
+    do {
+      let created = try MeridianClient(baseURL:endpoint,sessionId:room)
+      client = created
+      let started = healthGeneration
+      healthTask = await created.startSessionHealthChecks { snapshot in
+        let text = snapshot.summary
+        Task { @MainActor in
+          if started == healthGeneration { healthSummary = text }
+        }
+      }
+      await refresh()
+    } catch { message=String(describing:error) }
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
@@ -76,6 +96,8 @@ import MeridianSDK
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
+      let bio = await client.resolveBiometricPrompt(sensorAvailable: biometricAvailable)
+      if bio.code == "SCA_FALLBACK" { message = "Local biometric unavailable. Continuing with the selected provider." }
       let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
       if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
       else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}

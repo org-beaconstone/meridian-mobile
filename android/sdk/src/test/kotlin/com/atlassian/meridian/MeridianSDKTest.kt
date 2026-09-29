@@ -322,6 +322,10 @@ class MeridianSDKTest {
       assertNotNull(idempotencyKey)
       assertTrue(idempotencyKey.isNotEmpty())
 
+      val traceparent = exchange.requestHeaders.getFirst("traceparent")
+      assertNotNull(traceparent)
+      assertTrue(TraceIds.isTraceparent(traceparent!!))
+
       // Track idempotency key
       val isRetry = idempotencyKey in seenKeys
       seenKeys.add(idempotencyKey)
@@ -370,6 +374,186 @@ class MeridianSDKTest {
 
       // Verify only one idempotency key was used
       assertEquals(1, seenKeys.size)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testSanitizerRedactsPanAndIbanOnly() {
+    val pan = "4111111111111111"
+    val spacedPan = "4111 1111 1111 1111"
+    val dashedPan = "4111-1111-1111-1111"
+    val iban = "GB82WEST12345698765432"
+    val spacedIban = "GB82 WEST 1234 5698 7654 32"
+    val raw = "declined $iban $spacedIban card $pan / $spacedPan / $dashedPan"
+    val cleaned = Sanitizer.sanitize(raw)
+    assertFalse(cleaned.contains(pan))
+    assertFalse(cleaned.contains("4111 1111"))
+    assertFalse(cleaned.contains("4111-1111"))
+    assertFalse(cleaned.contains(iban))
+    assertFalse(cleaned.contains("WEST 1234"))
+    assertTrue(cleaned.contains("[REDACTED_PAN]"))
+    assertTrue(cleaned.contains("[REDACTED_IBAN]"))
+    assertEquals("Insufficient balance", Sanitizer.sanitize("Insufficient balance"))
+    assertEquals("4111111111111112", Sanitizer.sanitize("4111111111111112"))
+    val attributes = Sanitizer.cleanAttributes(mapOf("pan" to pan, "note" to iban, "http.path" to "/payments"))
+    assertFalse(attributes.containsKey("pan"))
+    assertFalse(attributes.containsKey("note"))
+    assertEquals("/payments", attributes["http.path"])
+  }
+
+  @Test
+  fun testTraceparentSpansRedactionAndCorridorDegradation() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val captured = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val healthCalls = java.util.concurrent.atomic.AtomicInteger()
+
+    fun write(exchange: com.sun.net.httpserver.HttpExchange, status: Int, body: String) {
+      val traceparent = exchange.requestHeaders.getFirst("traceparent")
+      assertNotNull(traceparent)
+      assertTrue(TraceIds.isTraceparent(traceparent!!))
+      assertEquals("trace-room", exchange.requestHeaders.getFirst("X-Rehearsal-Session"))
+      captured[exchange.requestURI.path] = traceparent
+      val bytes = body.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(status, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+
+    server.createContext("/api/v1/catalog") { exchange ->
+      write(
+        exchange,
+        200,
+        """{"demoDate":"2026-09-18","recipients":[{"id":"northline-studio","name":"Northline Studio","initials":"NS","detail":"Design tools","category":"Shopping","color":"#111111"}],"providers":[{"id":"adyen","name":"Adyen","description":"Card","methods":["card"]},{"id":"worldpay","name":"Worldpay","description":"Bank","methods":["bank"]}]}"""
+      )
+    }
+    server.createContext("/api/v1/payments") { exchange ->
+      val requestBody = exchange.requestBody.bufferedReader().readText()
+      assertTrue(requestBody.contains("GB82WEST12345698765432"))
+      assertEquals("idem-trace-1", exchange.requestHeaders.getFirst("Idempotency-Key"))
+      write(
+        exchange,
+        422,
+        """{"ok":false,"code":"DECLINED","error":"declined 4111 1111 1111 1111 for GB82 WEST 1234 5698 7654 32"}"""
+      )
+    }
+    server.createContext("/api/v1/session/health") { exchange ->
+      val attempt = healthCalls.incrementAndGet()
+      val body = if (attempt == 1) {
+        """{"status":"UP","connection":"connected","corridors":[{"id":"adyen-card","state":"healthy"},{"id":"worldpay-bank","state":"healthy"},{"id":"unlisted","state":"healthy"}]}"""
+      } else {
+        """{"status":"UP","connection":"connected","corridors":[{"id":"adyen-card","state":"degraded"},{"id":"worldpay-bank","state":"healthy"},{"id":"unlisted","provider":"unlisted","state":"down"}]}"""
+      }
+      write(exchange, 200, body)
+    }
+    server.createContext("/api/v1/state") { exchange ->
+      write(exchange, 200, """{"version":1,"balance":1248050,"transactions":[],"budgets":[]}""")
+    }
+    server.start()
+
+    try {
+      val client = MeridianClient("http://127.0.0.1:${server.address.port}/api/v1", "trace-room")
+      val catalog = runBlocking { client.getCatalog() }
+      assertEquals(1, catalog.recipients.size)
+      val parse = client.telemetry.spans().single { it.name == "catalog.parse" }
+      assertTrue(parse.durationMillis >= 0)
+      assertEquals("ok", parse.status)
+      assertEquals("1", parse.attributes["recipientCount"])
+
+      val biometric = runBlocking { client.resolveBiometricPrompt(sensorAvailable = false) }
+      assertEquals("SCA_FALLBACK", biometric.code)
+      val biometricSpan = client.telemetry.spans().single { it.name == "biometric.prompt" }
+      assertEquals("error", biometricSpan.status)
+      assertTrue(biometricSpan.durationMillis >= 0)
+
+      val payment = runBlocking {
+        client.submitPayment(
+          recipientId = "northline-studio",
+          amountMinor = 1000,
+          method = PaymentMethod.card,
+          note = "Rent GB82WEST12345698765432",
+          idempotencyKey = "idem-trace-1",
+        )
+      }
+      assertFalse(payment.ok)
+      assertEquals("DECLINED", payment.code)
+      assertFalse(payment.error.orEmpty().contains("4111"))
+      assertFalse(payment.error.orEmpty().contains("WEST"))
+      val gateway = client.telemetry.spans().single { it.name == "payment.gateway" }
+      assertTrue(gateway.durationMillis >= 0)
+      assertEquals("error", gateway.status)
+      val paymentHeader = captured.getValue("/api/v1/payments")
+      assertTrue(paymentHeader.contains(gateway.traceId))
+      assertTrue(paymentHeader.contains(gateway.spanId))
+
+      runBlocking { client.getState() }
+      val first = runBlocking { client.checkSessionHealth() }
+      assertEquals("connected", first.connection)
+      assertTrue(first.corridors.any { it.id == "adyen-card" && it.state == "healthy" })
+      assertTrue(first.corridors.any { it.id == "corridor" && it.state == "healthy" })
+      val second = runBlocking { client.checkSessionHealth() }
+      assertEquals("degraded", second.connection)
+      assertTrue(second.corridors.any { it.id == "adyen-card" && it.state == "degraded" })
+
+      val required = listOf("/api/v1/catalog", "/api/v1/payments", "/api/v1/session/health", "/api/v1/state")
+      required.forEach { path -> assertTrue(TraceIds.isTraceparent(captured.getValue(path))) }
+      assertEquals(captured.getValue("/api/v1/catalog").split("-")[1], parse.traceId)
+
+      val dump = (client.telemetry.events() + client.telemetry.spans().map {
+        TelemetryEvent(it.name, it.status, it.name, it.attributes.values.joinToString(" "), it.traceId, it.spanId, it.attributes)
+      }).joinToString(" ") { "${it.code} ${it.stage} ${it.message} ${it.attributes}" }
+      assertTrue(dump.contains("SCA_FALLBACK"))
+      assertTrue(dump.contains("biometric"))
+      assertTrue(dump.contains("DECLINED"))
+      assertTrue(dump.contains("gateway"))
+      assertTrue(dump.contains("corridor.degraded") || dump.contains("CORRIDOR_DEGRADED"))
+      assertTrue(dump.contains("adyen-card"))
+      assertFalse(dump.contains("4111111111111111"))
+      assertFalse(dump.contains("4111 1111 1111 1111"))
+      assertFalse(dump.contains("GB82WEST12345698765432"))
+      assertFalse(dump.contains("GB82 WEST"))
+      assertFalse(dump.contains("GB82WEST12345698765432"))
+      assertFalse(dump.contains("unlisted"))
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testPeriodicSessionHealthRecordsDegradationOnce() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val calls = java.util.concurrent.atomic.AtomicInteger()
+    server.createContext("/api/v1/session/health") { exchange ->
+      val attempt = calls.incrementAndGet()
+      val body = if (attempt == 1) {
+        """{"status":"UP","connection":"connected","corridors":[{"id":"worldpay-bank","state":"healthy"}]}"""
+      } else {
+        """{"status":"UP","corridors":[{"id":"bank","state":"degraded"}]}"""
+      }
+      val bytes = body.toByteArray()
+      exchange.sendResponseHeaders(200, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient("http://127.0.0.1:${server.address.port}/api/v1", "trace-room")
+      val updates = java.util.concurrent.atomic.AtomicInteger()
+      val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default)
+      val job = client.startSessionHealthChecks(scope, intervalMillis = 40) { updates.incrementAndGet() }
+      val deadline = System.currentTimeMillis() + 2000
+      while (updates.get() < 2 && System.currentTimeMillis() < deadline) {
+        Thread.sleep(20)
+      }
+      job.cancel()
+      assertTrue(updates.get() >= 2)
+      val degraded = client.telemetry.events().filter { it.name == "corridor.degraded" }
+      assertEquals(1, degraded.size)
+      assertEquals("worldpay-bank", degraded.single().attributes["corridorId"])
+      assertEquals("health", degraded.single().stage)
+      assertTrue(client.telemetry.events().any { it.name == "connection.state" && it.attributes["connection"] == "degraded" })
     } finally {
       server.stop(0)
     }

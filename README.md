@@ -23,7 +23,7 @@ swift run MeridianDesktop
 MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks
 ```
 
-Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, 20 executable SDK assertions, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated.
+Verified on macOS: Swift SDK, actual SwiftUI desktop executable compilation, and real Java transport including payment, duplicate-key retry, pending response and reset. The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated. The executable SDK checks now include tracing and redaction; 23 checks passed on Linux with Swift 6.0.3. The SwiftUI desktop target was not rebuilt in that run.
 
 For an iOS project, install Xcode and XcodeGen, then `cd ios && xcodegen generate`. `project.yml` builds `App/MeridianApp.swift` with the local SDK package. No iOS simulator/device build was run on the authoring machine because full Xcode was unavailable. Local network HTTP is for the rehearsal only; use HTTPS for any shared hosted endpoint.
 
@@ -36,9 +36,17 @@ mvn clean verify
 gradle :app:assembleDebug
 ```
 
-`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 22 tests including an actual local HTTP transport check for session/idempotency headers and HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
+`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 25 tests, including an actual local HTTP transport check for session, idempotency, and `traceparent` headers, HTTP 202 pending behavior, span timers, and redacted corridor telemetry. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset) before tracing was added; that live pass was not repeated here. `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
+
+## Tracing and sanitized telemetry
+
+The Swift and Kotlin SDKs inject a W3C `traceparent` header (`00-{traceId}-{spanId}-01`) on outgoing HTTP calls, including `/catalog`, `/payments`, and `/session/health`. Client spans record duration for dynamic catalog parsing (`catalog.parse`), local biometric prompt resolution (`biometric.prompt`), and the payment gateway roundtrip (`payment.gateway`). Error events keep the error code and failure stage. Primary account numbers that pass the Luhn check, and IBANs that pass the mod-97 check, are redacted before they are stored in the in-memory log or shown from a gateway error string. The payment note is still sent to the API and is not copied into telemetry.
+
+Session health polls `GET /session/health` on a 15 second interval. Connection changes are recorded once per change. A corridor moving to `degraded` or `down` emits one telemetry event. An unavailable local biometric sensor records `SCA_FALLBACK` and does not switch the selected Adyen card or Worldpay bank method. Traces stay in process; there is no collector export and no provider network call.
+
+The browser companion under `preview/` mirrors the same header, span names, and redaction for rehearsal. It is not a native build. Android and iOS device builds were not run for this change.
 
 ## Deliberate baseline
 
