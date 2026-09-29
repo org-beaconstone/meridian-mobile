@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -89,6 +92,25 @@ public actor MeridianClient {
   }
 
   // MARK: - Public API Methods
+
+  /// GET /config — `enable_mobile_eu_payments`. Missing, malformed, or failed calls stay off.
+  public func mobileEuPaymentsEnabled() async -> Bool {
+    let url = baseURL.appendingPathComponent("config")
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 15
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
+    do {
+      let (data, response) = try await session.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        return false
+      }
+      return evaluateMobileEuPaymentsFlag(data)
+    } catch {
+      return false
+    }
+  }
 
   /// GET /health - Check service health
   public func getHealth() async throws -> HealthResponse {

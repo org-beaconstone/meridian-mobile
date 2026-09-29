@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import { formatMinor, money, parsePence as pence } from './domain/currency';
+import {
+  type CatalogProvider,
+  type CurrencyCode,
+  evaluateMobileEuPaymentsFlag,
+  GBP_BASELINE,
+  reconcileSelection,
+  resolvePaymentSurface,
+  type PaymentSurface,
+} from './domain/featureGate';
 
-type Method = 'card' | 'bank';
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
 type Transaction = {
   id: string;
@@ -20,11 +29,6 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
-import { money, parsePence as pence } from './domain/currency';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -57,6 +61,21 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
     throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
   return data;
 }
+async function readEuFlag(room: string): Promise<boolean> {
+  try {
+    const response = await fetch('/api/v1/config', {
+      headers: {
+        Accept: 'application/json',
+        'X-Rehearsal-Session': room,
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) return false;
+    return evaluateMobileEuPaymentsFlag(await response.json());
+  } catch {
+    return false;
+  }
+}
 function bankState(value: unknown): State {
   const v = value as State;
   if (
@@ -83,7 +102,11 @@ export default function App() {
   const [recipient, setRecipient] = useState('northline-studio');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
-  const [method, setMethod] = useState<Method>('card');
+  const [currency, setCurrency] = useState<CurrencyCode>('GBP');
+  const [railId, setRailId] = useState(GBP_BASELINE[0].id);
+  const [surface, setSurface] = useState<PaymentSurface>(
+    () => resolvePaymentSurface(false, null, GBP_BASELINE).surface,
+  );
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -93,7 +116,14 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef(crypto.randomUUID()),
+    currencyRef = useRef<CurrencyCode>('GBP'),
+    railRef = useRef(GBP_BASELINE[0].id),
+    stepRef = useRef(step),
+    cacheRef = useRef(GBP_BASELINE);
+  currencyRef.current = currency;
+  railRef.current = railId;
+  stepRef.current = step;
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -101,8 +131,40 @@ export default function App() {
     setState(null);
     setConnected(false);
     setError('');
+    cacheRef.current = GBP_BASELINE;
+    currencyRef.current = 'GBP';
+    railRef.current = GBP_BASELINE[0].id;
+    setCurrency('GBP');
+    setRailId(GBP_BASELINE[0].id);
+    setSurface(resolvePaymentSurface(false, null, GBP_BASELINE).surface);
+    function applyFlag(flag: boolean, providers: CatalogProvider[] | null) {
+      const resolved = resolvePaymentSurface(flag, providers, cacheRef.current);
+      cacheRef.current = resolved.cachedGbp;
+      setSurface(resolved.surface);
+      const next = reconcileSelection(
+        resolved.surface,
+        currencyRef.current,
+        railRef.current,
+        stepRef.current === 'review',
+      );
+      const paused = stepRef.current === 'review' && !next.reviewing && !flag;
+      currencyRef.current = next.currency;
+      railRef.current = next.railId;
+      setCurrency(next.currency);
+      setRailId(next.railId);
+      if (stepRef.current === 'review' && !next.reviewing) {
+        stepRef.current = 'details';
+        setStep('details');
+        paymentKey.current = crypto.randomUUID();
+        if (paused) {
+          setNotice('European payments are paused. GBP card and bank payments are still available.');
+        }
+      }
+    }
     async function poll() {
       const version = revision.current;
+      const flag = await readEuFlag(room);
+      if (closed || generation !== epoch.current) return;
       try {
         if (!mutating.current) {
           const [raw, catalog] = await Promise.all([
@@ -118,12 +180,18 @@ export default function App() {
             setState(bankState(raw));
             setRecipients(catalog.recipients);
             setConnected(true);
+            setError('');
+            const providers = Array.isArray(catalog.providers)
+              ? (catalog.providers as CatalogProvider[])
+              : null;
+            applyFlag(flag, providers);
           }
         }
       } catch (e) {
         if (!closed && generation === epoch.current) {
           setConnected(false);
           setError(e instanceof Error ? e.message : 'API unavailable');
+          if (!mutating.current) applyFlag(flag, null);
         }
       } finally {
         if (!closed) timer = setTimeout(poll, 2000);
@@ -169,11 +237,12 @@ export default function App() {
   }
   function review() {
     const value = pence(amount);
+    const unit = currency === 'EUR' ? '€' : '£';
     if (value === null) {
-      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      setError(`Enter an amount from ${unit}0.01 to ${unit}10,000 with no more than two decimals.`);
       return;
     }
-    if (!state || value > state.balance) {
+    if (currency === 'GBP' && (!state || value > state.balance)) {
       setError('Insufficient balance');
       return;
     }
@@ -181,12 +250,25 @@ export default function App() {
     setStep('review');
   }
   async function confirm() {
+    const rail =
+      surface.rails.find((item) => item.id === railId) ??
+      surface.rails.find((item) => item.currency === currency);
+    if (!rail) {
+      setError('Payment method unavailable. GBP card and bank payments are still available.');
+      setStep('details');
+      return;
+    }
+    if (rail.currency !== 'GBP') {
+      setNotice('EUR stays on this device. The shared ledger settles in GBP pence, so no payment was sent.');
+      setError('');
+      return;
+    }
     try {
       setError('');
       const result = await mutate(
         '/payments',
         'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
+        { recipientId: recipient, amountMinor: pence(amount), method: rail.method, note, scenario },
         paymentKey.current,
       );
       if (result.ok) {
@@ -198,6 +280,8 @@ export default function App() {
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const visibleRails = surface.rails.filter((rail) => rail.currency === currency);
+  const methodRails = visibleRails.length > 0 ? visibleRails : surface.rails;
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -223,6 +307,7 @@ export default function App() {
         <div className="connection-bar">
           <span className={connected ? 'status-dot' : 'status-dot offline'} />
           <strong>{connected ? 'Connected API' : 'API unavailable'}</strong>
+          <span>{surface.flagEnabled ? 'EU payments on' : 'GBP baseline'}</span>
           <span>{room}</span>
         </div>
         <main>
@@ -299,7 +384,11 @@ export default function App() {
               {page === 'Pay' && (
                 <section className="mobile-card">
                   <h1>{step === 'done' ? 'Taken care of.' : 'Make a payment'}</h1>
-                  <p>Fictional money. Shared rehearsal account.</p>
+                  <p>
+                    {surface.flagEnabled
+                      ? 'EU payments are on for this cohort. The shared ledger still settles in GBP.'
+                      : 'GBP card and bank payments. Fictional money.'}
+                  </p>
                   {step === 'details' && (
                     <form
                       onSubmit={(e) => {
@@ -319,7 +408,30 @@ export default function App() {
                           </option>
                         ))}
                       </select>
-                      <label htmlFor="mobile-amount">Amount (GBP)</label>
+                      {surface.currencies.includes('EUR') && (
+                        <fieldset>
+                          <legend>Currency</legend>
+                          {(['GBP', 'EUR'] as const).map((code) => (
+                            <label
+                              className={'mobile-method ' + (currency === code ? 'selected' : '')}
+                              key={code}
+                            >
+                              <input
+                                type="radio"
+                                name="currency"
+                                checked={currency === code}
+                                onChange={() => {
+                                  const next = reconcileSelection(surface, code, railId, false);
+                                  setCurrency(next.currency);
+                                  setRailId(next.railId);
+                                }}
+                              />
+                              <span>{code}</span>
+                            </label>
+                          ))}
+                        </fieldset>
+                      )}
+                      <label htmlFor="mobile-amount">Amount ({currency})</label>
                       <input
                         id="mobile-amount"
                         inputMode="decimal"
@@ -338,25 +450,26 @@ export default function App() {
                       />
                       <fieldset>
                         <legend>Payment method</legend>
-                        {providers.map((provider) => (
-                          <label
-                            className={
-                              'mobile-method ' + (method === provider.method ? 'selected' : '')
-                            }
-                            key={provider.id}
-                          >
-                            <input
-                              type="radio"
-                              name="method"
-                              checked={method === provider.method}
-                              onChange={() => setMethod(provider.method)}
-                            />
-                            <span>
-                              {provider.method === 'card' ? 'Debit card' : 'Bank payment'}
-                              <small>{provider.name} simulation</small>
-                            </span>
-                          </label>
-                        ))}
+                        {methodRails.map((rail) => {
+                          const copy = railCopy(rail.label);
+                          return (
+                            <label
+                              className={'mobile-method ' + (railId === rail.id ? 'selected' : '')}
+                              key={rail.id}
+                            >
+                              <input
+                                type="radio"
+                                name="method"
+                                checked={railId === rail.id}
+                                onChange={() => setRailId(rail.id)}
+                              />
+                              <span>
+                                {copy.title}
+                                <small>{copy.detail}</small>
+                              </span>
+                            </label>
+                          );
+                        })}
                       </fieldset>
                       <button className="primary" disabled={!connected || busy} type="submit">
                         Review payment
@@ -367,9 +480,9 @@ export default function App() {
                     <>
                       <div className="mobile-review">
                         <span>To {selected?.name}</span>
-                        <strong>{money(pence(amount) || 0)}</strong>
+                        <strong>{formatMinor(pence(amount) || 0, currency)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {surface.rails.find((rail) => rail.id === railId)?.label} ·{' '}
                           {note || 'No reference'}
                         </p>
                       </div>
@@ -529,6 +642,10 @@ export default function App() {
       </div>
     </div>
   );
+}
+function railCopy(label: string): { title: string; detail: string } {
+  const [title, ...rest] = label.split(' · ');
+  return { title, detail: rest.join(' · ') };
 }
 function History({ items }: { items: Transaction[] }) {
   return (

@@ -77,6 +77,8 @@ data class Provider(
   val name: String,
   val description: String,
   val methods: List<String>,
+  val currencies: List<String>? = null,
+  val regions: List<String>? = null,
 ) : Serializable
 
 // MARK: - API Response Types
@@ -154,9 +156,10 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
 
 // MARK: - Amount Formatting
 
-fun money(pence: Int): String {
-  val pounds = pence / 100.0
-  return "£%.2f".format(pounds)
+fun money(minor: Int, currency: CurrencyCode = CurrencyCode.GBP): String {
+  val major = minor / 100.0
+  val symbol = if (currency == CurrencyCode.EUR) "€" else "£"
+  return "%s%.2f".format(symbol, major)
 }
 
 /**
@@ -164,7 +167,9 @@ fun money(pence: Int): String {
  * @param input Amount string (e.g., "10.50", "10", "10.5")
  * @return Pair of (pence: Int?, error: String?)
  */
-fun parseAmount(input: String): Pair<Int?, String?> {
+fun parseAmount(input: String, currency: CurrencyCode = CurrencyCode.GBP): Pair<Int?, String?> {
+  val symbol = if (currency == CurrencyCode.EUR) "€" else "£"
+  val limitMessage = "Amount cannot exceed ${symbol}10,000"
   val trimmed = input.trim()
 
   // Empty or whitespace only
@@ -199,7 +204,7 @@ fun parseAmount(input: String): Pair<Int?, String?> {
   val pounds = poundsStr.toIntOrNull() ?: return Pair(null, "Amount is not a valid integer")
   val pence = penceStr.toIntOrNull() ?: return Pair(null, "Amount is not a valid integer")
 
-  if (pounds > 10000) return Pair(null, "Amount cannot exceed £10,000")
+  if (pounds > 10000) return Pair(null, limitMessage)
   val totalPence = pounds * 100 + pence
 
   // Validate range: 1 to 1,000,000 pence (£10,000)
@@ -208,7 +213,7 @@ fun parseAmount(input: String): Pair<Int?, String?> {
   }
 
   if (totalPence > 1_000_000) {
-    return Pair(null, "Amount cannot exceed £10,000")
+    return Pair(null, limitMessage)
   }
 
   return Pair(totalPence, null)
