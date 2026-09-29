@@ -4,16 +4,25 @@ public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let catalogTTL: TimeInterval
+  private let catalogStore: CatalogStoring
+  private let clock: () -> Date
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - catalogTTL: How long a saved catalog is fresh before the next refresh
+  ///   - catalogStore: Encrypted local cache. Defaults to an app-support file.
+  ///   - now: Clock used for catalog expiry. Tests can supply a fixed time.
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    catalogTTL: TimeInterval = 300,
+    catalogStore: CatalogStoring? = nil,
+    now: @escaping () -> Date = { Date() }
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,6 +45,24 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.catalogTTL = catalogTTL
+    self.clock = now
+    self.catalogStore = catalogStore ?? EncryptedFileCatalogStore(
+      directory: Self.catalogDirectory(sessionId: sessionId)
+    )
+  }
+
+  static func catalogDirectory(sessionId: String) -> URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+      ?? FileManager.default.temporaryDirectory
+    let safe = sessionId.map { character -> Character in
+      let ok = character.isLetter || character.isNumber || character == "-" || character == "_"
+      return ok ? character : "_"
+    }
+    return base
+      .appendingPathComponent("Meridian", isDirectory: true)
+      .appendingPathComponent("catalog", isDirectory: true)
+      .appendingPathComponent(String(safe), isDirectory: true)
   }
 
   // MARK: - Internal Request Method
@@ -98,6 +125,40 @@ public actor MeridianClient {
   /// GET /catalog - Fetch recipients and providers
   public func getCatalog() async throws -> CatalogResponse {
     return try await request(method: "GET", path: "/catalog")
+  }
+
+  /// Authenticated catalog read with encrypted local cache.
+  /// Gateway failures, offline errors, and unrecognized provider ids reuse the
+  /// last accepted catalog. Payment submission is unchanged.
+  public func loadCatalog() async -> CatalogLoad {
+    let now = clock()
+    let nowMillis = Int64((now.timeIntervalSince1970 * 1000).rounded())
+    let cached = catalogStore.load()
+    if let cached, nowMillis &- cached.fetchedAtEpochMillis < Int64(catalogTTL * 1000) {
+      return CatalogLoad(catalog: cached.catalog, origin: .cache)
+    }
+
+    do {
+      let fetched = try await getCatalog()
+      if let accepted = ProviderBaseline.accept(fetched) {
+        catalogStore.save(
+          StoredCatalog(fetchedAtEpochMillis: nowMillis, catalog: accepted)
+        )
+        return CatalogLoad(catalog: accepted, origin: .network)
+      }
+      return CatalogFallback.load(cached)
+    } catch let error as MeridianError {
+      switch error {
+      case let .httpError(statusCode, _) where CatalogFallback.isGateway(statusCode):
+        return CatalogFallback.load(cached)
+      case .decodingError, .networkError:
+        return CatalogFallback.load(cached)
+      default:
+        return CatalogFallback.load(cached)
+      }
+    } catch {
+      return CatalogFallback.load(cached)
+    }
   }
 
   /// GET /state - Fetch current bank state

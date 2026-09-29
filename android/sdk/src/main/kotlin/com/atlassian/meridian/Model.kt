@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -72,11 +73,22 @@ data class BankState(
   val budgets: List<Budget>,
 ) : Serializable
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class Provider(
   val id: String,
   val name: String,
   val description: String,
-  val methods: List<String>,
+  val methods: List<String> = emptyList(),
+  val available: Boolean = true,
+) : Serializable
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class Corridor(
+  val id: String = "",
+  val provider: String = "",
+  val method: String = "",
+  val currency: String = "GBP",
+  val available: Boolean = true,
 ) : Serializable
 
 // MARK: - API Response Types
@@ -87,11 +99,82 @@ data class HealthResponse(
   val simulation: Boolean,
 ) : Serializable
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CatalogResponse(
   val demoDate: String,
-  val recipients: List<Recipient>,
-  val providers: List<Provider>,
+  val recipients: List<Recipient> = emptyList(),
+  val providers: List<Provider> = emptyList(),
+  val corridors: List<Corridor> = emptyList(),
 ) : Serializable
+
+/**
+ * Compiled Adyen card and Worldpay bank allowlist. Catalog payloads are dynamic,
+ * but an unrecognized provider id is rejected so it is never presented or stored.
+ */
+object ProviderBaseline {
+  const val ADYEN = "adyen"
+  const val WORLDPAY = "worldpay"
+
+  fun matches(provider: Provider): Boolean = when (provider.id) {
+    ADYEN -> provider.methods == listOf("card")
+    WORLDPAY -> provider.methods == listOf("bank")
+    else -> false
+  }
+
+  fun label(id: String): String = when (id) {
+    ADYEN -> "Debit card · Adyen"
+    WORLDPAY -> "Bank payment · Worldpay"
+    else -> ""
+  }
+
+  fun methodOf(provider: Provider): PaymentMethod? = when (provider.id) {
+    ADYEN -> PaymentMethod.card
+    WORLDPAY -> PaymentMethod.bank
+    else -> null
+  }
+
+  fun accept(catalog: CatalogResponse): CatalogResponse? {
+    if (catalog.providers.isEmpty()) return null
+    val ids = catalog.providers.map { it.id }
+    if (ids.size != ids.toSet().size) return null
+    if (catalog.providers.any { !matches(it) }) return null
+    for (corridor in catalog.corridors) {
+      if (corridor.currency != "GBP") return null
+      val paired = (corridor.provider == ADYEN && corridor.method == "card") ||
+        (corridor.provider == WORLDPAY && corridor.method == "bank")
+      if (!paired) return null
+    }
+    return catalog
+  }
+
+  fun active(catalog: CatalogResponse): List<Provider> =
+    catalog.providers.filter { it.available && matches(it) }
+
+  fun catalog(): CatalogResponse = CatalogResponse(
+    demoDate = "",
+    recipients = emptyList(),
+    providers = listOf(
+      Provider(
+        id = ADYEN,
+        name = "Adyen",
+        description = "Card payment processor",
+        methods = listOf("card"),
+        available = true,
+      ),
+      Provider(
+        id = WORLDPAY,
+        name = "Worldpay",
+        description = "Bank payment processor",
+        methods = listOf("bank"),
+        available = true,
+      ),
+    ),
+    corridors = listOf(
+      Corridor(id = "gb-card", provider = ADYEN, method = "card", currency = "GBP"),
+      Corridor(id = "gb-bank", provider = WORLDPAY, method = "bank", currency = "GBP"),
+    ),
+  )
+}
 
 data class PaymentResponse(
   val ok: Boolean,

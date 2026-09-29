@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -16,9 +17,15 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val catalogTtlMillis: Long = 300_000,
+  catalogStore: CatalogStore? = null,
+  private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+  private val catalogStore: CatalogStore = catalogStore ?: EncryptedFileCatalogStore(
+    defaultCatalogDirectory(sessionId),
+  )
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -120,6 +127,35 @@ class MeridianClient(
    */
   suspend fun getCatalog(): CatalogResponse =
     request("GET", "/catalog", responseType = CatalogResponse::class.java)
+
+  /**
+   * Authenticated catalog read with encrypted local cache.
+   * Gateway failures, offline errors, and unrecognized provider ids reuse the
+   * last accepted catalog. Payment submission is unchanged.
+   */
+  suspend fun loadCatalog(): CatalogLoad {
+    val now = clock()
+    val cached = catalogStore.load()
+    if (cached != null && now - cached.fetchedAtEpochMillis < catalogTtlMillis) {
+      return CatalogLoad(cached.catalog, CatalogOrigin.CACHE)
+    }
+    return try {
+      val fetched = getCatalog()
+      val accepted = ProviderBaseline.accept(fetched)
+      if (accepted != null) {
+        catalogStore.save(StoredCatalog(now, accepted))
+        CatalogLoad(accepted, CatalogOrigin.NETWORK)
+      } else {
+        fallbackCatalog(cached)
+      }
+    } catch (_: MeridianError.HttpError) {
+      fallbackCatalog(cached)
+    } catch (_: MeridianError.DecodingError) {
+      fallbackCatalog(cached)
+    } catch (_: IOException) {
+      fallbackCatalog(cached)
+    }
+  }
 
   /**
    * GET /state - Fetch current bank state

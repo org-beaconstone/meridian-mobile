@@ -1,5 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import {
+  activeChoices,
+  baselineCatalog,
+  cacheIsFresh,
+  CATALOG_TTL_MS,
+  isGatewayStatus,
+  resolveCatalog,
+  type CatalogChoice,
+  type CatalogPayload,
+} from './domain/catalog';
+import { readCatalogCache, writeCatalogCache } from './domain/catalogStorage';
+import { money, parsePence as pence } from './domain/currency';
 
 type Method = 'card' | 'bank';
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
@@ -20,15 +32,11 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
-import { money, parsePence as pence } from './domain/currency';
 class RequestError extends Error {
   constructor(
     message: string,
     public code: string,
+    public status?: number,
   ) {
     super(message);
   }
@@ -54,7 +62,11 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
   }
   const data = await response.json();
   if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+    throw new RequestError(
+      data.error || `HTTP ${response.status}`,
+      data.code || 'HTTP_ERROR',
+      response.status,
+    );
   return data;
 }
 function bankState(value: unknown): State {
@@ -81,6 +93,7 @@ export default function App() {
   const [notice, setNotice] = useState('');
   const [page, setPage] = useState<'Home' | 'Pay' | 'History' | 'Settings'>('Home');
   const [recipient, setRecipient] = useState('northline-studio');
+  const [choices, setChoices] = useState<CatalogChoice[]>(activeChoices(baselineCatalog()));
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
@@ -105,10 +118,8 @@ export default function App() {
       const version = revision.current;
       try {
         if (!mutating.current) {
-          const [raw, catalog] = await Promise.all([
-            request(room, '/state'),
-            request(room, '/catalog'),
-          ]);
+          const raw = await request(room, '/state');
+          const resolved = await loadRoomCatalog(room);
           if (
             !closed &&
             generation === epoch.current &&
@@ -116,7 +127,8 @@ export default function App() {
             !mutating.current
           ) {
             setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            setRecipients(resolved.recipients);
+            setChoices(resolved.choices);
             setConnected(true);
           }
         }
@@ -153,6 +165,14 @@ export default function App() {
       setBusy(false);
     }
   }
+  useEffect(() => {
+    if (choices.some((choice) => choice.method === method)) return;
+    if (choices[0]) setMethod(choices[0].method);
+    if (step === 'review') {
+      paymentKey.current = crypto.randomUUID();
+      setStep('details');
+    }
+  }, [choices, method, step]);
   function freshPayment() {
     setStep('details');
     setAmount('');
@@ -338,7 +358,7 @@ export default function App() {
                       />
                       <fieldset>
                         <legend>Payment method</legend>
-                        {providers.map((provider) => (
+                        {choices.map((provider) => (
                           <label
                             className={
                               'mobile-method ' + (method === provider.method ? 'selected' : '')
@@ -352,13 +372,18 @@ export default function App() {
                               onChange={() => setMethod(provider.method)}
                             />
                             <span>
-                              {provider.method === 'card' ? 'Debit card' : 'Bank payment'}
+                              {provider.title}
                               <small>{provider.name} simulation</small>
                             </span>
                           </label>
                         ))}
+                        {choices.length === 0 && <p>No payment method is available right now.</p>}
                       </fieldset>
-                      <button className="primary" disabled={!connected || busy} type="submit">
+                      <button
+                        className="primary"
+                        disabled={!connected || busy || choices.length === 0}
+                        type="submit"
+                      >
                         Review payment
                       </button>
                     </form>
@@ -369,7 +394,7 @@ export default function App() {
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {choices.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
                         </p>
                       </div>
@@ -529,6 +554,34 @@ export default function App() {
       </div>
     </div>
   );
+}
+async function loadRoomCatalog(room: string): Promise<{
+  recipients: Recipient[];
+  choices: CatalogChoice[];
+}> {
+  const now = Date.now();
+  const cached = await readCatalogCache(room);
+  if (cached && cacheIsFresh(cached, now, CATALOG_TTL_MS)) {
+    return {
+      recipients: cached.catalog.recipients ?? [],
+      choices: activeChoices(cached.catalog),
+    };
+  }
+  try {
+    const catalog = (await request(room, '/catalog')) as CatalogPayload;
+    const resolved = resolveCatalog({ cached, now, outcome: { type: 'success', catalog } });
+    if (resolved.persist) await writeCatalogCache(room, resolved.persist);
+    return { recipients: resolved.catalog.recipients ?? [], choices: activeChoices(resolved.catalog) };
+  } catch (error) {
+    const outcome =
+      error instanceof RequestError && error.status !== undefined && isGatewayStatus(error.status)
+        ? ({ type: 'gateway' } as const)
+        : error instanceof RequestError && error.code === 'NETWORK_ERROR'
+          ? ({ type: 'offline' } as const)
+          : ({ type: 'other' } as const);
+    const resolved = resolveCatalog({ cached, now, outcome });
+    return { recipients: resolved.catalog.recipients ?? [], choices: activeChoices(resolved.catalog) };
+  }
 }
 function History({ items }: { items: Transaction[] }) {
   return (
