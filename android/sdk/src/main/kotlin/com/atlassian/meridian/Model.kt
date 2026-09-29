@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -127,13 +128,29 @@ data class AuditEvent(
 
 // MARK: - Request Payloads
 
+@JsonInclude(JsonInclude.Include.NON_NULL)
 data class PaymentRequest(
   val recipientId: String,
   val amountMinor: Int,
   val method: String,
   val note: String,
   val scenario: String,
+  /** Present only after a completed SCA challenge. Null is omitted so a strict API still accepts a normal payment. */
+  val scaChallengeToken: String? = null,
 ) : Serializable
+
+data class PaymentCall(
+  val statusCode: Int,
+  val response: PaymentResponse,
+  val bodyText: String,
+) : Serializable {
+  val ok: Boolean get() = response.ok
+  val state: BankState? get() = response.state
+  val transaction: Transaction? get() = response.transaction
+  val error: String? get() = response.error
+  val code: String? get() = response.code
+  val paymentId: String? get() = response.paymentId
+}
 
 data class BudgetRequest(
   val category: String,

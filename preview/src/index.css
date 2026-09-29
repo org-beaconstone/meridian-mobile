@@ -405,6 +405,13 @@ legend {
   font-size: 11px;
   margin-top: 20px !important;
 }
+.sca-panel h2 {
+  margin-top: 12px;
+}
+.sca-label {
+  font-size: 11px;
+  color: #53604f;
+}
 @media (max-width: 480px) {
   .rehearsal-background {
     padding: 0;
