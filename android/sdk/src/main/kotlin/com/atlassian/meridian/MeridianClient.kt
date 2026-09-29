@@ -35,6 +35,7 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
+    headerSink: MutableMap<String, String>? = null,
   ): T = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
@@ -64,6 +65,13 @@ class MeridianClient(
 
       // Read response
       val statusCode = connection.responseCode
+      val captured = linkedMapOf<String, String>()
+      connection.headerFields?.forEach { (key, values) ->
+        if (key != null && values.isNotEmpty()) {
+          captured[key.lowercase()] = values.first()
+        }
+      }
+      headerSink?.putAll(captured)
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
       } else {
@@ -114,6 +122,23 @@ class MeridianClient(
    */
   suspend fun getHealth(): HealthResponse =
     request("GET", "/health", responseType = HealthResponse::class.java)
+
+  /**
+   * GET /health on the already selected rehearsal session.
+   * A timeout or HTTP error throws. Callers keep the payment draft and do not switch provider.
+   */
+  suspend fun refreshSession(): SessionProbePayload {
+    val headers = mutableMapOf<String, String>()
+    request(
+      "GET",
+      "/health",
+      responseType = HealthResponse::class.java,
+      headerSink = headers,
+    )
+    val raw = headers["x-meridian-session-elsewhere"]?.trim()?.lowercase()
+    val elsewhere = raw == "true" || raw == "1" || raw == "yes"
+    return SessionProbePayload(healthy = true, activeElsewhere = elsewhere)
+  }
 
   /**
    * GET /catalog - Fetch recipients and providers
