@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import MeridianSDK
 
@@ -341,10 +342,215 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: SCAChallenge default type is biometric
+    print("21. SCAChallenge default type is biometric...")
+    let challenge21 = SCAChallenge(paymentId: "pay-001", amountMinor: 5000, recipientName: "Birch & Bloom")
+    if challenge21.type == .biometric && challenge21.paymentId == "pay-001" && challenge21.amountMinor == 5000 {
+      print("  ✓ SCAChallenge defaults to biometric")
+      passed += 1
+    } else {
+      print("  ✗ SCAChallenge fields mismatch")
+      failed += 1
+    }
+
+    // CHECK 22: SCAChallenge explicit pin type
+    print("22. SCAChallenge explicit pin type...")
+    let challenge22 = SCAChallenge(paymentId: "pay-002", amountMinor: 10000, recipientName: "Northline Studio", type: .pin)
+    if challenge22.type == .pin {
+      print("  ✓ SCAChallenge pin type set correctly")
+      passed += 1
+    } else {
+      print("  ✗ SCAChallenge pin type mismatch")
+      failed += 1
+    }
+
+    // CHECK 23: BankHandoff allowlist contains Worldpay domains
+    print("23. BankHandoff allowlist contains Worldpay domains...")
+    if BankHandoff.allowedHosts.contains("payments.worldpay.com") && BankHandoff.allowedHosts.contains("secure.worldpay.com") {
+      print("  ✓ Worldpay domains present in allowlist")
+      passed += 1
+    } else {
+      print("  ✗ Worldpay domains missing from allowlist")
+      failed += 1
+    }
+
+    // CHECK 24: buildHandoffURL rejects HTTP scheme
+    print("24. buildHandoffURL rejects HTTP scheme...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x42, count: 32))
+      _ = try BankHandoff.buildHandoffURL(
+        bankURL: URL(string: "http://payments.worldpay.com/auth")!,
+        paymentId: "pay-001", returnURLScheme: "meridian", signingKey: key)
+      print("  ✗ Should have rejected HTTP URL")
+      failed += 1
+    } catch BankHandoffError.domainNotAllowed {
+      print("  ✓ HTTP URL correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: buildHandoffURL rejects unknown domain
+    print("25. buildHandoffURL rejects unknown domain...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x42, count: 32))
+      _ = try BankHandoff.buildHandoffURL(
+        bankURL: URL(string: "https://evil.bank.example.com/auth")!,
+        paymentId: "pay-001", returnURLScheme: "meridian", signingKey: key)
+      print("  ✗ Should have rejected unknown domain")
+      failed += 1
+    } catch BankHandoffError.domainNotAllowed {
+      print("  ✓ Unknown domain correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 26: buildHandoffURL produces URL with state and redirect_uri
+    print("26. buildHandoffURL produces state and redirect_uri params...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x42, count: 32))
+      let url = try BankHandoff.buildHandoffURL(
+        bankURL: URL(string: "https://payments.worldpay.com/auth")!,
+        paymentId: "pay-123", returnURLScheme: "meridian", signingKey: key)
+      let urlStr = url.absoluteString
+      if urlStr.contains("state=") && urlStr.contains("redirect_uri=") && urlStr.hasPrefix("https://payments.worldpay.com") {
+        print("  ✓ Handoff URL has state and redirect_uri: \(url.host ?? "")")
+        passed += 1
+      } else {
+        print("  ✗ Handoff URL missing required params: \(urlStr)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 27: validateReturnURL succeeds with valid round-trip token
+    print("27. validateReturnURL succeeds with valid token...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x7A, count: 32))
+      let token = try BankHandoff.makeStateToken(paymentId: "pay-789", signingKey: key)
+      let encoded = token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? token
+      let returnURL = URL(string: "meridian://payment/return?state=\(encoded)")!
+      var nonces = Set<String>()
+      let state27 = try BankHandoff.validateReturnURL(returnURL, signingKey: key, usedNonces: &nonces)
+      if state27.paymentId == "pay-789" && nonces.count == 1 {
+        print("  ✓ validateReturnURL succeeded: paymentId=\(state27.paymentId)")
+        passed += 1
+      } else {
+        print("  ✗ ReturnState fields mismatch or nonce not recorded")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 28: validateReturnURL fails with tampered signature
+    print("28. validateReturnURL fails with tampered signature...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x7A, count: 32))
+      let token = try BankHandoff.makeStateToken(paymentId: "pay-tamper", signingKey: key)
+      let parts = token.split(separator: ".", maxSplits: 1).map(String.init)
+      let tampered = "\(parts[0]).AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      let encoded = tampered.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? tampered
+      let returnURL = URL(string: "meridian://payment/return?state=\(encoded)")!
+      var nonces = Set<String>()
+      _ = try BankHandoff.validateReturnURL(returnURL, signingKey: key, usedNonces: &nonces)
+      print("  ✗ Should have thrown invalidSignature")
+      failed += 1
+    } catch BankHandoffError.invalidSignature {
+      print("  ✓ Tampered signature correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 29: validateReturnURL fails when token is expired
+    print("29. validateReturnURL fails when expired...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x7A, count: 32))
+      let token = try BankHandoff.makeStateToken(paymentId: "pay-exp", signingKey: key)
+      let encoded = token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? token
+      let returnURL = URL(string: "meridian://payment/return?state=\(encoded)")!
+      var nonces = Set<String>()
+      // maxAgeSeconds = 0 forces expiry for any token
+      _ = try BankHandoff.validateReturnURL(returnURL, signingKey: key, usedNonces: &nonces, maxAgeSeconds: 0)
+      print("  ✗ Should have thrown tokenExpired")
+      failed += 1
+    } catch BankHandoffError.tokenExpired {
+      print("  ✓ Expired token correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 30: validateReturnURL fails on replay (second use of same token)
+    print("30. validateReturnURL fails on replay...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x7A, count: 32))
+      let token = try BankHandoff.makeStateToken(paymentId: "pay-replay", signingKey: key)
+      let encoded = token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? token
+      let returnURL = URL(string: "meridian://payment/return?state=\(encoded)")!
+      var nonces = Set<String>()
+      _ = try BankHandoff.validateReturnURL(returnURL, signingKey: key, usedNonces: &nonces)  // First: OK
+      _ = try BankHandoff.validateReturnURL(returnURL, signingKey: key, usedNonces: &nonces)  // Second: replay
+      print("  ✗ Should have thrown tokenReplayed")
+      failed += 1
+    } catch BankHandoffError.tokenReplayed {
+      print("  ✓ Replayed token correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 31: validateReturnURL fails when state param is missing
+    print("31. validateReturnURL fails with missing state param...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x7A, count: 32))
+      let returnURL = URL(string: "meridian://payment/return")!
+      var nonces = Set<String>()
+      _ = try BankHandoff.validateReturnURL(returnURL, signingKey: key, usedNonces: &nonces)
+      print("  ✗ Should have thrown malformedToken")
+      failed += 1
+    } catch BankHandoffError.malformedToken {
+      print("  ✓ Missing state param correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 32: validateReturnURL fails with wrong signing key
+    print("32. validateReturnURL fails with wrong signing key...")
+    do {
+      let key = SymmetricKey(data: Data(repeating: 0x7A, count: 32))
+      let wrongKey = SymmetricKey(data: Data(repeating: 0x3B, count: 32))
+      let token = try BankHandoff.makeStateToken(paymentId: "pay-wrongkey", signingKey: key)
+      let encoded = token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? token
+      let returnURL = URL(string: "meridian://payment/return?state=\(encoded)")!
+      var nonces = Set<String>()
+      _ = try BankHandoff.validateReturnURL(returnURL, signingKey: wrongKey, usedNonces: &nonces)
+      print("  ✗ Should have thrown invalidSignature")
+      failed += 1
+    } catch BankHandoffError.invalidSignature {
+      print("  ✓ Wrong key correctly rejected")
+      passed += 1
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/32")
+    print("Failed: \(failed)/32")
 
     if failed > 0 {
       exit(1)

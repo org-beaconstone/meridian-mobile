@@ -296,6 +296,200 @@ class MeridianSDKTest {
     assertTrue(exception.message?.contains("Invalid URL") ?: false)
   }
 
+  // MARK: - SCA Challenge Tests
+
+  @Test
+  fun testSCAChallengeDefaultsBiometric() {
+    val challenge = SCAChallenge(
+      paymentId = "pay-001",
+      amountMinor = 5000,
+      recipientName = "Birch & Bloom",
+    )
+    assertEquals("pay-001", challenge.paymentId)
+    assertEquals(5000, challenge.amountMinor)
+    assertEquals("Birch & Bloom", challenge.recipientName)
+    assertEquals(SCAType.biometric, challenge.type)
+  }
+
+  @Test
+  fun testSCAChallengeExplicitPin() {
+    val challenge = SCAChallenge(
+      paymentId = "pay-002",
+      amountMinor = 10000,
+      recipientName = "Northline Studio",
+      type = SCAType.pin,
+    )
+    assertEquals(SCAType.pin, challenge.type)
+  }
+
+  // MARK: - BankHandoff Allowlist Tests
+
+  @Test
+  fun testAllowedHostsContainsWorldpayDomains() {
+    assertTrue(BankHandoff.allowedHosts.contains("payments.worldpay.com"))
+    assertTrue(BankHandoff.allowedHosts.contains("secure.worldpay.com"))
+    assertTrue(BankHandoff.allowedHosts.contains("bank.rehearsal.meridian.internal"))
+  }
+
+  @Test
+  fun testBuildHandoffURLRejectsHttpScheme() {
+    try {
+      BankHandoff.buildHandoffURL(
+        bankURL = "http://payments.worldpay.com/auth",
+        paymentId = "pay-001",
+        returnURLScheme = "meridian",
+        signingKey = ByteArray(32) { it.toByte() },
+      )
+      fail("Expected DomainNotAllowed for non-HTTPS URL")
+    } catch (e: BankHandoffError.DomainNotAllowed) {
+      assertTrue(e.message?.contains("http") == true || e.message?.contains("worldpay") == true)
+    }
+  }
+
+  @Test
+  fun testBuildHandoffURLRejectsUnknownDomain() {
+    try {
+      BankHandoff.buildHandoffURL(
+        bankURL = "https://evil.bank.example.com/auth",
+        paymentId = "pay-001",
+        returnURLScheme = "meridian",
+        signingKey = ByteArray(32) { it.toByte() },
+      )
+      fail("Expected DomainNotAllowed for unknown domain")
+    } catch (e: BankHandoffError.DomainNotAllowed) {
+      assertTrue(e.message?.contains("evil.bank.example.com") == true)
+    }
+  }
+
+  @Test
+  fun testBuildHandoffURLProducesStateAndRedirectParams() {
+    val url = BankHandoff.buildHandoffURL(
+      bankURL = "https://payments.worldpay.com/auth",
+      paymentId = "pay-123",
+      returnURLScheme = "meridian",
+      signingKey = ByteArray(32) { it.toByte() },
+    )
+    assertTrue("URL must contain state param", url.contains("state="))
+    assertTrue("URL must contain redirect_uri param", url.contains("redirect_uri="))
+    assertTrue("URL must target allowed host", url.startsWith("https://payments.worldpay.com"))
+  }
+
+  @Test
+  fun testBuildHandoffURLAddsQuerySeparatorCorrectly() {
+    // Base URL already has a query param
+    val url = BankHandoff.buildHandoffURL(
+      bankURL = "https://payments.worldpay.com/auth?sessionId=abc",
+      paymentId = "pay-456",
+      returnURLScheme = "meridian",
+      signingKey = ByteArray(32) { it.toByte() },
+    )
+    assertTrue(url.contains("sessionId=abc"))
+    assertTrue(url.contains("state="))
+  }
+
+  // MARK: - BankHandoff Token Round-Trip Tests
+
+  @Test
+  fun testValidateReturnURLSucceedsWithValidToken() {
+    val key = ByteArray(32) { it.toByte() }
+    val token = BankHandoff.makeStateToken("pay-789", key)
+    val returnURL = "meridian://payment/return?state=${java.net.URLEncoder.encode(token, "UTF-8")}"
+    val nonces = mutableSetOf<String>()
+    val state = BankHandoff.validateReturnURL(returnURL, key, nonces)
+    assertEquals("pay-789", state.paymentId)
+    assertTrue(state.nonce.isNotEmpty())
+    assertEquals(1, nonces.size)
+  }
+
+  @Test
+  fun testValidateReturnURLFailsWithTamperedSignature() {
+    val key = ByteArray(32) { it.toByte() }
+    val token = BankHandoff.makeStateToken("pay-001", key)
+    // Corrupt the signature part
+    val parts = token.split(".")
+    val tampered = "${parts[0]}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    val returnURL = "meridian://payment/return?state=${java.net.URLEncoder.encode(tampered, "UTF-8")}"
+    val nonces = mutableSetOf<String>()
+    try {
+      BankHandoff.validateReturnURL(returnURL, key, nonces)
+      fail("Expected InvalidSignature")
+    } catch (e: BankHandoffError.InvalidSignature) {
+      assertTrue("Nonce set must be empty after failure", nonces.isEmpty())
+    }
+  }
+
+  @Test
+  fun testValidateReturnURLFailsWithWrongKey() {
+    val key = ByteArray(32) { it.toByte() }
+    val wrongKey = ByteArray(32) { (it + 1).toByte() }
+    val token = BankHandoff.makeStateToken("pay-001", key)
+    val returnURL = "meridian://payment/return?state=${java.net.URLEncoder.encode(token, "UTF-8")}"
+    val nonces = mutableSetOf<String>()
+    try {
+      BankHandoff.validateReturnURL(returnURL, wrongKey, nonces)
+      fail("Expected InvalidSignature with wrong key")
+    } catch (e: BankHandoffError.InvalidSignature) {
+      assertTrue(nonces.isEmpty())
+    }
+  }
+
+  @Test
+  fun testValidateReturnURLFailsWhenExpired() {
+    val key = ByteArray(32) { it.toByte() }
+    val token = BankHandoff.makeStateToken("pay-exp", key)
+    val returnURL = "meridian://payment/return?state=${java.net.URLEncoder.encode(token, "UTF-8")}"
+    val nonces = mutableSetOf<String>()
+    // maxAgeMs = 0 forces immediate expiry
+    try {
+      BankHandoff.validateReturnURL(returnURL, key, nonces, maxAgeMs = 0L)
+      fail("Expected TokenExpired")
+    } catch (e: BankHandoffError.TokenExpired) {
+      assertTrue(nonces.isEmpty())
+    }
+  }
+
+  @Test
+  fun testValidateReturnURLFailsOnReplay() {
+    val key = ByteArray(32) { it.toByte() }
+    val token = BankHandoff.makeStateToken("pay-rep", key)
+    val returnURL = "meridian://payment/return?state=${java.net.URLEncoder.encode(token, "UTF-8")}"
+    val nonces = mutableSetOf<String>()
+    // First call succeeds
+    val state = BankHandoff.validateReturnURL(returnURL, key, nonces)
+    assertEquals("pay-rep", state.paymentId)
+    // Second call with same token is a replay
+    try {
+      BankHandoff.validateReturnURL(returnURL, key, nonces)
+      fail("Expected TokenReplayed on second call")
+    } catch (e: BankHandoffError.TokenReplayed) {
+      // Nonce is still in the set (from first call), replay correctly rejected
+      assertTrue(nonces.contains(state.nonce))
+    }
+  }
+
+  @Test
+  fun testValidateReturnURLFailsWithMissingStateParam() {
+    val key = ByteArray(32) { it.toByte() }
+    val nonces = mutableSetOf<String>()
+    try {
+      BankHandoff.validateReturnURL("meridian://payment/return", key, nonces)
+      fail("Expected MalformedToken when state param absent")
+    } catch (e: BankHandoffError.MalformedToken) {
+      assertTrue(nonces.isEmpty())
+    }
+  }
+
+  @Test
+  fun testReturnStateHasCorrectFields() {
+    val key = ByteArray(32) { it.toByte() }
+    val token = BankHandoff.makeStateToken("pay-fields", key)
+    val nonces = mutableSetOf<String>()
+    val state = BankHandoff.verifyStateToken(token, key, nonces, 600_000L)
+    assertEquals("pay-fields", state.paymentId)
+    assertTrue(state.issuedAt > 0)
+    assertTrue(state.nonce.matches(Regex("[0-9a-f-]{36}")))
+  }
+
   @Test
   fun testHttpTransportWithIdempotency() {
     // Start a simple HTTP server on localhost:0 (random port)
