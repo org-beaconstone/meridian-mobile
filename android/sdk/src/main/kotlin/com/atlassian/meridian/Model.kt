@@ -159,6 +159,23 @@ fun money(pence: Int): String {
   return "£%.2f".format(pounds)
 }
 
+/** Card stays on Adyen and bank stays on Worldpay. Timeout retries must not pick another provider. */
+fun baselineProvider(method: PaymentMethod): ProviderId = when (method) {
+  PaymentMethod.card -> ProviderId.adyen
+  PaymentMethod.bank -> ProviderId.worldpay
+}
+
+/**
+ * Integer minor units for a supported currency.
+ * Meridian rehearsal amounts are GBP pence only.
+ */
+fun minorUnits(currency: String, input: String): Pair<Int?, String?> {
+  if (currency != "GBP") {
+    return Pair(null, "Only GBP integer pence are supported")
+  }
+  return parseAmount(input)
+}
+
 /**
  * Parse amount string to integer pence
  * @param input Amount string (e.g., "10.50", "10", "10.5")

@@ -269,6 +269,22 @@ public enum MeridianError: LocalizedError {
 
 // MARK: - Amount Formatting
 
+/// Card stays on Adyen and bank stays on Worldpay. Timeout retries must not pick another provider.
+public func baselineProvider(_ method: PaymentMethod) -> ProviderId {
+  switch method {
+  case .card: return .adyen
+  case .bank: return .worldpay
+  }
+}
+
+/// Integer minor units for a supported currency. Meridian rehearsal amounts are GBP pence only.
+public func minorUnits(currency: String, input: String) -> (Int?, String?) {
+  guard currency == "GBP" else {
+    return (nil, "Only GBP integer pence are supported")
+  }
+  return parseAmount(input)
+}
+
 public func money(_ pence: Int) -> String {
   let pounds = Double(pence) / 100.0
   let formatter = NumberFormatter()

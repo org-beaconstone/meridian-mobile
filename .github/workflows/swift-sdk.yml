@@ -9,5 +9,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: swift build
         working-directory: ios
+      - run: swift test
+        working-directory: ios
       - run: swift run MeridianSDKChecks
         working-directory: ios
