@@ -1,5 +1,12 @@
 export function money(pence: number): string {
-  return new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' }).format(pence / 100);
+  return formatMinor(pence, 'GBP');
+}
+
+export function formatMinor(minor: number, currency: 'GBP' | 'EUR' = 'GBP'): string {
+  return new Intl.NumberFormat(currency === 'EUR' ? 'en-IE' : 'en-GB', {
+    style: 'currency',
+    currency,
+  }).format(minor / 100);
 }
 export function parsePence(value: string): number | null {
   if (!/^\d+(\.\d{1,2})?$/.test(value)) return null;

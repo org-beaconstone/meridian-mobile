@@ -134,17 +134,25 @@ public struct Provider: Codable, Hashable {
   public let name: String
   public let description: String
   public let methods: [PaymentMethod]
+  /// Present when the catalog names settlement currencies. Absent means the flag decides.
+  public let currencies: [String]?
+  /// Present when the catalog names corridors such as EU. Absent means the flag decides.
+  public let regions: [String]?
 
   public init(
     id: ProviderId,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [PaymentMethod],
+    currencies: [String]? = nil,
+    regions: [String]? = nil
   ) {
     self.id = id
     self.name = name
     self.description = description
     self.methods = methods
+    self.currencies = currencies
+    self.regions = regions
   }
 }
 
@@ -160,6 +168,45 @@ public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
   public let providers: [Provider]
+
+  public init(demoDate: String, recipients: [Recipient], providers: [Provider]) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    demoDate = try container.decode(String.self, forKey: .demoDate)
+    recipients = try container.decode([Recipient].self, forKey: .recipients)
+    // An unrecognised provider must not fail the rest of the catalog.
+    if let raw = try? container.decode([OptionalProvider].self, forKey: .providers) {
+      providers = raw.compactMap(\.provider)
+    } else {
+      providers = []
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(demoDate, forKey: .demoDate)
+    try container.encode(recipients, forKey: .recipients)
+    try container.encode(providers, forKey: .providers)
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case demoDate
+    case recipients
+    case providers
+  }
+}
+
+private struct OptionalProvider: Decodable {
+  let provider: Provider?
+  init(from decoder: Decoder) throws {
+    let container = try decoder.singleValueContainer()
+    provider = try? container.decode(Provider.self)
+  }
 }
 
 public struct PaymentResponse: Codable {
@@ -269,18 +316,25 @@ public enum MeridianError: LocalizedError {
 
 // MARK: - Amount Formatting
 
-public func money(_ pence: Int) -> String {
-  let pounds = Double(pence) / 100.0
+public func money(_ minor: Int, currency: CurrencyCode = .gbp) -> String {
+  let major = Double(minor) / 100.0
   let formatter = NumberFormatter()
   formatter.numberStyle = .currency
+  if currency == .eur {
+    formatter.currencyCode = "EUR"
+    formatter.locale = Locale(identifier: "en_IE")
+    return formatter.string(from: NSNumber(value: major)) ?? "€\(String(format: "%.2f", major))"
+  }
   formatter.locale = Locale(identifier: "en_GB")
-  return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
+  return formatter.string(from: NSNumber(value: major)) ?? "£\(String(format: "%.2f", major))"
 }
 
 /// Parse amount string to integer pence
 /// - Parameter input: Amount string (e.g., "10.50", "10", "10.5")
 /// - Returns: Tuple of (pence: Int?, error: String?)
-public func parseAmount(_ input: String) -> (Int?, String?) {
+public func parseAmount(_ input: String, currency: CurrencyCode = .gbp) -> (Int?, String?) {
+  let unit = currency == .eur ? "€" : "£"
+  let limitMessage = "Amount cannot exceed \(unit)10,000"
   let trimmed = input.trimmingCharacters(in: .whitespaces)
 
   // Empty or whitespace only
@@ -316,7 +370,7 @@ public func parseAmount(_ input: String) -> (Int?, String?) {
     return (nil, "Amount is not a valid integer")
   }
 
-  guard pounds <= 10000 else { return (nil, "Amount cannot exceed £10,000") }
+  guard pounds <= 10000 else { return (nil, limitMessage) }
   let totalPence = pounds * 100 + pence
 
   // Validate range: 1 to 1,000,000 pence (£10,000)
@@ -325,7 +379,7 @@ public func parseAmount(_ input: String) -> (Int?, String?) {
   }
 
   if totalPence > 1_000_000 {
-    return (nil, "Amount cannot exceed £10,000")
+    return (nil, limitMessage)
   }
 
   return (totalPence, nil)

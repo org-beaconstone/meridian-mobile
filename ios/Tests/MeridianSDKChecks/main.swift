@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
@@ -341,13 +344,237 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: flag off hides EUR and keeps cached GBP rails
+    print("21. flag off uses cached GBP and hides EUR...")
+    let cached = [
+      PaymentRail(id: "adyen-card-gbp", provider: .adyen, method: .card, currency: .gbp, label: "Debit card · Adyen Cards"),
+      PaymentRail(id: "worldpay-bank-gbp", provider: .worldpay, method: .bank, currency: .gbp, label: "Bank payment · Worldpay"),
+    ]
+    let disabled = resolvePaymentSurface(
+      flagEnabled: false,
+      providers: [
+        Provider(id: .adyen, name: "Adyen EU", description: "Card", methods: [.card], currencies: ["GBP", "EUR"])
+      ],
+      cachedGbp: cached
+    )
+    if !disabled.surface.flagEnabled && disabled.surface.usingCachedGbp && disabled.surface.rails.count == 2
+      && disabled.surface.rails.allSatisfy({ $0.currency == .gbp })
+      && disabled.surface.rails[0].label == "Debit card · Adyen Cards"
+      && disabled.surface.rails[0].provider == .adyen && disabled.surface.rails[0].method == .card
+      && disabled.surface.rails[1].provider == .worldpay && disabled.surface.rails[1].method == .bank
+    {
+      print("  ✓ disabled flag keeps cached Adyen card and Worldpay bank")
+      passed += 1
+    } else {
+      print("  ✗ disabled flag did not stay on cached GBP")
+      failed += 1
+    }
+
+    // CHECK 22: flag on parses catalog and unlocks EUR
+    print("22. flag on unlocks EUR rails...")
+    let enabled = resolvePaymentSurface(
+      flagEnabled: true,
+      providers: [
+        Provider(id: .adyen, name: "Adyen", description: "Card", methods: [.card], currencies: ["GBP", "EUR"]),
+        Provider(id: .worldpay, name: "Worldpay", description: "Bank", methods: [.bank], currencies: ["GBP", "EUR"], regions: ["EU"]),
+      ],
+      cachedGbp: PaymentRail.gbpBaseline
+    )
+    if enabled.surface.dynamicCatalogActive && enabled.surface.currencies == [.gbp, .eur]
+      && enabled.surface.rails.count == 4
+      && enabled.surface.rails[2].id == "adyen-card-eur"
+      && enabled.surface.rails[3].id == "worldpay-bank-eur"
+      && enabled.surface.rails.allSatisfy({ $0.provider == .adyen || $0.provider == .worldpay })
+    {
+      print("  ✓ enabled flag parses catalog and shows EUR")
+      passed += 1
+    } else {
+      print("  ✗ enabled flag did not unlock EUR")
+      failed += 1
+    }
+
+    // CHECK 23: explicit GBP catalog withholds EUR
+    print("23. explicit GBP catalog hides EUR...")
+    let gbpOnly = resolvePaymentSurface(
+      flagEnabled: true,
+      providers: [
+        Provider(id: .adyen, name: "Adyen", description: "Card", methods: [.card], currencies: ["GBP"]),
+        Provider(id: .worldpay, name: "Worldpay", description: "Bank", methods: [.bank], currencies: ["GBP"]),
+      ],
+      cachedGbp: PaymentRail.gbpBaseline
+    )
+    if gbpOnly.surface.dynamicCatalogActive && gbpOnly.surface.currencies == [.gbp]
+      && gbpOnly.surface.rails.allSatisfy({ $0.currency == .gbp })
+    {
+      print("  ✓ catalog can withhold EUR while the flag is on")
+      passed += 1
+    } else {
+      print("  ✗ GBP-only catalog still exposed EUR")
+      failed += 1
+    }
+
+    // CHECK 24: unknown provider is dropped and the list stays populated
+    print("24. unknown provider dropped...")
+    let unknownJson = """
+    {"id":"pilot-rail","name":"Pilot Rail","description":"Ignored","methods":["card"],"currencies":["EUR"]}
+    """.data(using: .utf8)!
+    let unknown = try? JSONDecoder().decode(Provider.self, from: unknownJson)
+    let mixed = resolvePaymentSurface(
+      flagEnabled: true,
+      providers: [
+        Provider(id: .worldpay, name: "Worldpay", description: "Bank", methods: [.bank], regions: ["EU"])
+      ],
+      cachedGbp: PaymentRail.gbpBaseline
+    )
+    let labels = mixed.surface.rails.map(\.label).joined(separator: " ")
+    if unknown == nil && !labels.contains("Pilot") && mixed.surface.rails.contains(where: { $0.id == "worldpay-bank-eur" })
+      && mixed.surface.rails[0].provider == .adyen && mixed.surface.rails[0].method == .card
+    {
+      print("  ✓ unknown provider is ignored and GBP rails remain")
+      passed += 1
+    } else {
+      print("  ✗ unknown provider leaked or rails emptied")
+      failed += 1
+    }
+
+    // CHECK 25: kill switch clears an in-review EUR selection
+    print("25. kill switch restores GBP review state...")
+    let open = resolvePaymentSurface(flagEnabled: true, providers: nil, cachedGbp: PaymentRail.gbpBaseline)
+    let reviewing = reconcileSelection(surface: open.surface, currency: .eur, railId: "adyen-card-eur", reviewing: true)
+    let closed = resolvePaymentSurface(flagEnabled: false, providers: nil, cachedGbp: open.cachedGbp)
+    let settled = reconcileSelection(surface: closed.surface, currency: reviewing.currency, railId: reviewing.railId, reviewing: reviewing.reviewing)
+    if open.surface.rails.count == 4 && !closed.surface.flagEnabled && closed.surface.rails.count == 2
+      && settled.currency == .gbp && settled.railId == "adyen-card-gbp" && !settled.reviewing
+    {
+      print("  ✓ kill switch leaves a non-empty GBP list and ends EUR review")
+      passed += 1
+    } else {
+      print("  ✗ kill switch did not restore GBP")
+      failed += 1
+    }
+
+    // CHECK 26: flag payloads
+    print("26. flag payload evaluation...")
+    let yes = evaluateMobileEuPaymentsFlag(#"{"enable_mobile_eu_payments":true}"#.data(using: .utf8)!)
+    let no = evaluateMobileEuPaymentsFlag(#"{"enable_mobile_eu_payments":false}"#.data(using: .utf8)!)
+    let nested = evaluateMobileEuPaymentsFlag(#"{"flags":{"enable_mobile_eu_payments":true}}"#.data(using: .utf8)!)
+    let text = evaluateMobileEuPaymentsFlag(#"{"enable_mobile_eu_payments":"true"}"#.data(using: .utf8)!)
+    let number = evaluateMobileEuPaymentsFlag(#"{"enable_mobile_eu_payments":1}"#.data(using: .utf8)!)
+    let broken = evaluateMobileEuPaymentsFlag(Data("not-json".utf8))
+    if yes && !no && nested && text && !number && !broken {
+      print("  ✓ flag evaluator accepts booleans and fails closed")
+      passed += 1
+    } else {
+      print("  ✗ flag evaluator mismatch")
+      failed += 1
+    }
+
+    // CHECK 27: catalog skips an unrecognised provider without dropping recipients
+    print("27. catalog skips unknown provider...")
+    let mixedCatalog = """
+    {"demoDate":"2026-09-18","recipients":[{"id":"alice-001","name":"Alice","initials":"A","detail":"GH Bank","category":"Shopping","color":"#007AFF"}],"providers":[{"id":"pilot-rail","name":"Pilot Rail","description":"Ignored","methods":["card"]},{"id":"adyen","name":"Adyen","description":"Card processor","methods":["card"]}]}
+    """
+    if let catalog = try? JSONDecoder().decode(CatalogResponse.self, from: mixedCatalog.data(using: .utf8)!),
+      catalog.recipients.count == 1, catalog.providers.count == 1, catalog.providers[0].id == .adyen
+    {
+      print("  ✓ catalog kept Adyen and dropped the unknown provider")
+      passed += 1
+    } else {
+      print("  ✗ catalog decode did not skip the unknown provider")
+      failed += 1
+    }
+
+    // CHECK 28: remote config fails closed and honours the session header
+    print("28. remote config flag...")
+    final class ConfigURLProtocol: URLProtocol {
+      nonisolated(unsafe) static var status = 200
+      nonisolated(unsafe) static var body = Data()
+      nonisolated(unsafe) static var lastHeader: String?
+      nonisolated(unsafe) static var lastPath: String?
+      override class func canInit(with request: URLRequest) -> Bool { true }
+      override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+      override func startLoading() {
+        Self.lastHeader = request.value(forHTTPHeaderField: "X-Rehearsal-Session")
+        Self.lastPath = request.url?.path
+        let response = HTTPURLResponse(
+          url: request.url!,
+          statusCode: Self.status,
+          httpVersion: "HTTP/1.1",
+          headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
+      }
+      override func stopLoading() {}
+    }
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [ConfigURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    let flagClient = try? MeridianClient(
+      baseURL: "http://127.0.0.1:8080/api/v1",
+      sessionId: "room-eu",
+      urlSession: session
+    )
+    ConfigURLProtocol.status = 200
+    ConfigURLProtocol.body = Data(#"{"enable_mobile_eu_payments":true}"#.utf8)
+    let enabledFlag = awaitFlag { await flagClient?.mobileEuPaymentsEnabled() ?? false }
+    ConfigURLProtocol.status = 500
+    ConfigURLProtocol.body = Data(#"{"enable_mobile_eu_payments":true}"#.utf8)
+    let failedFlag = awaitFlag { await flagClient?.mobileEuPaymentsEnabled() ?? true }
+    let header = ConfigURLProtocol.lastHeader
+    let path = ConfigURLProtocol.lastPath ?? ""
+    if enabledFlag && !failedFlag && header == "room-eu" && path.hasSuffix("/config") {
+      print("  ✓ config flag uses the rehearsal session and fails closed")
+      passed += 1
+    } else {
+      print("  ✗ remote flag check failed (enabled=\(enabledFlag) failedClosed=\(!failedFlag) header=\(header ?? "nil") path=\(path))")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
+  }
+}
+
+private func awaitFlag(_ body: @escaping () async -> Bool) -> Bool {
+  let box = FlagBox()
+  Task {
+    let result = await body()
+    box.finish(result)
+  }
+  let deadline = Date().addingTimeInterval(5)
+  while !box.isDone && Date() < deadline {
+    _ = RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+  }
+  return box.isDone && box.value
+}
+
+private final class FlagBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored = false
+  private var done = false
+  var isDone: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return done
+  }
+  var value: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return stored
+  }
+  func finish(_ result: Bool) {
+    lock.lock()
+    stored = result
+    done = true
+    lock.unlock()
   }
 }

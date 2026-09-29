@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
@@ -17,7 +18,9 @@ class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
 ) {
-  private val mapper = ObjectMapper().registerKotlinModule()
+  private val mapper = ObjectMapper().registerKotlinModule().apply {
+    configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+  }
   private val baseUrlNormalized = baseURL.removeSuffix("/")
 
   init {
@@ -108,6 +111,36 @@ class MeridianClient(
   }
 
   // MARK: - Public API Methods
+
+  /**
+   * GET /config — enable_mobile_eu_payments.
+   * Missing, malformed, or failed calls stay off so the view falls back to GBP.
+   */
+  suspend fun mobileEuPaymentsEnabled(): Boolean {
+    return try {
+      val (status, body) = requestText("GET", "/config")
+      if (status !in 200..299) false else evaluateMobileEuPaymentsFlag(body)
+    } catch (_: Exception) {
+      false
+    }
+  }
+
+  private suspend fun requestText(method: String, path: String): Pair<Int, String> = withContext(Dispatchers.IO) {
+    val connection = URL("$baseUrlNormalized$path").openConnection() as HttpURLConnection
+    try {
+      connection.connectTimeout = 15000
+      connection.readTimeout = 15000
+      connection.requestMethod = method
+      connection.setRequestProperty("Accept", "application/json")
+      connection.setRequestProperty("X-Rehearsal-Session", sessionId)
+      val statusCode = connection.responseCode
+      val stream = if (statusCode >= 400) connection.errorStream else connection.inputStream
+      val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+      Pair(statusCode, body)
+    } finally {
+      connection.disconnect()
+    }
+  }
 
   /**
    * GET /health - Check service health

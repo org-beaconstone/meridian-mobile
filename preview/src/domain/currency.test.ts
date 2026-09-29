@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { money, parsePence } from './currency';
+import { formatMinor, money, parsePence } from './currency';
 describe('mobile integer money', () => {
   it.each([
     ['25.99', 2599],
@@ -24,4 +24,5 @@ describe('mobile integer money', () => {
     '99999999999999999999999',
   ])('rejects %s', (value) => expect(parsePence(value)).toBeNull());
   it('formats GBP', () => expect(money(1248050)).toBe('£12,480.50'));
+  it('formats EUR minor units', () => expect(formatMinor(1050, 'EUR').replace(/\s/g, '')).toBe('€10.50'));
 });

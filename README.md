@@ -42,6 +42,6 @@ Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `
 
 ## Deliberate baseline
 
-Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+Payment methods stay Adyen card and Worldpay bank. Each refresh reads `enable_mobile_eu_payments` from `GET /api/v1/config` with the same `X-Rehearsal-Session`. When that flag is missing, false, or the config call fails, Swift, Kotlin, and the labelled browser companion keep the cached GBP list and hide EUR. When it is true, those same two providers can take their labels from the catalog and EUR entry is shown. Amounts sent to the API remain integer GBP pence. An EUR selection is not submitted and is not moved to another provider. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
 
 See [source context](https://github.com/org-beaconstone/meridian-api/blob/main/docs/context.md), [API contract](https://github.com/org-beaconstone/meridian-api/blob/main/docs/contract.md) and [connected runbook](https://github.com/org-beaconstone/meridian-api/blob/main/docs/connected-rehearsal.md). Existing Kaizen site remains standalone; no Java hosting is implied.
