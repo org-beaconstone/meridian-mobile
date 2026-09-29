@@ -374,4 +374,85 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  @Test
+  fun testSessionPhaseBoundaries() {
+    val now = 1_700_000_000_000L
+    assertEquals(SessionTiming.warningWindowMillis, 5 * 60 * 1000L)
+    assertEquals(
+      SessionPhase.active,
+      resolveSessionPhase(now, now + SessionTiming.warningWindowMillis + 1, false),
+    )
+    assertEquals(
+      SessionPhase.expiringSoon,
+      resolveSessionPhase(now, now + SessionTiming.warningWindowMillis, false),
+    )
+    assertEquals(SessionPhase.expiringSoon, resolveSessionPhase(now, now + 30_000, false))
+    assertEquals(SessionPhase.expired, resolveSessionPhase(now, now, false))
+    assertEquals(SessionPhase.expired, resolveSessionPhase(now, now - 1, false))
+  }
+
+  @Test
+  fun testSessionActiveElsewhereYieldsToExpiry() {
+    val now = 1_700_000_000_000L
+    assertEquals(SessionPhase.activeElsewhere, resolveSessionPhase(now, now + 600_000, true))
+    assertEquals(SessionPhase.activeElsewhere, resolveSessionPhase(now, now + 60_000, true))
+    assertEquals(SessionPhase.expired, resolveSessionPhase(now, now - 1, true))
+  }
+
+  @Test
+  fun testApprovedSessionBannerCopy() {
+    assertEquals("Connected to secure payments platform", SessionBannerCopy.text(SessionPhase.active))
+    assertEquals("Session expiring soon. Tap to extend.", SessionBannerCopy.text(SessionPhase.expiringSoon))
+    assertEquals("Session active on another device.", SessionBannerCopy.text(SessionPhase.activeElsewhere))
+    assertEquals(
+      "Session expired. Please re-authenticate to confirm this transfer.",
+      SessionBannerCopy.text(SessionPhase.expired),
+    )
+  }
+
+  @Test
+  fun testSessionBannerContrastAndAmberWarning() {
+    assertTrue(contrastRatio(SessionColor(0, 0, 0), SessionColor(255, 255, 255)) >= 20.9)
+    val backgrounds = mutableSetOf<SessionColor>()
+    SessionPhase.values().forEach { phase ->
+      val tokens = sessionBannerTokens(phase)
+      backgrounds += tokens.background
+      assertTrue(contrastRatio(tokens.foreground, tokens.background) >= 4.5)
+      assertTrue(contrastRatio(tokens.indicator, tokens.background) >= 4.5)
+    }
+    assertEquals(4, backgrounds.size)
+    val amber = sessionBannerTokens(SessionPhase.expiringSoon).background
+    assertTrue(amber.red > 220 && amber.green > 160 && amber.blue < 120)
+  }
+
+  @Test
+  fun testSessionBannerInteractionRules() {
+    assertEquals(48, SessionTiming.minimumTapTargetDp)
+    assertFalse(sessionBlocksInteraction(SessionPhase.active))
+    assertFalse(sessionBlocksInteraction(SessionPhase.expiringSoon))
+    assertFalse(sessionBlocksInteraction(SessionPhase.activeElsewhere))
+    assertTrue(sessionBlocksInteraction(SessionPhase.expired))
+    assertTrue(sessionOffersExtend(SessionPhase.expiringSoon))
+    assertFalse(sessionOffersExtend(SessionPhase.active))
+    assertFalse(sessionOffersExtend(SessionPhase.activeElsewhere))
+    assertFalse(sessionOffersExtend(SessionPhase.expired))
+  }
+
+  @Test
+  fun testRefreshSessionKeepsInFlightDraft() {
+    val now = 1_700_000_000_000L
+    val draft = InFlightPaymentDraft(
+      recipientId = "northline-studio",
+      amount = "12.50",
+      reference = "Invoice 14",
+      method = PaymentMethod.bank,
+      reviewing = true,
+      idempotencyKey = "payment-key-keep",
+    )
+    val refreshed = refreshSessionInPlace(draft, now)
+    assertEquals(draft, refreshed.draft)
+    assertEquals("payment-key-keep", refreshed.draft.idempotencyKey)
+    assertEquals(now + SessionTiming.lifetimeMillis, refreshed.expiresAtMillis)
+  }
 }
