@@ -1,0 +1,79 @@
+{
+  "suite": "meridian-mobile-cross-platform",
+  "money": [
+    { "minorUnits": 0, "currency": "GBP", "formatted": "£0.00" },
+    { "minorUnits": 1, "currency": "GBP", "formatted": "£0.01" },
+    { "minorUnits": 100, "currency": "GBP", "formatted": "£1.00" },
+    { "minorUnits": 420, "currency": "GBP", "formatted": "£4.20" },
+    { "minorUnits": 1050, "currency": "GBP", "formatted": "£10.50" },
+    { "minorUnits": 1248050, "currency": "GBP", "formatted": "£12,480.50" },
+    { "minorUnits": 1000000, "currency": "GBP", "formatted": "£10,000.00" },
+    { "minorUnits": 1050, "currency": "EUR", "formatted": "€10.50" },
+    { "minorUnits": 1000000, "currency": "EUR", "formatted": "€10,000.00" }
+  ],
+  "cache": [
+    { "ttlMs": 300000, "ageMs": 0, "fresh": true },
+    { "ttlMs": 300000, "ageMs": 299999, "fresh": true },
+    { "ttlMs": 300000, "ageMs": 300000, "fresh": false },
+    { "ttlMs": 300000, "ageMs": 300001, "fresh": false }
+  ],
+  "processDeath": {
+    "idempotencyKey": "intent-key-144",
+    "recipientId": "northline-studio",
+    "amountMinor": 1050,
+    "currency": "GBP",
+    "method": "card",
+    "note": "Coffee",
+    "providerId": "adyen",
+    "conflictingAmountMinor": 2000
+  },
+  "returns": {
+    "nonce": "nonce-144",
+    "paymentId": "pay-1",
+    "validUrl": "meridian://payments/return?state=nonce-144&paymentId=pay-1",
+    "expiresAtEpochMs": 1700000000000,
+    "acceptedAtEpochMs": 1699999990000,
+    "expiredAtEpochMs": 1700000000000,
+    "replayReason": "replayed deep link",
+    "expiredReason": "expired return state",
+    "malformedUrl": "https://evil.example/payments/return?state=nonce-144&paymentId=pay-1",
+    "malformedReason": "malformed deep link",
+    "unknownUrl": "meridian://payments/return?state=missing&paymentId=pay-1",
+    "unknownReason": "unknown return state"
+  },
+  "accessibility": [
+    {
+      "minorUnits": 1248050,
+      "currency": "GBP",
+      "fontScale": 1.0,
+      "direction": "ltr",
+      "voiceOverLabel": "Everyday account balance, £12,480.50",
+      "talkBackDescription": "Everyday account balance, £12,480.50",
+      "scaledSp": 38.0,
+      "minimumTouchTargetDp": 48.0,
+      "startEdge": "left",
+      "arrangement": "start",
+      "amountText": "£12,480.50",
+      "amountDirection": "ltr"
+    },
+    {
+      "minorUnits": 1248050,
+      "currency": "GBP",
+      "fontScale": 2.0,
+      "direction": "rtl",
+      "voiceOverLabel": "Everyday account balance, £12,480.50",
+      "talkBackDescription": "Everyday account balance, £12,480.50",
+      "scaledSp": 76.0,
+      "minimumTouchTargetDp": 96.0,
+      "startEdge": "right",
+      "arrangement": "start",
+      "amountText": "£12,480.50",
+      "amountDirection": "ltr"
+    }
+  ],
+  "confirm": {
+    "voiceOverLabel": "Confirm payment",
+    "voiceOverHint": "Submits the reviewed GBP payment. No real money moves.",
+    "talkBackDescription": "Confirm payment. Submits the reviewed GBP payment. No real money moves."
+  }
+}

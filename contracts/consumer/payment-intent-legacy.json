@@ -1,0 +1,27 @@
+{
+  "consumer": "meridian-mobile",
+  "provider": "meridian-api",
+  "interaction": "POST /payments legacy integer amountMinor",
+  "request": {
+    "method": "POST",
+    "path": "/payments",
+    "headers": {
+      "Idempotency-Key": "intent-key-144",
+      "X-Rehearsal-Session": "meridian-rehearsal"
+    },
+    "body": {
+      "recipientId": "northline-studio",
+      "amountMinor": 1050,
+      "method": "card",
+      "note": "Coffee",
+      "scenario": "success"
+    }
+  },
+  "expect": {
+    "minorUnits": 1050,
+    "currency": "GBP",
+    "submittable": true,
+    "providerId": "adyen",
+    "legacyKeys": ["amountMinor", "method", "note", "recipientId", "scenario"]
+  }
+}

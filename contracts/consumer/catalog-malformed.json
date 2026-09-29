@@ -1,0 +1,144 @@
+{
+  "consumer": "meridian-mobile",
+  "provider": "meridian-api",
+  "interaction": "GET /catalog malformed entries are rejected",
+  "cases": [
+    {
+      "name": "unknown provider",
+      "reason": "unknown provider",
+      "body": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          {
+            "id": "northline-studio",
+            "name": "Northline Studio",
+            "initials": "NS",
+            "detail": "Design tools",
+            "category": "Shopping",
+            "color": "#1F6F8B"
+          }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payments", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank payments", "methods": ["bank"] },
+          { "id": "other", "name": "Other", "description": "Not on the baseline", "methods": ["card"] }
+        ]
+      }
+    },
+    {
+      "name": "missing recipient id",
+      "reason": "recipient id is required",
+      "body": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          {
+            "name": "No Id",
+            "initials": "NI",
+            "detail": "Missing identifier",
+            "category": "Shopping",
+            "color": "#000000"
+          }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payments", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank payments", "methods": ["bank"] }
+        ]
+      }
+    },
+    {
+      "name": "fractional sample amount",
+      "reason": "minor units must be an integer",
+      "body": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          {
+            "id": "northline-studio",
+            "name": "Northline Studio",
+            "initials": "NS",
+            "detail": "Design tools",
+            "category": "Shopping",
+            "color": "#1F6F8B"
+          }
+        ],
+        "providers": [
+          {
+            "id": "adyen",
+            "name": "Adyen",
+            "description": "Card payments",
+            "methods": ["card"],
+            "sampleAmount": 10.5
+          },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank payments", "methods": ["bank"] }
+        ]
+      }
+    },
+    {
+      "name": "unsupported method",
+      "reason": "unsupported payment method",
+      "body": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          {
+            "id": "northline-studio",
+            "name": "Northline Studio",
+            "initials": "NS",
+            "detail": "Design tools",
+            "category": "Shopping",
+            "color": "#1F6F8B"
+          }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payments", "methods": ["wallet"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank payments", "methods": ["bank"] }
+        ]
+      }
+    },
+    {
+      "name": "unknown currency",
+      "reason": "unknown currency",
+      "body": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          {
+            "id": "northline-studio",
+            "name": "Northline Studio",
+            "initials": "NS",
+            "detail": "Design tools",
+            "category": "Shopping",
+            "color": "#1F6F8B"
+          }
+        ],
+        "providers": [
+          {
+            "id": "adyen",
+            "name": "Adyen",
+            "description": "Card payments",
+            "methods": ["card"],
+            "currencies": ["GBP", "XXX"]
+          },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank payments", "methods": ["bank"] }
+        ]
+      }
+    },
+    {
+      "name": "missing baseline provider",
+      "reason": "baseline providers required",
+      "body": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          {
+            "id": "northline-studio",
+            "name": "Northline Studio",
+            "initials": "NS",
+            "detail": "Design tools",
+            "category": "Shopping",
+            "color": "#1F6F8B"
+          }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payments", "methods": ["card"] }
+        ]
+      }
+    }
+  ]
+}

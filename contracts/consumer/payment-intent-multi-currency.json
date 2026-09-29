@@ -1,0 +1,90 @@
+{
+  "consumer": "meridian-mobile",
+  "provider": "meridian-api",
+  "interaction": "POST /payments multi-currency amount model with legacy integers still accepted",
+  "intents": [
+    {
+      "name": "gbp object matches legacy integer",
+      "body": {
+        "recipientId": "northline-studio",
+        "amount": { "minorUnits": 1050, "currency": "GBP" },
+        "method": "card",
+        "note": "Coffee",
+        "scenario": "success"
+      },
+      "expect": {
+        "minorUnits": 1050,
+        "currency": "GBP",
+        "submittable": true,
+        "providerId": "adyen",
+        "legacyAmountMinor": 1050
+      }
+    },
+    {
+      "name": "eur model is stored and not submitted",
+      "body": {
+        "recipientId": "northline-studio",
+        "amount": { "amountMinor": 2599, "currency": "EUR" },
+        "method": "bank",
+        "note": "Rent",
+        "scenario": "success"
+      },
+      "expect": {
+        "minorUnits": 2599,
+        "currency": "EUR",
+        "submittable": false,
+        "providerId": "worldpay"
+      }
+    },
+    {
+      "name": "legacy integer inside multi-currency document",
+      "body": {
+        "recipientId": "birch-bloom",
+        "amountMinor": 500,
+        "method": "bank",
+        "note": "",
+        "scenario": "pending"
+      },
+      "expect": {
+        "minorUnits": 500,
+        "currency": "GBP",
+        "submittable": true,
+        "providerId": "worldpay",
+        "legacyAmountMinor": 500
+      }
+    },
+    {
+      "name": "fractional minor units",
+      "body": {
+        "recipientId": "northline-studio",
+        "amount": { "minorUnits": 10.5, "currency": "GBP" },
+        "method": "card",
+        "note": "",
+        "scenario": "success"
+      },
+      "expect": { "reject": "minor units must be an integer" }
+    },
+    {
+      "name": "string amount",
+      "body": {
+        "recipientId": "northline-studio",
+        "amountMinor": "10.50",
+        "method": "card",
+        "note": "",
+        "scenario": "success"
+      },
+      "expect": { "reject": "minor units must be an integer" }
+    },
+    {
+      "name": "unknown currency",
+      "body": {
+        "recipientId": "northline-studio",
+        "amount": { "minorUnits": 100, "currency": "XXX" },
+        "method": "card",
+        "note": "",
+        "scenario": "success"
+      },
+      "expect": { "reject": "unknown currency" }
+    }
+  ]
+}

@@ -19,6 +19,8 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @ScaledMetric(relativeTo: .largeTitle) private var balanceSize: CGFloat = CGFloat(AccessibilityCopy.balanceBaseSp)
+  @ScaledMetric(relativeTo: .body) private var touchTarget: CGFloat = 48
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -33,7 +35,7 @@ import MeridianSDK
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
-            Text(money(state.balance)).font(.system(size: 38, weight: .medium))
+            Text(money(state.balance)).font(.system(size: balanceSize, weight: .medium)).accessibilityLabel(AccessibilityCopy.balanceLabel(money(state.balance))).accessibilityAddTraits(.isHeader).accessibilityIdentifier("everyday-balance")
             Text("Shared room: \(room)").font(.caption)
           }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(Color(red:0.078,green:0.173,blue:0.208)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 16))
           Text("Make a payment").font(.title2)
@@ -46,7 +48,7 @@ import MeridianSDK
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
-            Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
+            Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy).frame(minHeight: touchTarget).accessibilityLabel(AccessibilityCopy.confirmLabel).accessibilityHint(AccessibilityCopy.confirmHint)
             Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
           } else {
             Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
