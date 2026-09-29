@@ -1,9 +1,12 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +344,253 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: UUID v4 idempotency keys
+    print("21. UUID v4 idempotency key...")
+    let generatedKey = newPaymentIdempotencyKey()
+    if isUuidV4(generatedKey) && !isUuidV4("not-a-uuid") {
+      print("  ✓ newPaymentIdempotencyKey() is UUID v4")
+      passed += 1
+    } else {
+      print("  ✗ Expected a UUID v4 key")
+      failed += 1
+    }
+
+    // CHECK 22: backoff schedule
+    print("22. Gateway backoff schedule...")
+    let backoff = [
+      GatewayRetry.backoffMillis(retryIndex: 0, randomUnit: 0),
+      GatewayRetry.backoffMillis(retryIndex: 1, randomUnit: 0),
+      GatewayRetry.backoffMillis(retryIndex: 2, randomUnit: 0),
+      GatewayRetry.backoffMillis(retryIndex: 0, randomUnit: 1),
+    ]
+    if backoff == [200, 400, 800, 300] {
+      print("  ✓ backoff is 200, 400, 800 ms with jitter")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected backoff: \(backoff)")
+      failed += 1
+    }
+
+    let orchestratorResult = await runOrchestratorChecks()
+    passed += orchestratorResult.passed
+    failed += orchestratorResult.failed
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    let total = passed + failed
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
+  }
+
+  static func runOrchestratorChecks() async -> (passed: Int, failed: Int) {
+    var passed = 0
+    var failed = 0
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [GatewayStub.self]
+    let session = URLSession(configuration: config)
+    guard let client = try? MeridianClient(
+      baseURL: "http://127.0.0.1:9/api/v1",
+      sessionId: "room-keep",
+      urlSession: session
+    ) else {
+      print("  ✗ Could not build orchestrator client")
+      failed += 1
+      return (passed, failed)
+    }
+
+    // CHECK 23: 502 then 200 keeps key, session, method, and amount
+    print("23. Gateway 502 retries the same payment...")
+    GatewayStub.reset(statuses: [502, 200])
+    let sleeps = MillisecondLog()
+    let key = newPaymentIdempotencyKey()
+    let orchestrator = PaymentOrchestrator(
+      client: client,
+      sleep: { sleeps.values.append($0) },
+      randomUnit: { 0 }
+    )
+    do {
+      let response = try await orchestrator.submit(
+        recipientId: "northline-studio",
+        amountMinor: 2599,
+        method: .bank,
+        note: "Studio rent",
+        idempotencyKey: key
+      )
+      if response.ok
+        && GatewayStub.seenKeys == [key, key]
+        && GatewayStub.seenSessions == ["room-keep", "room-keep"]
+        && GatewayStub.seenMethods == ["bank", "bank"]
+        && GatewayStub.seenAmounts == [2599, 2599]
+        && sleeps.values == [200]
+      {
+        print("  ✓ 502 retry kept the key, session, bank method, and amount")
+        passed += 1
+      } else {
+        print("  ✗ Retry payload drifted: keys=\(GatewayStub.seenKeys) methods=\(GatewayStub.seenMethods) sleeps=\(sleeps.values)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 24: exhausted 502/504 does not mint a new key
+    print("24. Exhausted gateway timeout keeps the original key...")
+    GatewayStub.reset(statuses: [502, 502, 504])
+    sleeps.values = []
+    do {
+      _ = try await orchestrator.submit(
+        recipientId: "northline-studio",
+        amountMinor: 1000,
+        method: .card,
+        idempotencyKey: key
+      )
+      print("  ✗ Expected the gateway timeout to surface")
+      failed += 1
+    } catch let MeridianError.httpError(statusCode, message) {
+      if statusCode == 504
+        && message.contains("same key")
+        && GatewayStub.seenKeys == [key, key, key]
+        && GatewayStub.seenMethods == ["card", "card", "card"]
+        && sleeps.values == [200, 400]
+      {
+        print("  ✓ Three timeouts kept card and the original key")
+        passed += 1
+      } else {
+        print("  ✗ Exhausted retry mismatch: \(GatewayStub.seenKeys) \(GatewayStub.seenMethods) \(sleeps.values)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: HTTP 400 is not a gateway retry
+    print("25. Business HTTP 400 is not retried...")
+    GatewayStub.reset(statuses: [400])
+    sleeps.values = []
+    do {
+      let response = try await orchestrator.submit(
+        recipientId: "northline-studio",
+        amountMinor: 100,
+        method: .card,
+        idempotencyKey: key
+      )
+      if !response.ok && GatewayStub.seenKeys.count == 1 && sleeps.values.isEmpty {
+        print("  ✓ HTTP 400 returned without a retry")
+        passed += 1
+      } else {
+        print("  ✗ HTTP 400 was retried")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 26: invalid key never leaves the device
+    print("26. Non-UUID key is rejected locally...")
+    GatewayStub.reset(statuses: [200])
+    do {
+      _ = try await orchestrator.submit(
+        recipientId: "northline-studio",
+        amountMinor: 100,
+        method: .card,
+        idempotencyKey: "not-a-uuid"
+      )
+      print("  ✗ Expected local validation to fail")
+      failed += 1
+    } catch MeridianError.validationError {
+      if GatewayStub.seenKeys.isEmpty {
+        print("  ✓ Invalid key made no network request")
+        passed += 1
+      } else {
+        print("  ✗ Invalid key still called the API")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+    return (passed, failed)
+  }
+}
+
+final class MillisecondLog: @unchecked Sendable {
+  var values: [UInt64] = []
+}
+
+final class GatewayStub: URLProtocol {
+  static var statuses: [Int] = []
+  static var seenKeys: [String] = []
+  static var seenSessions: [String] = []
+  static var seenMethods: [String] = []
+  static var seenAmounts: [Int] = []
+
+  static func reset(statuses: [Int]) {
+    self.statuses = statuses
+    seenKeys = []
+    seenSessions = []
+    seenMethods = []
+    seenAmounts = []
+  }
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+  override func startLoading() {
+    GatewayStub.seenKeys.append(request.value(forHTTPHeaderField: "Idempotency-Key") ?? "")
+    GatewayStub.seenSessions.append(request.value(forHTTPHeaderField: "X-Rehearsal-Session") ?? "")
+    if let body = Self.bodyData(from: request),
+      let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+    {
+      GatewayStub.seenMethods.append(json["method"] as? String ?? "")
+      if let amount = json["amountMinor"] as? Int {
+        GatewayStub.seenAmounts.append(amount)
+      } else if let amount = json["amountMinor"] as? NSNumber {
+        GatewayStub.seenAmounts.append(amount.intValue)
+      } else {
+        GatewayStub.seenAmounts.append(-1)
+      }
+    } else {
+      GatewayStub.seenMethods.append("")
+      GatewayStub.seenAmounts.append(-1)
+    }
+    let status = GatewayStub.statuses.isEmpty ? 200 : GatewayStub.statuses.removeFirst()
+    let payload = status == 400
+      ? #"{"ok":false,"error":"Invalid amount","code":"BAD_REQUEST"}"#
+      : #"{"ok":true,"error":null,"code":null,"state":null,"transaction":null}"#
+    let data = payload.data(using: .utf8) ?? Data()
+    let response = HTTPURLResponse(
+      url: request.url ?? URL(string: "http://127.0.0.1/api/v1/payments")!,
+      statusCode: status,
+      httpVersion: "HTTP/1.1",
+      headerFields: ["Content-Type": "application/json"]
+    )!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: data)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+
+  override func stopLoading() {}
+
+  private static func bodyData(from request: URLRequest) -> Data? {
+    if let body = request.httpBody { return body }
+    guard let stream = request.httpBodyStream else { return nil }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 1024)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+      let count = stream.read(buffer, maxLength: 1024)
+      if count <= 0 { break }
+      data.append(buffer, count: count)
+    }
+    return data
   }
 }
