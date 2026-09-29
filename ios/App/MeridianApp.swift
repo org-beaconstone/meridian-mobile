@@ -13,12 +13,23 @@ import MeridianSDK
   @State private var recipient = "northline-studio"
   @State private var amount = ""
   @State private var reference = ""
-  @State private var method: PaymentMethod = .card
+  // Dynamic provider/method selection driven by the server catalog.
+  @State private var selectedProvider: Provider?
+  @State private var selectedMethod: PaymentMethod?
+  @State private var showMethodSheet = false
+  @State private var showBankSheet = false
   @State private var key = UUID().uuidString
   @State private var review = false
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+
+  private var methodLabel: String {
+    guard let provider = selectedProvider, let method = selectedMethod else { return "Choose payment method" }
+    let methodName = method == .card ? "Card" : "Bank transfer"
+    return "\(methodName) · \(provider.name)"
+  }
+
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -42,43 +53,95 @@ import MeridianSDK
           }
           TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
-          Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          // Dynamic payment method selector – populated from server catalog.
+          Button(methodLabel) { showMethodSheet = true }
+            .buttonStyle(.bordered)
+            .disabled(review || busy)
+          if let method = selectedMethod, method == .bank {
+            Button("Change bank") { showBankSheet = true }
+              .buttonStyle(.borderless)
+              .disabled(review || busy)
+          }
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
+            if let method = selectedMethod, let provider = selectedProvider {
+              Text("\(method == .card ? "Card" : "Bank transfer") via \(provider.name)").font(.subheadline).foregroundStyle(.secondary)
+            }
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
             Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") {
+              guard selectedMethod != nil else { message = "Choose a payment method to continue."; return }
+              let (value,error) = parseAmount(amount)
+              guard value != nil else { message = error ?? "Invalid amount"; return }
+              guard reference.count <= 200 else { message = "Reference is too long"; return }
+              key = UUID().uuidString; review = true
+              message = "Review before confirming. No real money moves."
+            }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
-          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
+          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in
+            HStack {
+              VStack(alignment: .leading) {
+                Text(transaction.name)
+                Text(transaction.provider).font(.caption).foregroundStyle(.secondary)
+              }
+              Spacer()
+              Text(money(transaction.amount))
+            }
+          }
           Text("September budgets").font(.title2)
           ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
         }
       }.padding(24).frame(maxWidth: 550)
-    }.task {
+    }
+    .sheet(isPresented: $showMethodSheet) {
+      PaymentMethodSheet(catalog: catalog) { provider, method in
+        selectedProvider = provider
+        selectedMethod = method
+        // When bank is chosen and there are multiple bank providers,
+        // present the bank selector immediately.
+        if method == .bank, let cat = catalog, cat.providers.filter({ $0.methods.contains(.bank) }).count > 1 {
+          showBankSheet = true
+        }
+      }
+    }
+    .sheet(isPresented: $showBankSheet) {
+      BankSelectorView(providers: catalog?.providers ?? []) { provider in
+        selectedProvider = provider
+        selectedMethod = .bank
+      }
+    }
+    .task {
       while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
     }
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
     generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
+    selectedProvider=nil; selectedMethod=nil
     do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
-    guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    guard let client else { return }; let started = generation
+    do {
+      let next = try await client.getState()
+      let definitions = try await client.getCatalog()
+      if started == generation && !busy {
+        state = next; catalog = definitions; message = "Connected to shared Java API"
+      }
+    } catch { if started == generation { message = "API unavailable: \(error)" } }
   }
   private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
-    defer {busy=false}
+    guard let client, let method = selectedMethod, !busy else { return }
+    busy = true; generation += 1
+    defer { busy = false }
     do {
-      let (minor,error)=parseAmount(amount)
-      guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
-    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+      let (minor, error) = parseAmount(amount)
+      guard let minor else { message = error ?? "Invalid amount"; return }
+      let result = try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
+      if result.ok { state=result.state; review=false; amount=""; reference=""; key=UUID().uuidString; message="Demo payment completed. Other clients will refresh." }
+      else { message = result.error ?? "Payment pending. Retry the same payment, not a new one." }
+    } catch { message = "Outcome may be unknown: \(error). Retry preserves the payment key." }
   }
 }

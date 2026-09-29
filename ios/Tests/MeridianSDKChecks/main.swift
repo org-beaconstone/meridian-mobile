@@ -341,10 +341,88 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: Provider decodes with string id (ProviderId enum removed)
+    print("21. Provider string id decoding...")
+    let providerJson = """
+    {"id": "adyen", "name": "Adyen", "description": "Card processor", "methods": ["card"]}
+    """
+    do {
+      let decoder = JSONDecoder()
+      let provider = try decoder.decode(
+        Provider.self,
+        from: providerJson.data(using: .utf8)!
+      )
+      if provider.id == "adyen" && provider.name == "Adyen" && provider.methods == [.card] {
+        print("  ✓ Provider decoded with string id: \(provider.id)")
+        passed += 1
+      } else {
+        print("  ✗ Provider fields mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Decoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 22: Bank provider filtering from catalog
+    print("22. Bank provider filtering...")
+    let catalogJsonFull = """
+    {
+      "demoDate": "2026-09-18",
+      "recipients": [],
+      "providers": [
+        {"id": "adyen",    "name": "Adyen",    "description": "Card processor",  "methods": ["card"]},
+        {"id": "worldpay", "name": "Worldpay", "description": "Bank processor",  "methods": ["bank"]}
+      ]
+    }
+    """
+    do {
+      let decoder = JSONDecoder()
+      let cat = try decoder.decode(CatalogResponse.self, from: catalogJsonFull.data(using: .utf8)!)
+      let bankProviders = cat.providers.filter { $0.methods.contains(.bank) }
+      let cardProviders = cat.providers.filter { $0.methods.contains(.card) }
+      if bankProviders.count == 1 && bankProviders[0].id == "worldpay"
+        && cardProviders.count == 1 && cardProviders[0].id == "adyen" {
+        print("  ✓ Bank filter: \(bankProviders.count) bank provider, \(cardProviders.count) card provider")
+        passed += 1
+      } else {
+        print("  ✗ Provider filter mismatch: bank=\(bankProviders.count), card=\(cardProviders.count)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Decoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 23: Transaction decodes provider as String
+    print("23. Transaction provider as String...")
+    let txJson = """
+    {
+      "id": "txn-x", "reference": "REF-001", "recipientId": "birch-bloom",
+      "name": "Birch & Bloom", "category": "Food & drink", "amount": 3500,
+      "date": "2026-09-05", "provider": "worldpay", "method": "bank",
+      "status": "completed", "note": "Test"
+    }
+    """
+    do {
+      let decoder = JSONDecoder()
+      let tx = try decoder.decode(Transaction.self, from: txJson.data(using: .utf8)!)
+      if tx.provider == "worldpay" && tx.method == .bank {
+        print("  ✓ Transaction provider=\(tx.provider) method=\(tx.method.rawValue)")
+        passed += 1
+      } else {
+        print("  ✗ Transaction fields mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Decoding failed: \(error)")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/23")
+    print("Failed: \(failed)/23")
 
     if failed > 0 {
       exit(1)

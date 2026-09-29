@@ -374,4 +374,103 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - Dynamic Payment Method Catalog Tests
+
+  @Test
+  fun testProviderDeserializationWithStringId() {
+    // ProviderId enum has been removed; provider id is now a plain String field.
+    val json = """
+      {
+        "id": "adyen",
+        "name": "Adyen",
+        "description": "Card payment processor",
+        "methods": ["card"]
+      }
+    """.trimIndent()
+
+    val provider = mapper.readValue(json, Provider::class.java)
+    assertEquals("adyen", provider.id)
+    assertEquals("Adyen", provider.name)
+    assertEquals(listOf("card"), provider.methods)
+  }
+
+  @Test
+  fun testBankProviderFilter() {
+    // Verify that bank providers can be filtered from a mixed catalog.
+    val providers = listOf(
+      Provider(id = "adyen",    name = "Adyen",    description = "Cards",  methods = listOf("card")),
+      Provider(id = "worldpay", name = "Worldpay", description = "Banks",  methods = listOf("bank")),
+    )
+    val bankProviders = providers.filter { "bank" in it.methods }
+    val cardProviders = providers.filter { "card" in it.methods }
+
+    assertEquals(1, bankProviders.size)
+    assertEquals("worldpay", bankProviders[0].id)
+    assertEquals(1, cardProviders.size)
+    assertEquals("adyen", cardProviders[0].id)
+  }
+
+  @Test
+  fun testPaymentMethodGroupingFromCatalog() {
+    // A provider with both methods appears in both card and bank groups.
+    val providers = listOf(
+      Provider(id = "dual", name = "Dual", description = "Both", methods = listOf("card", "bank")),
+      Provider(id = "adyen", name = "Adyen", description = "Cards only", methods = listOf("card")),
+    )
+    val cardGroup = providers.filter { "card" in it.methods }
+    val bankGroup = providers.filter { "bank" in it.methods }
+
+    assertEquals(2, cardGroup.size)
+    assertEquals(1, bankGroup.size)
+    assertEquals("dual", bankGroup[0].id)
+  }
+
+  @Test
+  fun testBankSelectorSearchFilter() {
+    // Simulate the search filter logic used by BankSelectorContent.
+    val bankProviders = listOf(
+      Provider(id = "worldpay",  name = "Worldpay",  description = "Bank transfers", methods = listOf("bank")),
+      Provider(id = "clearbank",  name = "ClearBank", description = "Faster payments", methods = listOf("bank")),
+    )
+    val query = "clear"
+    val filtered = bankProviders.filter {
+      it.name.contains(query, ignoreCase = true) || it.description.contains(query, ignoreCase = true)
+    }
+
+    assertEquals(1, filtered.size)
+    assertEquals("clearbank", filtered[0].id)
+  }
+
+  @Test
+  fun testEmptyCatalogProvidersHandled() {
+    // An empty providers list is a valid server response (no methods available).
+    val json = """{"demoDate":"2026-09-18","recipients":[],"providers":[]}"""
+    val response = mapper.readValue(json, CatalogResponse::class.java)
+    assertTrue(response.providers.isEmpty())
+  }
+
+  @Test
+  fun testTransactionProviderIsString() {
+    // Transaction.provider is decoded as a plain String without ProviderId enum.
+    val json = """
+      {
+        "id": "txn-001",
+        "reference": "REF-001",
+        "recipientId": "birch-bloom",
+        "name": "Birch & Bloom",
+        "category": "Food & drink",
+        "amount": 3500,
+        "date": "2026-09-05",
+        "provider": "worldpay",
+        "method": "bank",
+        "status": "completed",
+        "note": "Breakfast"
+      }
+    """.trimIndent()
+
+    val tx = mapper.readValue(json, Transaction::class.java)
+    assertEquals("worldpay", tx.provider)
+    assertEquals("bank", tx.method)
+  }
 }

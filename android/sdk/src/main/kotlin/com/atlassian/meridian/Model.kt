@@ -23,10 +23,6 @@ enum class PaymentMethod {
   card, bank
 }
 
-enum class ProviderId {
-  adyen, worldpay
-}
-
 enum class Scenario {
   success, declined, unavailable, pending
 }
