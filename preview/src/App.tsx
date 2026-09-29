@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import {
+  CorridorControls,
+  PAYMENTS_PAUSED_MESSAGE,
+  type CorridorMethod,
+} from './domain/corridorControls';
 
-type Method = 'card' | 'bank';
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
 type Transaction = {
   id: string;
@@ -20,10 +24,6 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
 import { money, parsePence as pence } from './domain/currency';
 class RequestError extends Error {
   constructor(
@@ -83,7 +83,9 @@ export default function App() {
   const [recipient, setRecipient] = useState('northline-studio');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
-  const [method, setMethod] = useState<Method>('card');
+  const [methodId, setMethodId] = useState('adyen-card-gb');
+  const controlsRef = useRef(new CorridorControls());
+  const [gateRevision, setGateRevision] = useState(0);
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -98,6 +100,9 @@ export default function App() {
     const generation = ++epoch.current;
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
+    controlsRef.current.reset();
+    setGateRevision((value) => value + 1);
+    setMethodId('adyen-card-gb');
     setState(null);
     setConnected(false);
     setError('');
@@ -118,6 +123,16 @@ export default function App() {
             setState(bankState(raw));
             setRecipients(catalog.recipients);
             setConnected(true);
+            try {
+              const config = await request(room, '/config');
+              if (!closed && generation === epoch.current) {
+                controlsRef.current.applyServerPayload(config);
+                controlsRef.current.resolve(room);
+                setGateRevision((value) => value + 1);
+              }
+            } catch {
+              // A missing /config keeps the last flags, or rehearsal defaults.
+            }
           }
         }
       } catch (e) {
@@ -135,6 +150,12 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
+  useEffect(() => {
+    const available = controlsRef.current.visibleMethods(room);
+    if (available.length > 0 && !available.some((rail) => rail.id === methodId)) {
+      setMethodId(available[0].id);
+    }
+  }, [gateRevision, room, methodId]);
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
@@ -183,21 +204,66 @@ export default function App() {
   async function confirm() {
     try {
       setError('');
+      try {
+        const config = await request(room, '/config');
+        controlsRef.current.applyServerPayload(config);
+        controlsRef.current.resolve(room);
+        setGateRevision((value) => value + 1);
+      } catch {
+        // Last applied flags still decide whether a new intent can be created.
+      }
+      if (controlsRef.current.blocksNewIntent(paymentKey.current)) {
+        setError(PAYMENTS_PAUSED_MESSAGE);
+        return;
+      }
+      const amountMinor = pence(amount);
+      if (amountMinor === null) {
+        setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+        return;
+      }
+      const created = controlsRef.current.createIntent({
+        idempotencyKey: paymentKey.current,
+        accountId: room,
+        recipientId: recipient,
+        amountMinor,
+        note,
+        methodId,
+      });
+      if (!created.ok) {
+        setError(created.message);
+        return;
+      }
+      const intent = created.intent;
       const result = await mutate(
         '/payments',
         'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
+        {
+          recipientId: intent.recipientId,
+          amountMinor: intent.amountMinor,
+          method: intent.method,
+          note: intent.note,
+          scenario,
+        },
+        intent.idempotencyKey,
       );
       if (result.ok) {
+        controlsRef.current.complete(intent.id, result.transaction?.reference || intent.id);
         setReceipt(result.transaction);
         setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      } else if (result.code === 'PAYMENT_PENDING') {
+        setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      } else {
+        controlsRef.current.markDeclined(intent.id);
+        setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const rails: CorridorMethod[] = controlsRef.current.visibleMethods(room);
+  const selectedRail = rails.find((rail) => rail.id === methodId) ?? rails[0];
+  const killSwitch = controlsRef.current.flags.killSwitch;
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -336,29 +402,35 @@ export default function App() {
                         onChange={(e) => setNote(e.target.value)}
                         placeholder="What’s it for?"
                       />
-                      <fieldset>
+                      <fieldset key={gateRevision}>
                         <legend>Payment method</legend>
-                        {providers.map((provider) => (
+                        {rails.map((rail) => (
                           <label
-                            className={
-                              'mobile-method ' + (method === provider.method ? 'selected' : '')
-                            }
-                            key={provider.id}
+                            className={'mobile-method ' + (methodId === rail.id ? 'selected' : '')}
+                            key={rail.id}
                           >
                             <input
                               type="radio"
                               name="method"
-                              checked={method === provider.method}
-                              onChange={() => setMethod(provider.method)}
+                              checked={methodId === rail.id}
+                              onChange={() => setMethodId(rail.id)}
                             />
                             <span>
-                              {provider.method === 'card' ? 'Debit card' : 'Bank payment'}
-                              <small>{provider.name} simulation</small>
+                              {rail.method === 'card' ? 'Debit card' : 'Bank payment'}
+                              <small>
+                                {rail.provider === 'adyen' ? 'Adyen' : 'Worldpay'} simulation
+                                {rail.corridor === 'EU' ? ' · European corridor' : ''}
+                              </small>
                             </span>
                           </label>
                         ))}
                       </fieldset>
-                      <button className="primary" disabled={!connected || busy} type="submit">
+                      {killSwitch && <p role="status">{PAYMENTS_PAUSED_MESSAGE}</p>}
+                      <button
+                        className="primary"
+                        disabled={!connected || busy || killSwitch || rails.length === 0}
+                        type="submit"
+                      >
                         Review payment
                       </button>
                     </form>
@@ -369,11 +441,11 @@ export default function App() {
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
-                          {note || 'No reference'}
+                          {selectedRail?.label ?? 'Adyen'} · {note || 'No reference'}
                         </p>
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      {killSwitch && <p role="status">{PAYMENTS_PAUSED_MESSAGE}</p>}
+                      <button className="primary" onClick={confirm} disabled={busy || !connected || killSwitch}>
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
                       <button className="secondary" disabled={busy} onClick={editPayment}>

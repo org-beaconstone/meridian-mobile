@@ -29,13 +29,14 @@ class MeridianClient(
 
   // MARK: - Internal Request Method
 
-  private suspend fun <T> request(
+  private data class RawHttp(val statusCode: Int, val body: String)
+
+  private suspend fun exchange(
     method: String,
     path: String,
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
-    responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
+  ): RawHttp = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
@@ -47,12 +48,10 @@ class MeridianClient(
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
 
-      // Add additional headers (e.g., Idempotency-Key)
       additionalHeaders.forEach { (key, value) ->
         connection.setRequestProperty(key, value)
       }
 
-      // Write body if present
       if (body != null) {
         val bodyJson = mapper.writeValueAsString(body)
         connection.doOutput = true
@@ -62,48 +61,55 @@ class MeridianClient(
         }
       }
 
-      // Read response
       val statusCode = connection.responseCode
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
       } else {
         connection.inputStream
       }
-
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
+      RawHttp(statusCode, responseBody)
+    } finally {
+      connection.disconnect()
+    }
+  }
 
-      // Check HTTP status and handle errors
-      when {
-        statusCode >= 200 && statusCode < 300 -> {
-          // Success
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
-          }
+  private suspend fun <T> request(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+    responseType: Class<T>,
+  ): T {
+    val raw = exchange(method, path, body, additionalHeaders)
+    val statusCode = raw.statusCode
+    val responseBody = raw.body
+    return when {
+      statusCode >= 200 && statusCode < 300 -> {
+        try {
+          mapper.readValue(responseBody, responseType)
+        } catch (e: Exception) {
+          throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
         }
+      }
 
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
-          // These are expected error statuses, parse the response
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.HttpError(
-              statusCode,
-              responseBody.ifEmpty { "Unknown error" }
-            )
-          }
-        }
-
-        else -> {
+      statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
+        try {
+          mapper.readValue(responseBody, responseType)
+        } catch (e: Exception) {
           throw MeridianError.HttpError(
             statusCode,
             responseBody.ifEmpty { "Unknown error" }
           )
         }
       }
-    } finally {
-      connection.disconnect()
+
+      else -> {
+        throw MeridianError.HttpError(
+          statusCode,
+          responseBody.ifEmpty { "Unknown error" }
+        )
+      }
     }
   }
 
@@ -190,4 +196,14 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  /**
+   * GET /config - Server-driven corridor flags and catalog version.
+   * A missing route throws; callers keep the last applied flags.
+   */
+  suspend fun fetchConfig(): String {
+    val raw = exchange("GET", "/config")
+    if (raw.statusCode in 200..299) return raw.body
+    throw MeridianError.HttpError(raw.statusCode, raw.body.ifEmpty { "Unknown error" })
+  }
 }
