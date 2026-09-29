@@ -18,10 +18,10 @@ import java.util.UUID
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    setContent { MaterialTheme(colors=lightColors(primary=Color(0xFF142C35),secondary=Color(0xFFD5B77A))) { MeridianScreen() } }
+    setContent { MaterialTheme(colors=lightColors(primary=Color(0xFF142C35),secondary=Color(0xFFD5B77A))) { MeridianScreen(this@MainActivity) } }
   }
 }
-@Composable fun MeridianScreen() {
+@Composable fun MeridianScreen(activity: ComponentActivity) {
   val scope=rememberCoroutineScope()
   var base by remember { mutableStateOf("http://10.0.2.2:8080/api/v1") }
   var room by remember { mutableStateOf("meridian-rehearsal") }
@@ -37,6 +37,69 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  var scaSession by remember { mutableStateOf<ScaSession?>(null) }
+  var passcode by remember { mutableStateOf("") }
+  val biometric = remember(activity) { AndroidBiometricAuthenticator(activity) }
+  suspend fun applyResult(active: MeridianClient, draft: PaymentDraft, call: PaymentCall, allowStepUp: Boolean) {
+    when (val intercept = ScaInterpreter.intercept(call.statusCode, call.bodyText)) {
+      is ScaIntercept.NotStepUp -> {
+        if (call.response.ok) {
+          state = call.response.state
+          review = false
+          amount = ""
+          note = ""
+          paymentKey = UUID.randomUUID().toString()
+          scaSession = null
+          passcode = ""
+          message = "Demo payment complete"
+        } else message = call.response.error ?: "Awaiting confirmation. Retry the same payment."
+      }
+      is ScaIntercept.Invalid, is ScaIntercept.Expired -> message = ScaCopy.FAILURE_MESSAGE
+      is ScaIntercept.Required -> {
+        if (!allowStepUp) {
+          message = ScaCopy.FAILURE_MESSAGE
+          return
+        }
+        var session = ScaSession.start(draft, intercept.challenge)
+        scaSession = session
+        message = ScaCopy.BIOMETRIC_PROMPT
+        session = session.afterBiometric(biometric.authenticate(ScaCopy.BIOMETRIC_PROMPT))
+        scaSession = session
+        val token = session.resubmitToken ?: return
+        if (session.challenge.isExpired()) {
+          message = ScaCopy.FAILURE_MESSAGE
+          return
+        }
+        val again = active.submitPayment(
+          recipientId = draft.recipientId,
+          amountMinor = draft.amountMinor,
+          method = draft.method,
+          note = draft.note,
+          scenario = draft.scenario,
+          idempotencyKey = draft.idempotencyKey,
+          scaChallengeToken = token,
+        )
+        scaSession = null
+        applyResult(active, draft, again, false)
+      }
+    }
+  }
+  suspend fun resubmit(active: MeridianClient, draft: PaymentDraft, token: String) {
+    if (scaSession?.challenge?.isExpired() == true) {
+      message = ScaCopy.FAILURE_MESSAGE
+      return
+    }
+    val again = active.submitPayment(
+      recipientId = draft.recipientId,
+      amountMinor = draft.amountMinor,
+      method = draft.method,
+      note = draft.note,
+      scenario = draft.scenario,
+      idempotencyKey = draft.idempotencyKey,
+      scaChallengeToken = token,
+    )
+    applyResult(active, draft, again, false)
+  }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
@@ -55,7 +118,7 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;scaSession=null;passcode="";revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -71,16 +134,42 @@ class MainActivity : ComponentActivity() {
       // Intentional two-provider native baseline; changing it requires an app release.
       Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
       Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;scaSession=null;passcode="";paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
-            if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
-            else message=result.error?:"Awaiting confirmation. Retry the same payment."
+        val session=scaSession
+        if(session!=null && session.showsPasscode) {
+          Text(ScaCopy.BIOMETRIC_PROMPT)
+          Text("Rehearsal passcode ${ScaCopy.REHEARSAL_PASSCODE}. It stays on this device and is not sent to the API.")
+          OutlinedTextField(passcode,{passcode=it},label={Text("In-app passcode")},enabled=!busy)
+          Button(onClick={
+            val active=client
+            val current=scaSession
+            if(active!=null && current!=null && !busy) {
+              val next=current.afterPasscode(passcode)
+              passcode=""
+              scaSession=next
+              val token=next.resubmitToken
+              if(token==null) message=ScaCopy.FAILURE_MESSAGE
+              else {busy=true;revision++;scope.launch {
+                try {resubmit(active,next.draft,token)}
+                catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}
+                finally {revision++;busy=false}
+              }}
+            }
+          },enabled=!busy){Text(if(busy)"Confirming…" else "Verify passcode")}
+        } else Button(onClick={val active=client;val minor=parseAmount(amount).first;val ready=scaSession;val token=ready?.resubmitToken;if(active!=null&&!busy&&token!=null&&ready!=null){busy=true;revision++;scope.launch{
+          try {resubmit(active,ready.draft,token)}
+          catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}
+          finally{revision++;busy=false}
+        }} else if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
+          try {
+            val draft=PaymentDraft(recipient,minor,method,note,Scenario.success,paymentKey)
+            val result=active.submitPayment(recipientId=draft.recipientId,amountMinor=draft.amountMinor,method=draft.method,note=draft.note,idempotencyKey=draft.idempotencyKey)
+            applyResult(active,draft,result,true)
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
         }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
-        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
+        TextButton(onClick={review=false;scaSession=null;passcode="";paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
       current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
