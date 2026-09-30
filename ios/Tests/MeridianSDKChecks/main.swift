@@ -341,10 +341,84 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    func check(_ name: String, _ ok: Bool) {
+      if ok {
+        print("  ✓ \(name)")
+        passed += 1
+      } else {
+        print("  ✗ \(name)")
+        failed += 1
+      }
+    }
+
+    let adyen = Provider(id: .adyen, name: "Adyen", description: "Card processor", methods: [.card])
+    let worldpay = Provider(id: .worldpay, name: "Worldpay", description: "Bank processor", methods: [.bank])
+    let both = CatalogResponse(demoDate: "2026-09-18", recipients: [], providers: [worldpay, adyen])
+    let cardOnly = CatalogResponse(demoDate: "2026-09-18", recipients: [], providers: [adyen])
+    let bankOnly = CatalogResponse(demoDate: "2026-09-18", recipients: [], providers: [worldpay])
+    let mismatched = CatalogResponse(
+      demoDate: "2026-09-18",
+      recipients: [],
+      providers: [
+        Provider(id: .adyen, name: "Adyen", description: "Card processor", methods: [.bank]),
+        Provider(id: .worldpay, name: "Worldpay", description: "Bank processor", methods: [.card]),
+      ]
+    )
+
+    print("21. Catalog rails use generic labels...")
+    let eurozone = paymentOptions(in: both, corridor: .eurozone)
+    check("Eurozone keeps catalog order", eurozone.map(\.method) == [.bank, .card])
+    check("Bank rail label", eurozone.first?.railLabel == "SEPA Instant Transfer")
+    check("Card rail label", eurozone.last?.railLabel == "Debit / Credit Card")
+    let rendered = eurozone.map { $0.railLabel + $0.accessibilityLabel }.joined(separator: " ")
+    check("Labels omit vendor marks", !containsVendorMark(rendered))
+    check("Card accessibility names GBP", eurozone.last?.accessibilityLabel.contains("GBP") == true)
+    check("Bank accessibility names the rail", eurozone.first?.accessibilityLabel.contains("SEPA Instant Transfer") == true)
+
+    print("22. Corridor eligibility filters the catalog...")
+    check("United Kingdom is card only", paymentOptions(in: both, corridor: .unitedKingdom).map(\.method) == [.card])
+    check("United Kingdom is empty without card", paymentOptions(in: bankOnly, corridor: .unitedKingdom).isEmpty)
+    check("Other destinations are empty", paymentOptions(in: both, corridor: .other).isEmpty)
+    check("Mismatched methods produce no rails", paymentOptions(in: mismatched, corridor: .eurozone).isEmpty)
+    check("Duplicate providers collapse", paymentOptions(in: CatalogResponse(demoDate: "2026-09-18", recipients: [], providers: [adyen, adyen]), corridor: .eurozone).count == 1)
+    check("Unknown provider id is not a baseline method", baselineMethod(providerId: "unlisted") == nil)
+    check("Adyen stays mapped to card", baselineMethod(providerId: "adyen") == .card)
+    check("Worldpay stays mapped to bank", baselineMethod(providerId: "worldpay") == .bank)
+
+    print("23. Loading, empty, and unavailable phases...")
+    check("Missing catalog while retrieving is loading", paymentMethodPhase(catalog: nil, retrieving: true, failed: false, corridor: .eurozone) == .loading)
+    check("Loaded catalog does not shimmer again", paymentMethodPhase(catalog: cardOnly, retrieving: true, failed: false, corridor: .eurozone) == .ready(paymentOptions(in: cardOnly, corridor: .eurozone)))
+    if case let .empty(corridor) = paymentMethodPhase(catalog: both, retrieving: false, failed: false, corridor: .other) {
+      check("Empty phase names the corridor", corridor == .other)
+      check("Empty copy names the corridor and GBP", emptyPaymentMethodsMessage(corridor: corridor).contains("Other destinations") && emptyPaymentMethodsMessage(corridor: corridor).contains("GBP"))
+      check("Empty copy omits vendor marks", !containsVendorMark(emptyPaymentMethodsMessage(corridor: corridor)))
+    } else {
+      check("Other corridor is the empty phase", false)
+    }
+    if case let .unavailable(message) = paymentMethodPhase(catalog: nil, retrieving: false, failed: true, corridor: .eurozone) {
+      check("Failed catalog is unavailable", message == paymentMethodsUnavailableLabel)
+    } else {
+      check("Failed catalog is unavailable", false)
+    }
+
+    print("24. Contrast and scaled layout...")
+    check("Text pairs meet 4.5:1", PaymentTextColors.textPairs.allSatisfy { contrastRatio($0.0, $0.1) >= 4.5 })
+    check("Control boundaries meet 3:1", PaymentTextColors.controlPairs.allSatisfy { contrastRatio($0.0, $0.1) >= 3 })
+    check("Black on white is 21:1", abs(contrastRatio(ContrastColor(hex: 0x000000), ContrastColor(hex: 0xFFFFFF)) - 21) < 0.05)
+    check("Phone stays stacked at 200%", !usesSideBySideRails(widthPoints: 390, fontScale: 2))
+    check("Compact phone stays stacked", !usesSideBySideRails(widthPoints: 360, fontScale: 1))
+    check("Tablet is side by side at 100%", usesSideBySideRails(widthPoints: 834, fontScale: 1))
+    check("Tablet stacks at 200% to avoid clipping", !usesSideBySideRails(widthPoints: 834, fontScale: 2))
+    check("Unfolded foldable is side by side", usesSideBySideRails(widthPoints: 720, fontScale: 1))
+    check("Folded foldable stays stacked", !usesSideBySideRails(widthPoints: 360, fontScale: 1.15))
+    check("Exactly 600 points is side by side", usesSideBySideRails(widthPoints: 600, fontScale: 1))
+    check("1199 points at 200% stacks", !usesSideBySideRails(widthPoints: 1199, fontScale: 2))
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

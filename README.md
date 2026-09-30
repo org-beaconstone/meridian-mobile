@@ -42,6 +42,6 @@ Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `
 
 ## Deliberate baseline
 
-Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+Native payment pickers read the server catalog and show generic rail labels ("Debit / Credit Card", "SEPA Instant Transfer"). The only recognized pairings remain Adyen for card and Worldpay for bank; vendor marks are not drawn, and no third provider is named or implemented. Choosing United Kingdom keeps card, Eurozone keeps card and SEPA Instant, and other destinations show an empty state. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
 
 See [source context](https://github.com/org-beaconstone/meridian-api/blob/main/docs/context.md), [API contract](https://github.com/org-beaconstone/meridian-api/blob/main/docs/contract.md) and [connected runbook](https://github.com/org-beaconstone/meridian-api/blob/main/docs/connected-rehearsal.md). Existing Kaizen site remains standalone; no Java hosting is implied.
