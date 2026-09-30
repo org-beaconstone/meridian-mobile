@@ -68,9 +68,10 @@ class MainActivity : ComponentActivity() {
       }
       OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
       OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
-      // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      // European corridors stay off this client. Choices stay Adyen card and Worldpay bank.
+      baselinePaymentChoices(catalog?.providers).forEach { choice ->
+        Row {RadioButton(method==choice.method,{method=choice.method},enabled=!review&&!busy);Text(choice.title,Modifier.padding(top=12.dp))}
+      }
       if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")

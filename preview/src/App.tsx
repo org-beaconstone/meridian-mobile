@@ -20,11 +20,8 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
 import { money, parsePence as pence } from './domain/currency';
+import { baselinePaymentChoices, type PaymentChoice } from './domain/paymentChoices';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -84,6 +81,7 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
+  const [providerOptions, setProviderOptions] = useState<PaymentChoice[]>(baselinePaymentChoices());
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -101,6 +99,7 @@ export default function App() {
     setState(null);
     setConnected(false);
     setError('');
+    setProviderOptions(baselinePaymentChoices());
     async function poll() {
       const version = revision.current;
       try {
@@ -117,6 +116,7 @@ export default function App() {
           ) {
             setState(bankState(raw));
             setRecipients(catalog.recipients);
+            setProviderOptions(baselinePaymentChoices(catalog.providers));
             setConnected(true);
           }
         }
@@ -338,7 +338,7 @@ export default function App() {
                       />
                       <fieldset>
                         <legend>Payment method</legend>
-                        {providers.map((provider) => (
+                        {providerOptions.map((provider) => (
                           <label
                             className={
                               'mobile-method ' + (method === provider.method ? 'selected' : '')
@@ -369,7 +369,7 @@ export default function App() {
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {providerOptions.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
                         </p>
                       </div>

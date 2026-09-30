@@ -148,6 +148,33 @@ public struct Provider: Codable, Hashable {
   }
 }
 
+public struct PaymentChoice: Hashable {
+  public let method: PaymentMethod
+  public let provider: ProviderId
+  public let title: String
+  public let providerName: String
+}
+
+/// Selectable rehearsal methods for the shared Java catalog.
+/// European corridor clearance is still closed, so this always returns Adyen card
+/// then Worldpay bank. A catalog entry with any other id is ignored. Display names
+/// are taken from the catalog only when that id is paired with its baseline method.
+public func baselinePaymentChoices(from providers: [Provider]?) -> [PaymentChoice] {
+  let card = providers?.first { $0.id == .adyen && $0.methods.contains(.card) }
+  let bank = providers?.first { $0.id == .worldpay && $0.methods.contains(.bank) }
+  let cardName = displayName(card?.name, fallback: "Adyen")
+  let bankName = displayName(bank?.name, fallback: "Worldpay")
+  return [
+    PaymentChoice(method: .card, provider: .adyen, title: "Debit card · \(cardName)", providerName: cardName),
+    PaymentChoice(method: .bank, provider: .worldpay, title: "Bank payment · \(bankName)", providerName: bankName),
+  ]
+}
+
+private func displayName(_ name: String?, fallback: String) -> String {
+  let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  return trimmed.isEmpty ? fallback : trimmed
+}
+
 // MARK: - API Response Types
 
 public struct HealthResponse: Codable {
