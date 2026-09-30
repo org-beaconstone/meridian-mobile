@@ -79,6 +79,35 @@ data class Provider(
   val methods: List<String>,
 ) : Serializable
 
+data class PaymentChoice(
+  val method: PaymentMethod,
+  val provider: ProviderId,
+  val title: String,
+  val providerName: String,
+)
+
+/**
+ * Selectable rehearsal methods for the shared Java catalog.
+ * European corridor clearance is still closed, so this always returns Adyen card
+ * then Worldpay bank. A catalog entry with any other id is ignored. Display names
+ * are taken from the catalog only when that id is paired with its baseline method.
+ */
+fun baselinePaymentChoices(providers: List<Provider>?): List<PaymentChoice> {
+  val card = providers?.firstOrNull { it.id == ProviderId.adyen.name && it.methods.contains(PaymentMethod.card.name) }
+  val bank = providers?.firstOrNull { it.id == ProviderId.worldpay.name && it.methods.contains(PaymentMethod.bank.name) }
+  val cardName = displayName(card?.name, "Adyen")
+  val bankName = displayName(bank?.name, "Worldpay")
+  return listOf(
+    PaymentChoice(PaymentMethod.card, ProviderId.adyen, "Debit card · $cardName", cardName),
+    PaymentChoice(PaymentMethod.bank, ProviderId.worldpay, "Bank payment · $bankName", bankName),
+  )
+}
+
+private fun displayName(name: String?, fallback: String): String {
+  val trimmed = name?.trim().orEmpty()
+  return if (trimmed.isEmpty()) fallback else trimmed
+}
+
 // MARK: - API Response Types
 
 data class HealthResponse(

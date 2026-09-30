@@ -341,10 +341,49 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: unknown catalog provider does not decode into the closed baseline
+    print("21. unknown catalog provider is rejected...")
+    let extraProvider = """
+    {"demoDate":"2026-09-18","recipients":[],"providers":[{"id":"other","name":"Other","description":"Unused","methods":["card"]}]}
+    """
+    do {
+      _ = try JSONDecoder().decode(CatalogResponse.self, from: Data(extraProvider.utf8))
+      print("  ✗ Unknown provider id should not decode")
+      failed += 1
+    } catch {
+      print("  ✓ Unknown provider id rejected")
+      passed += 1
+    }
+
+    // CHECK 22: baseline choices stay Adyen card and Worldpay bank
+    print("22. baseline payment choices...")
+    let defaults = baselinePaymentChoices(from: nil)
+    let named = baselinePaymentChoices(from: [
+      Provider(id: .adyen, name: " Adyen ", description: "Card", methods: [.card]),
+      Provider(id: .worldpay, name: "Worldpay", description: "Bank", methods: [.bank]),
+    ])
+    let crossed = baselinePaymentChoices(from: [
+      Provider(id: .adyen, name: "Adyen", description: "Card", methods: [.bank]),
+      Provider(id: .worldpay, name: "Worldpay", description: "Bank", methods: [.card]),
+    ])
+    if defaults.map(\.title) == ["Debit card · Adyen", "Bank payment · Worldpay"]
+      && defaults.map(\.method) == [.card, .bank]
+      && defaults.map(\.provider) == [.adyen, .worldpay]
+      && named.map(\.providerName) == ["Adyen", "Worldpay"]
+      && crossed.map(\.title) == defaults.map(\.title)
+    {
+      print("  ✓ Baseline stays Adyen card and Worldpay bank")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected choices: \(named.map(\.title)) / \(crossed.map(\.title))")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

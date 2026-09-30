@@ -374,4 +374,43 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  @Test
+  fun testBaselineChoicesIgnoreUnlistedCatalogProvider() {
+    val json = """
+      {"demoDate":"2026-09-18","recipients":[],"providers":[
+        {"id":"adyen","name":"Adyen","description":"Card","methods":["card"]},
+        {"id":"other","name":"Other","description":"Unused","methods":["card","bank"]},
+        {"id":"worldpay","name":"Worldpay","description":"Bank","methods":["bank"]}
+      ]}
+    """
+    val catalog = mapper.readValue(json, CatalogResponse::class.java)
+    val choices = baselinePaymentChoices(catalog.providers)
+    assertEquals(2, choices.size)
+    assertEquals(PaymentMethod.card, choices[0].method)
+    assertEquals(ProviderId.adyen, choices[0].provider)
+    assertEquals("Debit card · Adyen", choices[0].title)
+    assertEquals(PaymentMethod.bank, choices[1].method)
+    assertEquals(ProviderId.worldpay, choices[1].provider)
+    assertEquals("Bank payment · Worldpay", choices[1].title)
+    assertFalse(choices.any { it.providerName == "Other" || it.title.contains("Other") })
+  }
+
+  @Test
+  fun testBaselineChoicesUseDefaultsWhenCatalogMissingOrCrossed() {
+    val defaults = baselinePaymentChoices(null)
+    assertEquals(
+      listOf("Debit card · Adyen", "Bank payment · Worldpay"),
+      defaults.map { it.title },
+    )
+    val crossed = baselinePaymentChoices(
+      listOf(
+        Provider("adyen", "Renamed Card", "Card", listOf("bank")),
+        Provider("worldpay", "Renamed Bank", "Bank", listOf("card")),
+        Provider("other", "Other", "Unused", listOf("card")),
+      ),
+    )
+    assertEquals(defaults.map { it.title }, crossed.map { it.title })
+    assertEquals(listOf(ProviderId.adyen, ProviderId.worldpay), crossed.map { it.provider })
+  }
 }
