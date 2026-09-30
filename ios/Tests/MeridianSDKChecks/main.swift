@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async throws {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +341,160 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    // Summary
+    // CHECK 21: bounded jittered backoff
+    print("21. bounded jittered backoff...")
+    let low = StatusBackoff.backoffMillis(attemptIndex: 0, randomUnit: 0)
+    let high = StatusBackoff.backoffMillis(attemptIndex: 0, randomUnit: 1)
+    let capped = StatusBackoff.backoffMillis(attemptIndex: 10, randomUnit: 1)
+    if low == 250 && high == 500 && capped == StatusBackoff.maxMs && high > low {
+      print("  ✓ backoff stays inside 250...4000ms")
+      passed += 1
+    } else {
+      print("  ✗ unexpected backoff low=\(low) high=\(high) capped=\(capped)")
+      failed += 1
+    }
+
+    // CHECK 22: decline stops polling and is not resubmitted on recovery
+    print("22. decline stops polling...")
+    let declinePoll = await pollResult(statuses: ["declined"])
+    if declinePoll.result.phase == .declined && declinePoll.result.attempts == 1 && declinePoll.sleeps.isEmpty {
+      print("  ✓ declined intent stops after one lookup")
+      passed += 1
+    } else {
+      print("  ✗ decline poll phase=\(declinePoll.result.phase) attempts=\(declinePoll.result.attempts) sleeps=\(declinePoll.sleeps)")
+      failed += 1
+    }
+    let declinedSnapshot = sampleSnapshot(phase: .declined, intentId: "pi-declined")
+    if recoveryAction(for: declinedSnapshot) == .showDecline
+      && recoveryFeedback(for: .declined).contains("will not be submitted again")
+    {
+      print("  ✓ stored decline does not resume a submission")
+      passed += 1
+    } else {
+      print("  ✗ decline recovery action was wrong")
+      failed += 1
+    }
+
+    // CHECK 23: processing, pending, and unknown keep polling until success
+    print("23. polls processing, pending, and unknown...")
+    let successPoll = await pollResult(statuses: ["processing", "pending", "mystery", "succeeded"])
+    if successPoll.result.phase == .succeeded && successPoll.result.attempts == 4 && successPoll.sleeps.count == 3 && successPoll.sleeps.allSatisfy({ $0 <= StatusBackoff.maxMs }) {
+      print("  ✓ non-terminal statuses poll with bounded backoff")
+      passed += 1
+    } else {
+      print("  ✗ success poll phase=\(successPoll.result.phase) attempts=\(successPoll.result.attempts) sleeps=\(successPoll.sleeps)")
+      failed += 1
+    }
+    if case .poll(let intentId) = recoveryAction(for: sampleSnapshot(phase: .processing, intentId: "pi-open")),
+      intentId == "pi-open",
+      recoveryAction(for: sampleSnapshot(phase: .pending, intentId: "pi-pending")) == .poll(intentId: "pi-pending"),
+      recoveryAction(for: sampleSnapshot(phase: .unknown, intentId: nil)) == .holdUnknown
+    {
+      print("  ✓ restart resumes a status check and holds an unknown payment without an id")
+      passed += 1
+    } else {
+      print("  ✗ recovery action mismatch")
+      failed += 1
+    }
+
+    // CHECK 24: receipt fields
+    print("24. success receipt...")
+    let receipt = makeReceipt(
+      snapshot: sampleSnapshot(phase: .succeeded, intentId: "pi-1"),
+      intent: PaymentIntent(
+        id: "pi-1",
+        status: "succeeded",
+        amountMinor: 2599,
+        currency: "GBP",
+        recipientName: "Northline Studio",
+        supportReference: "SUP-140-7781",
+        note: "Materials",
+        provider: "adyen"
+      )
+    )
+    if receipt.recipientName == "Northline Studio" && receipt.amountMinor == 2599 && receipt.supportReference == "SUP-140-7781" {
+      print("  ✓ receipt has recipient, amount, and support reference")
+      passed += 1
+    } else {
+      print("  ✗ receipt mismatch \(receipt)")
+      failed += 1
+    }
+
+    // CHECK 25: v2 URL and snapshot file
+    print("25. intent URL and stored snapshot...")
+    let base = URL(string: "http://127.0.0.1:8080/api/v1")!
+    let intentURL = try paymentIntentURL(baseURL: base, id: "pi_77")
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("meridian-snapshots-\(UUID().uuidString).json")
+    let store = FileIntentSnapshotStore(fileURL: file)
+    store.save(sampleSnapshot(phase: .pending, intentId: "pi-new", sessionId: "room-b", updatedAt: "2026-09-18T11:00:00Z"))
+    store.save(sampleSnapshot(phase: .declined, intentId: "pi-old", sessionId: "room-a", updatedAt: "2026-09-18T10:00:00Z"))
+    let restored = FileIntentSnapshotStore(fileURL: file).latestRecoverable()
+    if intentURL.absoluteString == "http://127.0.0.1:8080/api/v2/payment-intents/pi_77"
+      && restored?.intentId == "pi-new"
+    {
+      print("  ✓ v2 status URL and restart snapshot")
+      passed += 1
+    } else {
+      print("  ✗ url=\(intentURL.absoluteString) restored=\(restored?.intentId ?? "nil")")
+      failed += 1
+    }
+
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+}
+
+private func sampleSnapshot(
+  phase: IntentPhase,
+  intentId: String?,
+  sessionId: String = "room-1",
+  updatedAt: String = "2026-09-18T12:00:00Z"
+) -> IntentSnapshot {
+  IntentSnapshot(
+    intentId: intentId,
+    sessionId: sessionId,
+    baseURL: "http://127.0.0.1:8080/api/v1",
+    idempotencyKey: "11111111-1111-4111-8111-111111111111",
+    recipientId: "northline-studio",
+    recipientName: "Northline Studio",
+    amountMinor: 1500,
+    method: "card",
+    note: "Materials",
+    phase: phase,
+    provider: "adyen",
+    updatedAt: updatedAt
+  )
+}
+
+private final class PollCapture: @unchecked Sendable {
+  var remaining: [String]
+  var sleeps: [UInt64] = []
+  init(_ statuses: [String]) { remaining = statuses }
+}
+
+private func pollResult(statuses: [String]) async -> (result: StatusPollResult, sleeps: [UInt64]) {
+  let capture = PollCapture(statuses)
+  let poller = PaymentStatusPoller(
+    getIntent: { _ in
+      let status = capture.remaining.isEmpty ? "unknown" : capture.remaining.removeFirst()
+      return PaymentIntent(
+        id: "pi-1",
+        status: status,
+        amountMinor: 1500,
+        currency: "GBP",
+        recipientName: "Northline Studio"
+      )
+    },
+    sleep: { delay in capture.sleeps.append(delay) },
+    randomUnit: { 0 },
+    maxElapsedMs: 60_000
+  )
+  let result = await poller.poll(intentId: "pi-1")
+  return (result, capture.sleeps)
 }

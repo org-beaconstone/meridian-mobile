@@ -42,11 +42,19 @@ public actor MeridianClient {
 
   private func request<T: Decodable>(
     method: String,
-    path: String,
+    path: String? = nil,
+    url overrideURL: URL? = nil,
     body: Encodable? = nil,
     additionalHeaders: [String: String] = [:]
   ) async throws -> T {
-    let url = baseURL.appendingPathComponent(path)
+    let url: URL
+    if let overrideURL {
+      url = overrideURL
+    } else if let path {
+      url = baseURL.appendingPathComponent(path)
+    } else {
+      throw MeridianError.invalidURL
+    }
 
     var request = URLRequest(url: url)
     request.httpMethod = method
@@ -161,5 +169,12 @@ public actor MeridianClient {
   /// GET /events - Fetch audit events
   public func getEvents() async throws -> EventsResponse {
     return try await request(method: "GET", path: "/events")
+  }
+
+  /// GET /api/v2/payment-intents/{id}
+  /// Authoritative status lookup. This does not create or retry a payment.
+  public func getPaymentIntent(id: String) async throws -> PaymentIntent {
+    let url = try paymentIntentURL(baseURL: baseURL, id: id)
+    return try await request(method: "GET", url: url)
   }
 }

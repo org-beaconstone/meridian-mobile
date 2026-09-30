@@ -36,7 +36,9 @@ mvn clean verify
 gradle :app:assembleDebug
 ```
 
-`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes 22 tests including an actual local HTTP transport check for session/idempotency headers and HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
+`android/sdk` is the single Kotlin source tree, used by both Maven and Gradle build definitions. Maven compilation was verified; the Android Gradle build was not run locally. Maven executes the SDK tests, including an actual local HTTP transport check for session/idempotency headers and HTTP202 pending behavior. `LiveChecksKt` also passed against the real Spring Boot API (bank payment, duplicate key, pending and reset). `android/app` contains the native Compose customer UI. No APK or Android device build was verified locally because Android SDK was unavailable.
+
+While a payment is processing, pending, or unknown, the native clients and the browser companion poll `GET /api/v2/payment-intents/{id}` with bounded jittered backoff. That lookup does not create another payment. A successful lookup shows the recipient, GBP amount, transaction details, and support reference. A declined intent is terminal and is not submitted again. The intent snapshot is stored on device (and in browser storage for the companion) so a restart resumes the status check.
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
 
