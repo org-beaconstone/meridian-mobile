@@ -374,4 +374,77 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  @Test
+  fun testCatalogRailsUseGenericLabels() {
+    val options = paymentOptions(sampleCatalog(), PaymentCorridor.EUROZONE)
+    assertEquals(listOf(PaymentMethod.bank, PaymentMethod.card), options.map { it.method })
+    assertEquals("SEPA Instant Transfer", options[0].railLabel)
+    assertEquals("Debit / Credit Card", options[1].railLabel)
+    val rendered = options.joinToString(" ") { it.railLabel + it.accessibilityLabel }
+    assertFalse(containsVendorMark(rendered))
+    assertTrue(options[1].accessibilityLabel.contains("GBP"))
+    assertTrue(options[0].accessibilityLabel.contains("SEPA Instant Transfer"))
+  }
+
+  @Test
+  fun testCorridorFiltersCatalog() {
+    val both = sampleCatalog()
+    assertEquals(listOf(PaymentMethod.card), paymentOptions(both, PaymentCorridor.UNITED_KINGDOM).map { it.method })
+    assertTrue(paymentOptions(catalogOf(worldpay()), PaymentCorridor.UNITED_KINGDOM).isEmpty())
+    assertTrue(paymentOptions(both, PaymentCorridor.OTHER).isEmpty())
+    val mismatched = catalogOf(
+      Provider("adyen", "Adyen", "Card processor", listOf("bank")),
+      Provider("worldpay", "Worldpay", "Bank processor", listOf("card")),
+    )
+    assertTrue(paymentOptions(mismatched, PaymentCorridor.EUROZONE).isEmpty())
+    assertEquals(1, paymentOptions(catalogOf(adyen(), adyen()), PaymentCorridor.EUROZONE).size)
+    assertNull(baselineMethod("unlisted"))
+    assertEquals(PaymentMethod.card, baselineMethod("adyen"))
+    assertEquals(PaymentMethod.bank, baselineMethod("worldpay"))
+  }
+
+  @Test
+  fun testPaymentMethodPhases() {
+    assertEquals(
+      PaymentMethodPhase.Loading,
+      paymentMethodPhase(null, retrieving = true, failed = false, PaymentCorridor.EUROZONE),
+    )
+    val ready = paymentMethodPhase(catalogOf(adyen()), retrieving = true, failed = false, PaymentCorridor.EUROZONE)
+    assertTrue(ready is PaymentMethodPhase.Ready)
+    val empty = paymentMethodPhase(sampleCatalog(), retrieving = false, failed = false, PaymentCorridor.OTHER)
+    assertEquals(PaymentMethodPhase.Empty(PaymentCorridor.OTHER), empty)
+    val message = emptyPaymentMethodsMessage(PaymentCorridor.OTHER)
+    assertTrue(message.contains("Other destinations"))
+    assertTrue(message.contains("GBP"))
+    assertFalse(containsVendorMark(message))
+    assertEquals(
+      PaymentMethodPhase.Unavailable(paymentMethodsUnavailableLabel),
+      paymentMethodPhase(null, retrieving = false, failed = true, PaymentCorridor.EUROZONE),
+    )
+  }
+
+  @Test
+  fun testContrastAndScaledLayout() {
+    assertTrue(PaymentTextColors.textPairs.all { contrastRatio(it.first, it.second) >= 4.5 })
+    assertTrue(PaymentTextColors.controlPairs.all { contrastRatio(it.first, it.second) >= 3.0 })
+    val blackOnWhite = contrastRatio(ContrastColor(0x000000), ContrastColor(0xFFFFFF))
+    assertTrue(kotlin.math.abs(blackOnWhite - 21.0) < 0.05)
+    assertFalse(usesSideBySideRails(390.0, 2.0))
+    assertFalse(usesSideBySideRails(360.0, 1.0))
+    assertTrue(usesSideBySideRails(834.0, 1.0))
+    assertFalse(usesSideBySideRails(834.0, 2.0))
+    assertTrue(usesSideBySideRails(720.0, 1.0))
+    assertFalse(usesSideBySideRails(360.0, 1.15))
+    assertTrue(usesSideBySideRails(600.0, 1.0))
+    assertFalse(usesSideBySideRails(1199.0, 2.0))
+  }
+
+  private fun adyen() = Provider("adyen", "Adyen", "Card processor", listOf("card"))
+
+  private fun worldpay() = Provider("worldpay", "Worldpay", "Bank processor", listOf("bank"))
+
+  private fun catalogOf(vararg providers: Provider) = CatalogResponse("2026-09-18", emptyList(), providers.toList())
+
+  private fun sampleCatalog() = catalogOf(worldpay(), adyen())
 }
