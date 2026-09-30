@@ -30,6 +30,7 @@ import MeridianSDK
           Button("Connect") { Task { await connect() } }.disabled(busy)
         }.textFieldStyle(.roundedBorder)
         Text(message).font(.callout).foregroundStyle(.secondary)
+        WhiteboardView()
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
