@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
       else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
+    WhiteboardSection()
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}

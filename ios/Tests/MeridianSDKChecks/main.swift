@@ -341,10 +341,56 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: sticky palette defaults to yellow
+    print("21. Sticky palette defaults to yellow...")
+    let paletteIds = StickyPalette.colours.map(\.id)
+    if paletteIds == ["yellow", "orange", "coral", "pink", "purple", "blue", "teal", "green"]
+      && Set(paletteIds).count == paletteIds.count
+      && StickyPalette.colour(id: StickyPalette.defaultColourId).name == "Yellow"
+    {
+      print("  ✓ Palette includes yellow default")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected sticky palette")
+      failed += 1
+    }
+
+    // CHECK 22: sticky note keeps the selected colour
+    print("22. Sticky note keeps selected colour...")
+    switch StickyPalette.createNote(text: "  Ship the palette  ", colourId: "teal", id: "note-1") {
+    case .success(let note) where note.text == "Ship the palette" && note.colourId == "teal" && note.id == "note-1":
+      print("  ✓ Note stored the selected teal colour")
+      passed += 1
+    default:
+      print("  ✗ Selected colour was not stored")
+      failed += 1
+    }
+
+    // CHECK 23: blank sticky note rejected
+    print("23. Blank sticky note rejected...")
+    if case .failure(.empty) = StickyPalette.createNote(text: "   ", colourId: "yellow", id: "note-2") {
+      print("  ✓ Blank sticky note rejected")
+      passed += 1
+    } else {
+      print("  ✗ Blank sticky note should be rejected")
+      failed += 1
+    }
+
+    // CHECK 24: unknown sticky colour rejected
+    print("24. Unknown sticky colour rejected...")
+    if case .failure(.unknownColour) = StickyPalette.createNote(text: "Hello", colourId: "navy", id: "note-3") {
+      print("  ✓ Unknown colour rejected")
+      passed += 1
+    } else {
+      print("  ✗ Unknown colour should be rejected")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

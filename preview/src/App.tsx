@@ -25,6 +25,7 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import { StickyBoard } from './whiteboard/StickyBoard';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -79,7 +80,7 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [page, setPage] = useState<'Home' | 'Pay' | 'History' | 'Settings'>('Home');
+  const [page, setPage] = useState<'Home' | 'Pay' | 'Board' | 'History' | 'Settings'>('Home');
   const [recipient, setRecipient] = useState('northline-studio');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
@@ -236,7 +237,9 @@ export default function App() {
               {notice}
             </p>
           )}
-          {!state ? (
+          {page === 'Board' ? (
+            <StickyBoard />
+          ) : !state ? (
             <section className="mobile-card">
               <h1>Connecting your money.</h1>
               <p>
@@ -512,7 +515,7 @@ export default function App() {
           )}
         </main>
         <nav className="mobile-nav" aria-label="Mobile navigation">
-          {(['Home', 'Pay', 'History', 'Settings'] as const).map((item) => (
+          {(['Home', 'Pay', 'Board', 'History', 'Settings'] as const).map((item) => (
             <button
               key={item}
               aria-current={page === item ? 'page' : undefined}
