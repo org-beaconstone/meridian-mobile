@@ -190,4 +190,46 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  /**
+   * POST /api/v2/payment-intents
+   * Sends the canonical payload bytes unchanged. The rehearsal room stays on X-Rehearsal-Session.
+   * Timeout stays 15 seconds. A timeout throws and the caller keeps the same idempotency key.
+   */
+  suspend fun submitPaymentIntent(
+    canonicalBody: String,
+    idempotencyKey: String,
+    payloadHash: String,
+  ): PaymentIntentHttpResult = withContext(Dispatchers.IO) {
+    val url = URL(resolvePaymentIntentsUrl(baseUrlNormalized))
+    val connection = url.openConnection() as HttpURLConnection
+    try {
+      connection.connectTimeout = 15000
+      connection.readTimeout = 15000
+      connection.requestMethod = "POST"
+      connection.setRequestProperty("Content-Type", "application/json")
+      connection.setRequestProperty("X-Rehearsal-Session", sessionId)
+      connection.setRequestProperty("Idempotency-Key", idempotencyKey)
+      connection.setRequestProperty("X-Payload-Hash", payloadHash)
+      connection.doOutput = true
+      connection.outputStream.use { out ->
+        out.write(canonicalBody.toByteArray(StandardCharsets.UTF_8))
+        out.flush()
+      }
+      val statusCode = connection.responseCode
+      val responseStream = if (statusCode >= 400) connection.errorStream else connection.inputStream
+      val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
+      val allowed = statusCode in 200..299 || statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503
+      if (!allowed) {
+        throw MeridianError.HttpError(statusCode, responseBody.ifEmpty { "Unknown error" })
+      }
+      try {
+        PaymentIntentHttpResult(statusCode, mapper.readValue(responseBody, PaymentIntentResponse::class.java))
+      } catch (e: Exception) {
+        throw MeridianError.DecodingError("Failed to parse payment intent response: ${e.message}", e)
+      }
+    } finally {
+      connection.disconnect()
+    }
+  }
 }

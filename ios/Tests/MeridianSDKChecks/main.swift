@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,13 +341,307 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    // Summary
+    let intent = IntentCheckBox()
+    await runPaymentIntentChecks(intent)
+    passed += intent.passed
+    failed += intent.failed
+
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
+  }
+}
+
+final class IntentCheckBox: @unchecked Sendable {
+  var passed = 0
+  var failed = 0
+  func pass(_ name: String) {
+    passed += 1
+    print("  ✓ \(name)")
+  }
+  func fail(_ name: String, _ detail: String) {
+    failed += 1
+    print("  ✗ \(name): \(detail)")
+  }
+}
+
+private let goldenIntentBody =
+  "{\"amountMinor\":2599,\"bank\":\"Adyen\",\"consentAccepted\":true,\"consentSummary\":\"I authorise Meridian to submit this GBP payment to the named recipient. This rehearsal does not move real money or contact Adyen or Worldpay.\",\"currency\":\"GBP\",\"feeMinor\":39,\"localReference\":\"INV-1042\",\"method\":\"card\",\"provider\":\"adyen\",\"quoteExpiresAt\":\"2026-09-18T12:01:00Z\",\"quoteId\":\"quote-fixed\",\"recipientId\":\"northline-studio\",\"recipientName\":\"Northline Studio\"}"
+
+private func goldenAttempt() throws -> PaymentIntentAttempt {
+  try preparePaymentIntent(
+    recipientId: "northline-studio",
+    recipientName: "Northline Studio",
+    recipientDetail: "Design tools & materials",
+    amountInput: "25.99",
+    localReference: "INV-1042",
+    method: .card,
+    idempotencyKey: "11111111-1111-4111-8111-111111111111",
+    quoteId: "quote-fixed",
+    quoteExpiresAt: "2026-09-18T12:01:00Z"
+  )
+}
+
+private func intentResponse(
+  ok: Bool,
+  status: String,
+  intentId: String,
+  code: String? = nil,
+  error: String? = nil
+) -> PaymentIntentResponse {
+  PaymentIntentResponse(
+    ok: ok,
+    status: status,
+    intentId: intentId,
+    state: nil,
+    transaction: nil,
+    error: error,
+    code: code
+  )
+}
+
+private func runPaymentIntentChecks(_ box: IntentCheckBox) async {
+  print("21. payload hash and review fields...")
+  do {
+    let attempt = try goldenAttempt()
+    if attempt.canonicalBody == goldenIntentBody
+      && attempt.payloadHash == "c04ec489e9f4ddb99b509f0e493f2f5cd278b93935d65af809d29d28b4a14ef0"
+      && attempt.review.recipientName == "Northline Studio"
+      && attempt.review.amountLabel == "£25.99"
+      && attempt.review.feeLabel == "£0.39"
+      && attempt.review.methodLabel == "Debit card"
+      && attempt.review.bank == "Adyen"
+      && attempt.review.expiryLabel == "18 Sep 2026, 12:01 UTC"
+      && attempt.review.consentSummary == paymentConsentSummary
+      && SHA256.hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      && SHA256.hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    {
+      box.pass("canonical payload, hash, and localized review")
+    } else {
+      box.fail("canonical payload", attempt.canonicalBody)
+    }
+  } catch {
+    box.fail("canonical payload", String(describing: error))
+  }
+
+  print("22. unique key and hash per attempt...")
+  do {
+    let first = try preparePaymentIntent(
+      recipientId: "northline-studio", recipientName: "Northline Studio", recipientDetail: "",
+      amountInput: "10", localReference: "REF-1", method: .card, quoteId: "quote-one",
+      quoteExpiresAt: "2026-09-18T12:01:00Z"
+    )
+    let second = try preparePaymentIntent(
+      recipientId: "northline-studio", recipientName: "Northline Studio", recipientDetail: "",
+      amountInput: "10", localReference: "REF-1", method: .card, quoteId: "quote-two",
+      quoteExpiresAt: "2026-09-18T12:01:00Z"
+    )
+    let uuid = #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-4[0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"#
+    if first.idempotencyKey != second.idempotencyKey
+      && first.payloadHash != second.payloadHash
+      && first.idempotencyKey.range(of: uuid, options: .regularExpression) != nil
+      && second.idempotencyKey.range(of: uuid, options: .regularExpression) != nil
+    {
+      box.pass("distinct idempotency keys and payload hashes")
+    } else {
+      box.fail("distinct attempts", "\(first.idempotencyKey) \(second.idempotencyKey)")
+    }
+  } catch {
+    box.fail("distinct attempts", String(describing: error))
+  }
+
+  print("23. local reference and amount validation...")
+  let rejected = ["", "   ", String(repeating: "a", count: 201), "line\nbreak"]
+  var validationOK = true
+  for sample in rejected {
+    do {
+      _ = try preparePaymentIntent(
+        recipientId: "northline-studio", recipientName: "Northline Studio", recipientDetail: "",
+        amountInput: "10", localReference: sample, method: .bank
+      )
+      validationOK = false
+    } catch is MeridianError {
+      continue
+    } catch {
+      validationOK = false
+    }
+  }
+  do {
+    _ = try preparePaymentIntent(
+      recipientId: "northline-studio", recipientName: "Northline Studio", recipientDetail: "",
+      amountInput: "10.501", localReference: "REF-1", method: .card
+    )
+    validationOK = false
+  } catch is MeridianError {
+  } catch { validationOK = false }
+  let bank = try? preparePaymentIntent(
+    recipientId: "northline-studio", recipientName: "Cafe\u{0301}", recipientDetail: "Cafe",
+    amountInput: "8", localReference: "  REF-8  ", method: .bank,
+    idempotencyKey: "bank-key", quoteId: "quote-bank", quoteExpiresAt: "2026-09-18T12:02:00Z"
+  )
+  if validationOK && bank?.review.bank == "Worldpay" && bank?.review.feeMinor == 0
+    && bank?.review.localReference == "REF-8" && bank?.review.recipientName == "Caf\u{00e9}"
+    && resolvePaymentIntentsURL("http://10.0.2.2:8080/api/v1/") == "http://10.0.2.2:8080/api/v2/payment-intents"
+  {
+    box.pass("reference, amount, bank rail, and v2 URL")
+  } else {
+    box.fail("validation", "ok=\(validationOK) bank=\(bank?.review.bank ?? "nil")")
+  }
+
+  print("24. classify success, decline, and action required...")
+  let success = classifyPaymentIntent(statusCode: 200, ok: true, status: "succeeded", code: nil)
+  let declined = classifyPaymentIntent(statusCode: 422, ok: false, status: "declined", code: "DECLINED")
+  let action = classifyPaymentIntent(statusCode: 202, ok: false, status: "action-required", code: "ACTION_REQUIRED")
+  let retry = classifyPaymentIntent(statusCode: 503, ok: false, status: nil, code: "UNAVAILABLE")
+  if success == .succeeded && declined == .declined && action == .actionRequired && retry == .retrySameIntent {
+    box.pass("intent dispositions")
+  } else {
+    box.fail("intent dispositions", "\(success) \(declined) \(action) \(retry)")
+  }
+
+  print("25. rapid tap and terminal responses do not recreate the intent...")
+  do {
+    let attempt = try goldenAttempt()
+    let hits = IntentHitCounter()
+    let now = Date(timeIntervalSince1970: 0)
+    async let first: PaymentIntentSubmission = attempt.submit(now: now, consentAccepted: true) { _, key, hash in
+      await hits.record(key: key, hash: hash)
+      try await Task.sleep(nanoseconds: 150_000_000)
+      return (200, intentResponse(ok: true, status: "succeeded", intentId: "pi_ok"))
+    }
+    var inFlight = false
+    for _ in 0..<50 {
+      if await hits.count > 0 {
+        inFlight = true
+        break
+      }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    if !inFlight { box.fail("duplicate tap", "first submit did not start"); return }
+    do {
+      _ = try await attempt.submit(now: now, consentAccepted: true) { _, key, hash in
+        await hits.record(key: key, hash: hash)
+        return (200, intentResponse(ok: true, status: "succeeded", intentId: "pi_new"))
+      }
+      box.fail("duplicate tap", "second submit was accepted")
+    } catch MeridianError.duplicateSubmission {
+      let submission = try await first
+      let repeated = try await attempt.submit(now: Date(), consentAccepted: true) { _, key, hash in
+        await hits.record(key: key, hash: hash)
+        return (200, intentResponse(ok: true, status: "succeeded", intentId: "pi_new"))
+      }
+      let count = await hits.count
+      if submission.intentId == "pi_ok" && repeated.intentId == "pi_ok" && count == 1
+        && submission.message.contains("not submitted again")
+      {
+        box.pass("duplicate tap reuses the succeeded intent")
+      } else {
+        box.fail("duplicate tap", "id=\(repeated.intentId ?? "nil") hits=\(count)")
+      }
+    }
+  } catch {
+    box.fail("duplicate tap", String(describing: error))
+  }
+
+  print("26. decline and action required stay on the same intent...")
+  do {
+    let declinedAttempt = try goldenAttempt()
+    let actionAttempt = try goldenAttempt()
+    let declinedHits = IntentHitCounter()
+    let actionHits = IntentHitCounter()
+    let now = Date(timeIntervalSince1970: 0)
+    let declinedResult = try await declinedAttempt.submit(now: now, consentAccepted: true) { _, _, _ in
+      await declinedHits.record(key: "d", hash: "d")
+      return (422, intentResponse(ok: false, status: "declined", intentId: "pi_decline", code: "DECLINED", error: "The payment was declined"))
+    }
+    let declinedAgain = try await declinedAttempt.submit(now: now, consentAccepted: true) { _, _, _ in
+      await declinedHits.record(key: "d2", hash: "d2")
+      return (422, intentResponse(ok: false, status: "declined", intentId: "pi_other"))
+    }
+    let actionResult = try await actionAttempt.submit(now: now, consentAccepted: true) { _, _, _ in
+      await actionHits.record(key: "a", hash: "a")
+      return (202, intentResponse(ok: false, status: "action_required", intentId: "pi_action", code: "ACTION_REQUIRED", error: "Additional customer action is required"))
+    }
+    let actionAgain = try await actionAttempt.submit(now: now, consentAccepted: true) { _, _, _ in
+      await actionHits.record(key: "a2", hash: "a2")
+      return (200, intentResponse(ok: true, status: "succeeded", intentId: "pi_other"))
+    }
+    let declinedCount = await declinedHits.count
+    let actionCount = await actionHits.count
+    if declinedResult.disposition == .declined && declinedAgain.intentId == "pi_decline"
+      && declinedCount == 1 && declinedResult.message.contains("stays closed")
+      && actionResult.disposition == .actionRequired && actionAgain.intentId == "pi_action"
+      && actionCount == 1 && actionResult.message.contains("not recreated")
+    {
+      box.pass("decline and action required do not recreate intents")
+    } else {
+      box.fail("terminal outcomes", "decline=\(declinedAgain.intentId ?? "nil") action=\(actionAgain.intentId ?? "nil")")
+    }
+  } catch {
+    box.fail("terminal outcomes", String(describing: error))
+  }
+
+  print("27. uncertain failure retries the same key without switching rail...")
+  do {
+    let attempt = try preparePaymentIntent(
+      recipientId: "northline-studio", recipientName: "Northline Studio", recipientDetail: "",
+      amountInput: "12", localReference: "REF-12", method: .bank,
+      idempotencyKey: "bank-retry-key", quoteId: "quote-bank-retry",
+      quoteExpiresAt: "2026-09-18T12:05:00Z"
+    )
+    let hits = IntentHitCounter()
+    let now = Date(timeIntervalSince1970: 0)
+    do {
+      _ = try await attempt.submit(now: now, consentAccepted: false) { _, _, _ in
+        await hits.record(key: "no", hash: "no")
+        return (200, intentResponse(ok: true, status: "succeeded", intentId: "no"))
+      }
+      box.fail("consent", "submitted without consent")
+    } catch MeridianError.validationError {
+      let expiredNow = Date(timeIntervalSince1970: 1_893_456_000)
+      do {
+        _ = try await attempt.submit(now: expiredNow, consentAccepted: true) { _, _, _ in
+          await hits.record(key: "expired", hash: "expired")
+          return (200, intentResponse(ok: true, status: "succeeded", intentId: "expired"))
+        }
+        box.fail("expiry", "submitted an expired quote")
+      } catch MeridianError.quoteExpired {
+        do {
+          _ = try await attempt.submit(now: now, consentAccepted: true) { _, key, hash in
+            await hits.record(key: key, hash: hash)
+            throw MeridianError.httpError(statusCode: 504, message: "gateway timeout")
+          }
+        } catch is MeridianError {}
+        let retried = try await attempt.submit(now: expiredNow, consentAccepted: true) { body, key, hash in
+          await hits.record(key: key, hash: hash)
+          if !body.contains("\"provider\":\"worldpay\"") || !body.contains("\"method\":\"bank\"") {
+            throw MeridianError.validationError("rail changed")
+          }
+          return (200, intentResponse(ok: true, status: "succeeded", intentId: "pi_bank"))
+        }
+        let count = await hits.count
+        if retried.intentId == "pi_bank" && retried.idempotencyKey == "bank-retry-key" && count == 2 {
+          box.pass("uncertain retry keeps the Worldpay bank intent")
+        } else {
+          box.fail("uncertain retry", "hits=\(count) id=\(retried.intentId ?? "nil")")
+        }
+      }
+    }
+  } catch {
+    box.fail("uncertain retry", String(describing: error))
+  }
+}
+
+private actor IntentHitCounter {
+  var count = 0
+  func record(key: String, hash: String) {
+    count += 1
+    _ = key
+    _ = hash
   }
 }

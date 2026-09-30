@@ -2,9 +2,14 @@ package com.atlassian.meridian
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.Date
+import java.util.concurrent.atomic.AtomicInteger
 
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
@@ -370,6 +375,208 @@ class MeridianSDKTest {
 
       // Verify only one idempotency key was used
       assertEquals(1, seenKeys.size)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  private val goldenIntentBody =
+    """{"amountMinor":2599,"bank":"Adyen","consentAccepted":true,"consentSummary":"I authorise Meridian to submit this GBP payment to the named recipient. This rehearsal does not move real money or contact Adyen or Worldpay.","currency":"GBP","feeMinor":39,"localReference":"INV-1042","method":"card","provider":"adyen","quoteExpiresAt":"2026-09-18T12:01:00Z","quoteId":"quote-fixed","recipientId":"northline-studio","recipientName":"Northline Studio"}"""
+
+  private fun goldenAttempt() = preparePaymentIntent(
+    recipientId = "northline-studio",
+    recipientName = "Northline Studio",
+    recipientDetail = "Design tools & materials",
+    amountInput = "25.99",
+    localReference = "INV-1042",
+    method = PaymentMethod.card,
+    idempotencyKey = "11111111-1111-4111-8111-111111111111",
+    quoteId = "quote-fixed",
+    quoteExpiresAt = "2026-09-18T12:01:00Z",
+  )
+
+  @Test
+  fun testPaymentIntentReviewHashAndValidation() {
+    val attempt = goldenAttempt()
+    assertEquals(goldenIntentBody, attempt.canonicalBody)
+    assertEquals("c04ec489e9f4ddb99b509f0e493f2f5cd278b93935d65af809d29d28b4a14ef0", attempt.payloadHash)
+    assertEquals(sha256Hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assertEquals("Northline Studio", attempt.review.recipientName)
+    assertEquals("£25.99", attempt.review.amountLabel)
+    assertEquals("£0.39", attempt.review.feeLabel)
+    assertEquals("Debit card", attempt.review.methodLabel)
+    assertEquals("Adyen", attempt.review.bank)
+    assertEquals("18 Sep 2026, 12:01 UTC", attempt.review.expiryLabel)
+    assertEquals(paymentConsentSummary, attempt.review.consentSummary)
+
+    val first = preparePaymentIntent("northline-studio", "Northline Studio", "", "10", "REF-1", PaymentMethod.card, quoteId = "quote-one", quoteExpiresAt = "2026-09-18T12:01:00Z")
+    val second = preparePaymentIntent("northline-studio", "Northline Studio", "", "10", "REF-1", PaymentMethod.card, quoteId = "quote-two", quoteExpiresAt = "2026-09-18T12:01:00Z")
+    assertNotEquals(first.idempotencyKey, second.idempotencyKey)
+    assertNotEquals(first.payloadHash, second.payloadHash)
+    assertTrue(first.idempotencyKey.matches(Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")))
+
+    assertThrows(MeridianError.ValidationError::class.java) {
+      preparePaymentIntent("northline-studio", "Northline Studio", "", "10", "  ", PaymentMethod.card)
+    }
+    assertThrows(MeridianError.ValidationError::class.java) {
+      preparePaymentIntent("northline-studio", "Northline Studio", "", "10.501", "REF-1", PaymentMethod.card)
+    }
+    val bank = preparePaymentIntent("northline-studio", "Cafe\u0301", "Cafe", "8", "  REF-8  ", PaymentMethod.bank, idempotencyKey = "bank-key", quoteId = "quote-bank", quoteExpiresAt = "2026-09-18T12:02:00Z")
+    assertEquals("Worldpay", bank.review.bank)
+    assertEquals(0, bank.review.feeMinor)
+    assertEquals("REF-8", bank.review.localReference)
+    assertEquals("Café", bank.review.recipientName)
+    assertEquals("http://10.0.2.2:8080/api/v2/payment-intents", resolvePaymentIntentsUrl("http://10.0.2.2:8080/api/v1/"))
+  }
+
+  @Test
+  fun testPaymentIntentDoesNotRecreateTerminalOrInFlightAttempts() = runBlocking {
+    val attempt = goldenAttempt()
+    val hits = AtomicInteger()
+    val started = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val now = Date(0)
+    val first = async(Dispatchers.Default) {
+      attempt.submit(now, true) { _, _, _ ->
+        hits.incrementAndGet()
+        started.complete(Unit)
+        release.await()
+        PaymentIntentHttpResult(200, PaymentIntentResponse(ok = true, status = "succeeded", intentId = "pi_ok"))
+      }
+    }
+    started.await()
+    val duplicate = runCatching {
+      attempt.submit(now, true) { _, _, _ ->
+        hits.incrementAndGet()
+        PaymentIntentHttpResult(200, PaymentIntentResponse(ok = true, status = "succeeded", intentId = "pi_new"))
+      }
+    }
+    assertTrue(duplicate.exceptionOrNull() is MeridianError.DuplicateSubmission)
+    release.complete(Unit)
+    assertEquals("pi_ok", first.await().intentId)
+    val again = attempt.submit(Date(), true) { _, _, _ ->
+      hits.incrementAndGet()
+      PaymentIntentHttpResult(200, PaymentIntentResponse(ok = true, status = "succeeded", intentId = "pi_new"))
+    }
+    assertEquals("pi_ok", again.intentId)
+    assertEquals(1, hits.get())
+    assertTrue(again.message.contains("not submitted again"))
+
+    val declined = goldenAttempt().submit(now, true) { _, _, _ ->
+      PaymentIntentHttpResult(
+        422,
+        PaymentIntentResponse(ok = false, status = "declined", intentId = "pi_decline", error = "The payment was declined", code = "DECLINED"),
+      )
+    }
+    val declinedAgain = goldenAttempt()
+    val declinedHits = AtomicInteger()
+    val declinedFirst = declinedAgain.submit(now, true) { _, _, _ ->
+      declinedHits.incrementAndGet()
+      PaymentIntentResponse(ok = false, status = "declined", intentId = "pi_decline", error = "The payment was declined", code = "DECLINED").let {
+        PaymentIntentHttpResult(422, it)
+      }
+    }
+    val declinedRepeat = declinedAgain.submit(now, true) { _, _, _ ->
+      declinedHits.incrementAndGet()
+      PaymentIntentHttpResult(200, PaymentIntentResponse(ok = true, status = "succeeded", intentId = "pi_other"))
+    }
+    assertEquals(IntentDisposition.declined, declined.disposition)
+    assertEquals("pi_decline", declinedFirst.intentId)
+    assertEquals("pi_decline", declinedRepeat.intentId)
+    assertEquals(1, declinedHits.get())
+    assertTrue(declinedFirst.message.contains("stays closed"))
+
+    val actionAttempt = goldenAttempt()
+    val actionHits = AtomicInteger()
+    val action = actionAttempt.submit(now, true) { _, _, _ ->
+      actionHits.incrementAndGet()
+      PaymentIntentHttpResult(
+        202,
+        PaymentIntentResponse(ok = false, status = "action_required", intentId = "pi_action", error = "Additional customer action is required", code = "ACTION_REQUIRED"),
+      )
+    }
+    val actionRepeat = actionAttempt.submit(now, true) { _, _, _ ->
+      actionHits.incrementAndGet()
+      PaymentIntentHttpResult(200, PaymentIntentResponse(ok = true, status = "succeeded", intentId = "pi_other"))
+    }
+    assertEquals(IntentDisposition.actionRequired, action.disposition)
+    assertEquals("pi_action", actionRepeat.intentId)
+    assertEquals(1, actionHits.get())
+    assertTrue(action.message.contains("not recreated"))
+  }
+
+  @Test
+  fun testUncertainIntentRetryKeepsKeyAndBank() = runBlocking {
+    val attempt = preparePaymentIntent(
+      "northline-studio", "Northline Studio", "", "12", "REF-12", PaymentMethod.bank,
+      idempotencyKey = "bank-retry-key", quoteId = "quote-bank-retry", quoteExpiresAt = "2026-09-18T12:05:00Z",
+    )
+    val hits = AtomicInteger()
+    val now = Date(0)
+    val consent = runCatching { attempt.submit(now, false) { _, _, _ -> error("should not send") } }
+    assertTrue(consent.exceptionOrNull() is MeridianError.ValidationError)
+    val expired = runCatching {
+      attempt.submit(Date(1_893_456_000_000), true) { _, _, _ -> error("should not send") }
+    }
+    assertTrue(expired.exceptionOrNull() is MeridianError.QuoteExpired)
+    val failed = runCatching {
+      attempt.submit(now, true) { _, key, hash ->
+        hits.incrementAndGet()
+        assertEquals("bank-retry-key", key)
+        assertEquals(sha256Hex(attempt.canonicalBody), hash)
+        throw MeridianError.HttpError(504, "gateway timeout")
+      }
+    }
+    assertTrue(failed.exceptionOrNull() is MeridianError.HttpError)
+    val retried = attempt.submit(Date(1_893_456_000_000), true) { body, key, hash ->
+      hits.incrementAndGet()
+      assertEquals("bank-retry-key", key)
+      assertEquals(attempt.payloadHash, hash)
+      assertTrue(body.contains("\"provider\":\"worldpay\""))
+      assertTrue(body.contains("\"method\":\"bank\""))
+      PaymentIntentHttpResult(200, PaymentIntentResponse(ok = true, status = "succeeded", intentId = "pi_bank"))
+    }
+    assertEquals(2, hits.get())
+    assertEquals("pi_bank", retried.intentId)
+  }
+
+  @Test
+  fun testPaymentIntentHttpTransport() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    val hits = AtomicInteger()
+    server.createContext("/api/v2/payment-intents") { exchange ->
+      hits.incrementAndGet()
+      val session = exchange.requestHeaders.getFirst("X-Rehearsal-Session")
+      val key = exchange.requestHeaders.getFirst("Idempotency-Key")
+      val hash = exchange.requestHeaders.getFirst("X-Payload-Hash")
+      val body = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
+      assertEquals("POST", exchange.requestMethod)
+      assertEquals("intent-room", session)
+      assertEquals("11111111-1111-4111-8111-111111111111", key)
+      assertEquals(sha256Hex(body), hash)
+      assertEquals(goldenIntentBody, body)
+      val payload = """{"ok":true,"status":"succeeded","intent_id":"pi_http"}"""
+      val bytes = payload.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient("http://127.0.0.1:$port/api/v1", "intent-room")
+      val attempt = goldenAttempt()
+      val submission = runBlocking {
+        attempt.submit(Date(0), true) { body, key, hash -> client.submitPaymentIntent(body, key, hash) }
+      }
+      val repeated = runBlocking {
+        attempt.submit(Date(), true) { body, key, hash -> client.submitPaymentIntent(body, key, hash) }
+      }
+      assertEquals("pi_http", submission.intentId)
+      assertEquals("pi_http", repeated.intentId)
+      assertEquals(IntentDisposition.succeeded, submission.disposition)
+      assertEquals(1, hits.get())
     } finally {
       server.stop(0)
     }

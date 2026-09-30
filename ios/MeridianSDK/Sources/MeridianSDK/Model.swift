@@ -246,6 +246,8 @@ public enum MeridianError: LocalizedError {
   case missingSession
   case invalidAmount(String)
   case validationError(String)
+  case duplicateSubmission
+  case quoteExpired
 
   public var errorDescription: String? {
     switch self {
@@ -263,6 +265,10 @@ public enum MeridianError: LocalizedError {
       return "Invalid amount: \(msg)"
     case let .validationError(msg):
       return "Validation error: \(msg)"
+    case .duplicateSubmission:
+      return "Payment is already being submitted."
+    case .quoteExpired:
+      return "Quote expired. Refresh the quote before confirming."
     }
   }
 }

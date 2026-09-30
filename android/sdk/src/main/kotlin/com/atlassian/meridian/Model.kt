@@ -150,6 +150,8 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
   class ValidationError(msg: String) : MeridianError(msg)
+  class DuplicateSubmission(msg: String = "Payment is already being submitted.") : MeridianError(msg)
+  class QuoteExpired(msg: String = "Quote expired. Refresh the quote before confirming.") : MeridianError(msg)
 }
 
 // MARK: - Amount Formatting
