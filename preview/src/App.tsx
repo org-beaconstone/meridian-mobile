@@ -25,14 +25,39 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  applying,
+  baselineProvider,
+  fetchPaymentIntent,
+  loadSnapshot,
+  makeReceipt,
+  phaseFromPaymentResult,
+  pollPaymentIntent,
+  providerLabel,
+  recoveryAction,
+  recoveryFeedback,
+  removeSnapshot,
+  saveSnapshot,
+  type IntentSnapshot,
+  type ReceiptTransaction,
+} from './domain/paymentStatus';
 class RequestError extends Error {
   constructor(
     message: string,
     public code: string,
+    public payload?: PaymentResult,
   ) {
     super(message);
   }
 }
+type PaymentResult = {
+  ok?: boolean;
+  code?: string | null;
+  error?: string | null;
+  paymentId?: string | null;
+  transaction?: ReceiptTransaction | null;
+  state?: State;
+};
 async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
   let response: Response;
   try {
@@ -54,7 +79,11 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
   }
   const data = await response.json();
   if (!response.ok)
-    throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
+    throw new RequestError(
+      data.error || `HTTP ${response.status}`,
+      data.code || 'HTTP_ERROR',
+      data,
+    );
   return data;
 }
 function bankState(value: unknown): State {
@@ -84,16 +113,17 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
-  const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
+  const [step, setStep] = useState<'details' | 'review' | 'checking' | 'declined' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
-  const [receipt, setReceipt] = useState<Transaction | null>(null);
+  const [handoff, setHandoff] = useState<IntentSnapshot | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef<string>(crypto.randomUUID()),
+    pollGeneration = useRef(0);
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -135,6 +165,63 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
+  useEffect(() => {
+    const saved = loadSnapshot(room);
+    if (!saved) return;
+    let cancelled = false;
+    const token = ++pollGeneration.current;
+    setHandoff(saved);
+    paymentKey.current = saved.idempotencyKey;
+    const action = recoveryAction(saved);
+    if (action.kind === 'showReceipt') {
+      setStep('done');
+      setPage('Pay');
+      setError('');
+      return;
+    }
+    if (action.kind === 'showDecline') {
+      setStep('declined');
+      setPage('Pay');
+      setError(recoveryFeedback('declined'));
+      return;
+    }
+    if (action.kind === 'holdUnknown') {
+      setStep('checking');
+      setPage('Pay');
+      setError(recoveryFeedback('unknown'));
+      return;
+    }
+    setStep('checking');
+    setPage('Pay');
+    setError('');
+    setBusy(true);
+    void (async () => {
+      const result = await pollPaymentIntent({
+        intentId: action.intentId,
+        fetchIntent: (id) => fetchPaymentIntent(room, id),
+      });
+      if (cancelled || token !== pollGeneration.current) return;
+      const next = applying(result, saved);
+      saveSnapshot(next);
+      setHandoff(next);
+      if (result.phase === 'succeeded') {
+        setStep('done');
+        setError('');
+        paymentKey.current = crypto.randomUUID();
+      } else if (result.phase === 'declined') {
+        setStep('declined');
+        setError(recoveryFeedback('declined'));
+      } else {
+        setStep('checking');
+        setError(recoveryFeedback(result.phase));
+      }
+      setBusy(false);
+    })();
+    return () => {
+      cancelled = true;
+      pollGeneration.current += 1;
+    };
+  }, [room]);
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
@@ -154,11 +241,21 @@ export default function App() {
     }
   }
   function freshPayment() {
+    const saved = loadSnapshot(room);
+    const action = saved ? recoveryAction(saved) : null;
+    if (saved && (action?.kind === 'poll' || action?.kind === 'holdUnknown')) {
+      setHandoff(saved);
+      setPage('Pay');
+      setStep('checking');
+      setError(recoveryFeedback(saved.phase === 'succeeded' ? 'unknown' : saved.phase));
+      return;
+    }
+    removeSnapshot(room);
+    setHandoff(null);
     setStep('details');
     setAmount('');
     setNote('');
     setError('');
-    setReceipt(null);
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
@@ -180,24 +277,120 @@ export default function App() {
     setError('');
     setStep('review');
   }
+  function remember(snapshot: IntentSnapshot) {
+    saveSnapshot(snapshot);
+    setHandoff(snapshot);
+  }
+  function snapshotFrom(
+    result: PaymentResult,
+    amountMinor: number,
+    recipientName: string,
+    phase = phaseFromPaymentResult(result),
+  ): IntentSnapshot {
+    const tx = result.transaction ?? null;
+    return {
+      intentId: result.paymentId ?? null,
+      sessionId: room,
+      baseURL: '',
+      idempotencyKey: paymentKey.current,
+      recipientId: recipient,
+      recipientName: tx?.name || recipientName,
+      amountMinor: tx?.amount ?? amountMinor,
+      method,
+      note,
+      phase,
+      supportReference: tx?.reference ?? null,
+      transaction: tx,
+      provider: tx?.provider || baselineProvider(method),
+      detail: result.error ?? null,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  async function follow(snapshot: IntentSnapshot) {
+    if (!snapshot.intentId) {
+      setStep('checking');
+      setError(recoveryFeedback('unknown'));
+      return;
+    }
+    const token = ++pollGeneration.current;
+    setStep('checking');
+    setBusy(true);
+    setError('');
+    try {
+      const result = await pollPaymentIntent({
+        intentId: snapshot.intentId,
+        fetchIntent: (id) => fetchPaymentIntent(snapshot.sessionId, id),
+      });
+      if (token !== pollGeneration.current) return;
+      const next = applying(result, snapshot);
+      remember(next);
+      if (result.phase === 'succeeded') {
+        setStep('done');
+        setError('');
+        paymentKey.current = crypto.randomUUID();
+      } else if (result.phase === 'declined') {
+        setStep('declined');
+        setError(recoveryFeedback('declined'));
+      } else {
+        setStep('checking');
+        setError(recoveryFeedback(result.phase));
+      }
+    } finally {
+      if (token === pollGeneration.current) setBusy(false);
+    }
+  }
+  function acceptPaymentResult(result: PaymentResult, amountMinor: number, recipientName: string) {
+    const snapshot = snapshotFrom(result, amountMinor, recipientName);
+    remember(snapshot);
+    if (snapshot.phase === 'succeeded') {
+      setStep('done');
+      setError('');
+      paymentKey.current = crypto.randomUUID();
+      return;
+    }
+    if (snapshot.phase === 'declined') {
+      setStep('declined');
+      setError(recoveryFeedback('declined'));
+      return;
+    }
+    void follow(snapshot);
+  }
   async function confirm() {
+    const value = pence(amount);
+    if (value === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    const blocked = handoff ? recoveryAction(handoff) : null;
+    if (blocked?.kind === 'poll' || blocked?.kind === 'showDecline') return;
+    const recipientName = recipients.find((item) => item.id === recipient)?.name ?? recipient;
     try {
       setError('');
       const result = await mutate(
         '/payments',
         'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
+        { recipientId: recipient, amountMinor: value, method, note, scenario },
         paymentKey.current,
       );
-      if (result.ok) {
-        setReceipt(result.transaction);
-        setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      acceptPaymentResult(result, value, recipientName);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Payment failed');
+      if (e instanceof RequestError && e.payload) {
+        acceptPaymentResult(e.payload, value, recipientName);
+        return;
+      }
+      const snapshot = snapshotFrom(
+        { ok: false, code: 'UNKNOWN', error: e instanceof Error ? e.message : 'Payment failed' },
+        value,
+        recipientName,
+        'unknown',
+      );
+      remember(snapshot);
+      setStep('checking');
+      setError(recoveryFeedback('unknown'));
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const succeededReceipt = handoff?.phase === 'succeeded' ? makeReceipt(handoff) : null;
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -298,8 +491,20 @@ export default function App() {
               )}
               {page === 'Pay' && (
                 <section className="mobile-card">
-                  <h1>{step === 'done' ? 'Taken care of.' : 'Make a payment'}</h1>
-                  <p>Fictional money. Shared rehearsal account.</p>
+                  <h1>
+                    {step === 'done'
+                      ? 'Taken care of.'
+                      : step === 'declined'
+                        ? 'Payment declined'
+                        : step === 'checking'
+                          ? 'Checking status'
+                          : 'Make a payment'}
+                  </h1>
+                  <p>
+                    {step === 'checking'
+                      ? 'Browser companion rehearsal. Status is read from the Java API and does not start another payment.'
+                      : 'Fictional money. Shared rehearsal account.'}
+                  </p>
                   {step === 'details' && (
                     <form
                       onSubmit={(e) => {
@@ -381,14 +586,86 @@ export default function App() {
                       </button>
                     </>
                   )}
-                  {step === 'done' && receipt && (
-                    <div className="mobile-success">
+                  {step === 'checking' && (
+                    <div data-testid="status-checking">
+                      <p>{error || recoveryFeedback(handoff?.phase === 'pending' ? 'pending' : 'processing')}</p>
+                      {handoff?.intentId ? (
+                        <button
+                          className="secondary"
+                          disabled={busy}
+                          onClick={() => {
+                            if (handoff) void follow(handoff);
+                          }}
+                        >
+                          Check status again
+                        </button>
+                      ) : (
+                        <button className="primary" disabled={busy || !connected} onClick={confirm}>
+                          Retry this payment
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {step === 'declined' && (
+                    <div className="decline-panel" data-testid="payment-declined">
+                      <h2>Payment declined</h2>
+                      <p>{recoveryFeedback('declined')}</p>
+                      <button className="secondary" onClick={freshPayment}>
+                        New payment
+                      </button>
+                    </div>
+                  )}
+                  {step === 'done' && succeededReceipt && (
+                    <div className="mobile-success" data-testid="payment-receipt">
                       <span>✓</span>
-                      <h2>Demo payment complete</h2>
+                      <h2>Payment complete</h2>
                       <p>
-                        {money(receipt.amount)} to {receipt.name}
+                        {money(succeededReceipt.amountMinor)} to {succeededReceipt.recipientName}
                       </p>
-                      <code>{receipt.reference}</code>
+                      <div className="receipt-details">
+                        <div>
+                          <span>Recipient</span>
+                          <strong>{succeededReceipt.recipientName}</strong>
+                        </div>
+                        <div>
+                          <span>Amount</span>
+                          <strong>{money(succeededReceipt.amountMinor)}</strong>
+                        </div>
+                        <div>
+                          <span>Support reference</span>
+                          <strong data-testid="support-reference">
+                            {succeededReceipt.supportReference}
+                          </strong>
+                        </div>
+                        {succeededReceipt.transactionId && (
+                          <div>
+                            <span>Transaction</span>
+                            <strong>{succeededReceipt.transactionId}</strong>
+                          </div>
+                        )}
+                        {succeededReceipt.transactionDate && (
+                          <div>
+                            <span>Date</span>
+                            <strong>{succeededReceipt.transactionDate}</strong>
+                          </div>
+                        )}
+                        <div>
+                          <span>Method</span>
+                          <strong>
+                            {succeededReceipt.method === 'bank' ? 'Bank payment' : 'Debit card'}
+                          </strong>
+                        </div>
+                        <div>
+                          <span>Provider</span>
+                          <strong>{providerLabel(succeededReceipt.provider)}</strong>
+                        </div>
+                        {succeededReceipt.note && (
+                          <div>
+                            <span>Details</span>
+                            <strong>{succeededReceipt.note}</strong>
+                          </div>
+                        )}
+                      </div>
                       <p>Your web view will update automatically.</p>
                       <button className="primary" onClick={() => setPage('Home')}>
                         Back to overview

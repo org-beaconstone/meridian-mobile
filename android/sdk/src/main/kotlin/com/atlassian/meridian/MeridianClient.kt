@@ -35,8 +35,9 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
+    absoluteUrl: String? = null,
   ): T = withContext(Dispatchers.IO) {
-    val fullUrl = "$baseUrlNormalized$path"
+    val fullUrl = absoluteUrl ?: "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
     val connection = url.openConnection() as HttpURLConnection
@@ -190,4 +191,16 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  /**
+   * GET /api/v2/payment-intents/{id}
+   * Authoritative status lookup. This does not create or retry a payment.
+   */
+  suspend fun getPaymentIntent(id: String): PaymentIntent =
+    request(
+      "GET",
+      "/payment-intents/$id",
+      responseType = PaymentIntent::class.java,
+      absoluteUrl = paymentIntentUrl(baseUrlNormalized, id),
+    )
 }
