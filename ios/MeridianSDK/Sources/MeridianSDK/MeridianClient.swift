@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -161,5 +164,25 @@ public actor MeridianClient {
   /// GET /events - Fetch audit events
   public func getEvents() async throws -> EventsResponse {
     return try await request(method: "GET", path: "/events")
+  }
+
+  /// GET /config - Server-driven corridor flags and catalog version.
+  /// A missing route throws; callers keep the last applied flags.
+  public func fetchConfig() async throws -> Data {
+    let url = baseURL.appendingPathComponent("/config")
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
+
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw MeridianError.networkError("Invalid response type")
+    }
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw MeridianError.httpError(statusCode: httpResponse.statusCode, message: errorMsg)
+    }
+    return data
   }
 }

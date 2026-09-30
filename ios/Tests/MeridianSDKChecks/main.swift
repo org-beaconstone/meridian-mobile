@@ -1,6 +1,240 @@
 import Foundation
 @testable import MeridianSDK
 
+enum CorridorChecks {
+  static func run(passed: inout Int, failed: inout Int) {
+  func expect(_ name: String, _ condition: Bool) {
+    if condition {
+      print("  ✓ \(name)")
+      passed += 1
+    } else {
+      print("  ✗ \(name)")
+      failed += 1
+    }
+  }
+
+  let euCatalog = """
+  "catalogVersion": 2,
+  "catalogs": [
+    {"version": 1, "corridors": ["GB"]},
+    {"version": 2, "corridors": ["GB", "EU"]}
+  ]
+  """
+
+  func ids(_ controls: CorridorControls, _ account: String = "acct") -> [String] {
+    controls.visibleMethods(accountId: account).map(\.id)
+  }
+
+  print("21. default rails are Adyen and Worldpay...")
+  let defaults = CorridorControls()
+  expect(
+    "default GB rails",
+    ids(defaults) == ["adyen-card-gb", "worldpay-bank-gb"]
+      && defaults.visibleMethods(accountId: "acct").allSatisfy { $0.provider == .adyen || $0.provider == .worldpay }
+  )
+
+  print("22. flags are independent...")
+  let flags = CorridorControls()
+  let independent = flags.applyServerPayload(
+    Data(
+      """
+      {"flags":{"multi_provider_selection":false,"european_corridor":true},\(euCatalog)}
+      """.utf8
+    )
+  )
+  expect("multi off and EU on", independent && !flags.flags.multiProviderSelection && flags.flags.europeanCorridorEnabled)
+  expect("single provider on both corridors", ids(flags) == ["adyen-card-gb", "adyen-card-eu"])
+  _ = flags.applyServerPayload(
+    Data(
+      """
+      {"flags":{"multi_provider_selection":true,"european_corridor":false}}
+      """.utf8
+    )
+  )
+  expect(
+    "multi on and EU off",
+    flags.flags.multiProviderSelection && !flags.flags.europeanCorridorEnabled
+      && ids(flags) == ["adyen-card-gb", "worldpay-bank-gb"] && flags.activeCatalog.version == 2
+  )
+
+  print("23. dark launch hides Europe and records telemetry...")
+  let dark = CorridorControls()
+  _ = dark.applyServerPayload(
+    Data(
+      """
+      {"flags":{"multi_provider_selection":true,"european_corridor":true,"dark_launch":true},\(euCatalog)}
+      """.utf8
+    )
+  )
+  let resolved = dark.resolve(accountId: "acct")
+  _ = dark.resolve(accountId: "acct")
+  expect(
+    "dark launch telemetry",
+    resolved.allSatisfy { $0.corridor == .gb } && dark.telemetry.count == 1
+      && dark.telemetry[0].europeanMethodsHidden && dark.telemetry[0].corridor == "EU"
+      && dark.telemetry[0].catalogVersion == 2
+  )
+
+  print("24. canary accounts...")
+  let canary = CorridorControls()
+  _ = canary.applyServerPayload(
+    Data(
+      """
+      {"flags":{"european_corridor":true,"multi_provider_selection":true},"controlledAccounts":["controlled-eu"],\(euCatalog)}
+      """.utf8
+    )
+  )
+  expect(
+    "canary sees EU",
+    ids(canary, "controlled-eu").contains("adyen-card-eu") && !ids(canary, "everyone-else").contains("adyen-card-eu")
+  )
+  _ = canary.applyServerPayload(
+    Data(
+      """
+      {"flags":{"european_corridor":true,"dark_launch":true,"multi_provider_selection":true},"canaryAccounts":["controlled-eu"]}
+      """.utf8
+    )
+  )
+  _ = canary.resolve(accountId: "controlled-eu")
+  expect(
+    "dark launch hides the canary",
+    !ids(canary, "controlled-eu").contains("adyen-card-eu") && canary.telemetry.last?.europeanMethodsHidden == true
+  )
+
+  print("25. kill switch preserves status and receipt...")
+  let kill = CorridorControls()
+  let created = kill.createIntent(
+    idempotencyKey: "key-1",
+    accountId: "acct",
+    recipientId: "northline-studio",
+    amountMinor: 2500,
+    note: "Studio",
+    methodId: "adyen-card-gb"
+  )
+  var createdId = ""
+  if case let .success(intent) = created {
+    createdId = intent.id
+    _ = kill.complete(intentId: intent.id, reference: "REF-1")
+  }
+  _ = kill.applyServerPayload(Data(#"{"flags":{"payments_kill_switch":true}}"#.utf8))
+  let blocked = kill.createIntent(
+    idempotencyKey: "key-2",
+    accountId: "acct",
+    recipientId: "northline-studio",
+    amountMinor: 100,
+    methodId: "adyen-card-gb"
+  )
+  let retry = kill.createIntent(
+    idempotencyKey: "key-1",
+    accountId: "acct",
+    recipientId: "other",
+    amountMinor: 1,
+    methodId: "worldpay-bank-gb"
+  )
+  expect(
+    "kill switch",
+    kill.flags.killSwitch && blocked == .failure(.killSwitch) && kill.status(intentId: createdId) == .completed
+      && kill.receipt(intentId: createdId)?.reference == "REF-1"
+  )
+  if case let .success(intent) = retry {
+    expect("retry keeps the original intent", intent.id == createdId && intent.provider == .adyen)
+  } else {
+    expect("retry keeps the original intent", false)
+  }
+
+  print("26. catalog rollback keeps the in-flight snapshot...")
+  let rollback = CorridorControls()
+  _ = rollback.applyServerPayload(
+    Data(
+      """
+      {"flags":{"european_corridor":true,"multi_provider_selection":true},\(euCatalog)}
+      """.utf8
+    )
+  )
+  let euIntent = rollback.createIntent(
+    idempotencyKey: "eu-key",
+    accountId: "acct",
+    recipientId: "northline-studio",
+    amountMinor: 1_000_000,
+    methodId: "worldpay-bank-eu"
+  )
+  var snapshotVersion = 0
+  var intentId = ""
+  if case let .success(intent) = euIntent {
+    snapshotVersion = intent.snapshot.version
+    intentId = intent.id
+  }
+  _ = rollback.applyServerPayload(
+    Data(
+      """
+      {"flags":{"european_corridor":true,"multi_provider_selection":true},"catalogVersion":1}
+      """.utf8
+    )
+  )
+  let stored = rollback.intent(id: intentId)
+  expect(
+    "snapshot survives rollback",
+    snapshotVersion == 2 && rollback.activeCatalog.version == 1
+      && stored?.snapshot.version == 2
+      && stored?.snapshot.methods.contains { $0.id == "worldpay-bank-eu" } == true
+      && !rollback.activeCatalog.methods.contains { $0.id == "worldpay-bank-eu" }
+      && rollback.snapshotRemainsValid(intentId: intentId)
+      && rollback.status(intentId: intentId) == .inFlight
+      && !rollback.rollbackCatalog(to: 99)
+      && rollback.rollbackCatalog(to: 2)
+      && rollback.intent(id: intentId)?.snapshot.version == 2
+  )
+
+  print("27. numeric flags and corrupt payloads...")
+  let parsing = CorridorControls()
+  _ = parsing.applyServerPayload(Data(#"{"flags":{"payments_kill_switch":true}}"#.utf8))
+  let corruptKept = !parsing.applyServerPayload(Data("nope".utf8)) && !parsing.applyServerPayload(Data("[]".utf8))
+    && parsing.flags.killSwitch && parsing.blocksNewIntent(idempotencyKey: "fresh")
+  _ = parsing.applyServerPayload(
+    Data(
+      """
+      {"flags":{"payments_kill_switch":1,"european_corridor":1,"dark_launch":1,"multi_provider_selection":0}}
+      """.utf8
+    )
+  )
+  expect(
+    "numbers do not enable flags",
+    corruptKept && !parsing.flags.killSwitch && !parsing.flags.europeanCorridorEnabled && !parsing.flags.darkLaunch
+      && !parsing.flags.multiProviderSelection && ids(parsing) == ["adyen-card-gb"]
+  )
+  _ = parsing.applyServerPayload(
+    Data(
+      """
+      {"payments_kill_switch":true,"flags":{"payments_kill_switch":false},"dark_launch":"TRUE","european_corridor":"true"}
+      """.utf8
+    )
+  )
+  expect(
+    "nested flag wins and string true enables",
+    !parsing.flags.killSwitch && parsing.flags.darkLaunch && parsing.flags.europeanCorridorEnabled
+  )
+
+  print("28. hidden method and amount...")
+  let rejected = CorridorControls()
+  let hidden = rejected.createIntent(
+    idempotencyKey: "hidden",
+    accountId: "acct",
+    recipientId: "northline-studio",
+    amountMinor: 100,
+    methodId: "adyen-card-eu"
+  )
+  let amount = rejected.createIntent(
+    idempotencyKey: "amount",
+    accountId: "acct",
+    recipientId: "northline-studio",
+    amountMinor: 1_000_001,
+    methodId: "adyen-card-gb"
+  )
+  expect("hidden EU method", hidden == .failure(.methodUnavailable) && rejected.intent(id: "intent-1") == nil)
+  expect("amount range", amount == .failure(.invalidAmount))
+  }
+}
+
 @main
 struct MeridianSDKChecks {
   static func main() {
@@ -341,10 +575,13 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    CorridorChecks.run(passed: &passed, failed: &failed)
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
