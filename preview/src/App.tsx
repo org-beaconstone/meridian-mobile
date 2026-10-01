@@ -25,6 +25,14 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  applySessionAction,
+  presentSession,
+  sessionForPhase,
+  type CustomerSession,
+  type SessionPhase,
+} from './domain/sessionBanner';
+import { SessionBanner } from './SessionBanner';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -79,7 +87,7 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [page, setPage] = useState<'Home' | 'Pay' | 'History' | 'Settings'>('Home');
+  const [page, setPage] = useState<'Home' | 'Pay' | 'History' | 'Account' | 'Settings'>('Home');
   const [recipient, setRecipient] = useState('northline-studio');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
@@ -90,6 +98,10 @@ export default function App() {
   const [receipt, setReceipt] = useState<Transaction | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
+  const [now, setNow] = useState(() => Date.now());
+  const [session, setSession] = useState<CustomerSession>(() =>
+    sessionForPhase('active', Date.now()),
+  );
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
@@ -135,6 +147,31 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  async function onSessionAction(action: Parameters<typeof applySessionAction>[1]) {
+    let apiReachable = false;
+    if (action === 'refresh' || action === 'try-again') {
+      try {
+        await request(room, '/health');
+        apiReachable = true;
+      } catch {
+        apiReachable = false;
+      }
+    }
+    const result = applySessionAction(session, action, Date.now(), apiReachable, {
+      recipientId: recipient,
+      amount,
+      reference: note,
+      method,
+      step,
+      idempotencyKey: paymentKey.current,
+    });
+    setSession(result.session);
+    setNotice(result.announcement);
+  }
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
@@ -198,6 +235,7 @@ export default function App() {
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const banner = presentSession(session, now);
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -236,7 +274,50 @@ export default function App() {
               {notice}
             </p>
           )}
-          {!state ? (
+          {(page === 'Pay' || page === 'Account') && (
+            <SessionBanner model={banner} onAction={(action) => void onSessionAction(action)} />
+          )}
+          {page === 'Account' ? (
+            <section className="mobile-card">
+              <h1>Authentication</h1>
+              <p>Alex Morgan · fictional rehearsal profile.</p>
+              <p>
+                No password is collected and no identity provider is called. Changing session state
+                keeps the payment amount, recipient and reference already entered.
+              </p>
+              {(banner.phase === 'active' ||
+                banner.phase === 'expiring' ||
+                banner.phase === 'active-elsewhere') && (
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setSession({ kind: 'signed-out' });
+                    setNotice('Signed out. Payment details are unchanged.');
+                  }}
+                >
+                  Sign out
+                </button>
+              )}
+              <label htmlFor="session-preview">Preview session state</label>
+              <select
+                id="session-preview"
+                value={banner.phase}
+                onChange={(event) => {
+                  const stamp = Date.now();
+                  setSession(sessionForPhase(event.target.value as SessionPhase, stamp));
+                  setNow(stamp);
+                }}
+              >
+                <option value="active">Active</option>
+                <option value="expiring">Expiring</option>
+                <option value="active-elsewhere">Active elsewhere</option>
+                <option value="signed-out">Signed out</option>
+                <option value="expired">Expired</option>
+                <option value="unknown">Unknown</option>
+              </select>
+            </section>
+          ) : !state ? (
             <section className="mobile-card">
               <h1>Connecting your money.</h1>
               <p>
@@ -512,7 +593,7 @@ export default function App() {
           )}
         </main>
         <nav className="mobile-nav" aria-label="Mobile navigation">
-          {(['Home', 'Pay', 'History', 'Settings'] as const).map((item) => (
+          {(['Home', 'Pay', 'History', 'Account', 'Settings'] as const).map((item) => (
             <button
               key={item}
               aria-current={page === item ? 'page' : undefined}
