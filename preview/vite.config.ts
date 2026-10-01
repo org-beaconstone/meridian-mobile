@@ -14,6 +14,10 @@ export default defineConfig({
         target: MERIDIAN_API_TARGET,
         changeOrigin: true,
       },
+      '/api/v2': {
+        target: MERIDIAN_API_TARGET,
+        changeOrigin: true,
+      },
     },
   },
   build: { outDir: 'dist', sourcemap: false, assetsInlineLimit: 0 },

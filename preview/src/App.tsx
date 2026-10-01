@@ -25,6 +25,13 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  isQuoteExpired,
+  preparePaymentIntent,
+  type PaymentIntentAttempt,
+  type PaymentIntentResponseBody,
+  type PaymentIntentSubmission,
+} from './domain/paymentIntent';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -57,6 +64,57 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
     throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
   return data;
 }
+async function postPaymentIntent(
+  room: string,
+  body: string,
+  key: string,
+  hash: string,
+  scenario: string,
+) {
+  let response: Response;
+  try {
+    response = await fetch('/api/v2/payment-intents', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Rehearsal-Session': room,
+        'Idempotency-Key': key,
+        'X-Payload-Hash': hash,
+        'X-Rehearsal-Scenario': scenario,
+      },
+      body,
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    throw new Error(
+      'Outcome may be unknown. Retry keeps the same idempotency key and payload hash.',
+    );
+  }
+  const text = await response.text();
+  let data: PaymentIntentResponseBody = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as PaymentIntentResponseBody;
+    } catch {
+      throw new Error(
+        `HTTP ${response.status}. Retry keeps the same idempotency key and payload hash.`,
+      );
+    }
+  }
+  const allowed =
+    (response.status >= 200 && response.status < 300) ||
+    response.status === 400 ||
+    response.status === 409 ||
+    response.status === 422 ||
+    response.status === 503;
+  if (!allowed) {
+    throw new Error(
+      data.error ||
+        `HTTP ${response.status}. Retry keeps the same idempotency key and payload hash.`,
+    );
+  }
+  return { statusCode: response.status, body: data };
+}
 function bankState(value: unknown): State {
   const v = value as State;
   if (
@@ -87,13 +145,23 @@ export default function App() {
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
+  const [consent, setConsent] = useState(false);
+  const [intentAttempt, setIntentAttempt] = useState<PaymentIntentAttempt | null>(null);
+  const [intentOutcome, setIntentOutcome] = useState<PaymentIntentSubmission | null>(null);
+  const [intentLocked, setIntentLocked] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [receipt, setReceipt] = useState<Transaction | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    submittingRef = useRef(false);
+  useEffect(() => {
+    if (step !== 'review') return;
+    const timer = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [step]);
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -159,13 +227,19 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
-    paymentKey.current = crypto.randomUUID();
+    setConsent(false);
+    setIntentAttempt(null);
+    setIntentOutcome(null);
+    setIntentLocked(false);
     setPage('Pay');
   }
   function editPayment() {
+    if (submittingRef.current || intentLocked) return;
     setStep('details');
     setError('');
-    paymentKey.current = crypto.randomUUID();
+    setConsent(false);
+    setIntentAttempt(null);
+    setIntentOutcome(null);
   }
   function review() {
     const value = pence(amount);
@@ -177,27 +251,104 @@ export default function App() {
       setError('Insufficient balance');
       return;
     }
-    setError('');
-    setStep('review');
-  }
-  async function confirm() {
     try {
+      const person = recipients.find((item) => item.id === recipient);
+      const next = preparePaymentIntent({
+        recipientId: recipient,
+        recipientName: person?.name ?? '',
+        recipientDetail: person?.detail ?? '',
+        amountInput: amount,
+        localReference: note,
+        method,
+      });
+      setIntentAttempt(next);
+      setConsent(false);
+      setIntentOutcome(null);
+      setIntentLocked(false);
+      setNowTick(Date.now());
       setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
-      if (result.ok) {
-        setReceipt(result.transaction);
-        setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      setStep('review');
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Payment failed');
+      setError(e instanceof Error ? e.message : 'Invalid payment');
     }
   }
-  const selected = recipients.find((item) => item.id === recipient);
+  function refreshQuote() {
+    if (submittingRef.current || intentLocked) return;
+    try {
+      const person = recipients.find((item) => item.id === recipient);
+      const next = preparePaymentIntent({
+        recipientId: recipient,
+        recipientName: person?.name ?? '',
+        recipientDetail: person?.detail ?? '',
+        amountInput: amount,
+        localReference: note,
+        method,
+      });
+      setIntentAttempt(next);
+      setConsent(false);
+      setIntentOutcome(null);
+      setNowTick(Date.now());
+      setError('');
+      setNotice('Quote refreshed. Review the new expiry before confirming.');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not refresh quote');
+    }
+  }
+  async function confirm() {
+    const current = intentAttempt;
+    if (!current || submittingRef.current) {
+      if (submittingRef.current) setError('Payment is already being submitted.');
+      return;
+    }
+    if (current.settledSubmission) {
+      setIntentOutcome(current.settledSubmission);
+      return;
+    }
+    const alreadySent = current.hasSubmitted();
+    if (!alreadySent && !consent) {
+      setError('Consent is required');
+      return;
+    }
+    if (!alreadySent && isQuoteExpired(current.quoteExpiresAt, new Date(nowTick))) {
+      setError('Quote expired. Refresh the quote before confirming.');
+      return;
+    }
+    if (!connected) {
+      setError('Wait for API connection before submitting.');
+      return;
+    }
+    submittingRef.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      const submission = await current.submit(new Date(nowTick), true, async (body, key, hash) => {
+        mutating.current = true;
+        revision.current += 1;
+        try {
+          return await postPaymentIntent(room, body, key, hash, scenario);
+        } finally {
+          revision.current += 1;
+          mutating.current = false;
+        }
+      });
+      setIntentOutcome(submission);
+      if (submission.disposition === 'succeeded' && submission.body.state) {
+        setReceipt((submission.body.state as State).transactions?.at(-1) ?? null);
+        setState(bankState(submission.body.state));
+        setNotice(submission.message);
+      } else if (submission.disposition === 'succeeded') {
+        setNotice(submission.message);
+      } else {
+        setError(submission.message);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Payment failed');
+    } finally {
+      setIntentLocked(current.hasSubmitted());
+      submittingRef.current = false;
+      setBusy(false);
+    }
+  }
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -328,7 +479,7 @@ export default function App() {
                         onChange={(e) => setAmount(e.target.value)}
                         placeholder="0.00"
                       />
-                      <label htmlFor="mobile-note">Reference</label>
+                      <label htmlFor="mobile-note">Local reference</label>
                       <input
                         id="mobile-note"
                         value={note}
@@ -363,22 +514,91 @@ export default function App() {
                       </button>
                     </form>
                   )}
-                  {step === 'review' && (
+                  {step === 'review' && intentAttempt && (
                     <>
-                      <div className="mobile-review">
-                        <span>To {selected?.name}</span>
-                        <strong>{money(pence(amount) || 0)}</strong>
-                        <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
-                          {note || 'No reference'}
-                        </p>
-                      </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
-                        {busy ? 'Confirming…' : 'Confirm payment'}
-                      </button>
-                      <button className="secondary" disabled={busy} onClick={editPayment}>
-                        Back to details
-                      </button>
+                      <dl className="intent-review">
+                        <div>
+                          <dt>Recipient</dt>
+                          <dd data-testid="review-recipient">
+                            {intentAttempt.review.recipientName}
+                            {intentAttempt.review.recipientDetail && (
+                              <small>{intentAttempt.review.recipientDetail}</small>
+                            )}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Amount</dt>
+                          <dd data-testid="review-amount">{intentAttempt.review.amountLabel}</dd>
+                        </div>
+                        <div>
+                          <dt>Fees</dt>
+                          <dd data-testid="review-fees">{intentAttempt.review.feeLabel}</dd>
+                        </div>
+                        <div>
+                          <dt>Method</dt>
+                          <dd data-testid="review-method">{intentAttempt.review.methodLabel}</dd>
+                        </div>
+                        <div>
+                          <dt>Bank</dt>
+                          <dd data-testid="review-bank">{intentAttempt.review.bank}</dd>
+                        </div>
+                        <div>
+                          <dt>Quote expiry</dt>
+                          <dd data-testid="review-quote-expiry">{intentAttempt.review.expiryLabel}</dd>
+                        </div>
+                      </dl>
+                      <p className="consent-summary" data-testid="review-consent">
+                        {intentAttempt.review.consentSummary}
+                      </p>
+                      <label className="consent-check">
+                        <input
+                          type="checkbox"
+                          checked={consent}
+                          disabled={busy || intentLocked}
+                          onChange={(e) => setConsent(e.target.checked)}
+                        />
+                        I agree to this payment
+                      </label>
+                      <p className="fine-print" data-testid="review-idempotency">
+                        Idempotency {intentAttempt.idempotencyKey}
+                      </p>
+                      <p className="fine-print" data-testid="review-hash">
+                        Payload hash {intentAttempt.payloadHash}
+                      </p>
+                      {intentOutcome?.terminal ? (
+                        <div data-testid="intent-outcome">
+                          <p>{intentOutcome.message}</p>
+                          {intentOutcome.intentId && <code>{intentOutcome.intentId}</code>}
+                          <button className="primary" onClick={freshPayment}>
+                            New payment
+                          </button>
+                        </div>
+                      ) : !intentLocked && isQuoteExpired(intentAttempt.quoteExpiresAt, new Date(nowTick)) ? (
+                        <>
+                          <p role="status">This quote has expired.</p>
+                          <button
+                            className="primary"
+                            disabled={busy || intentLocked}
+                            onClick={refreshQuote}
+                          >
+                            Refresh quote
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="primary"
+                          data-testid="confirm-payment"
+                          onClick={confirm}
+                          disabled={busy || !consent || !connected}
+                        >
+                          {busy ? 'Confirming…' : intentLocked ? 'Retry payment' : 'Confirm payment'}
+                        </button>
+                      )}
+                      {!intentLocked && !intentOutcome?.terminal && (
+                        <button className="secondary" disabled={busy} onClick={editPayment}>
+                          Back to details
+                        </button>
+                      )}
                     </>
                   )}
                   {step === 'done' && receipt && (
