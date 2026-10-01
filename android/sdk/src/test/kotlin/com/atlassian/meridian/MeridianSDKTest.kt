@@ -374,4 +374,223 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - PaymentIntentSnapshot Tests
+
+  @Test
+  fun testPaymentIntentStatusTerminalFlags() {
+    assertTrue(PaymentIntentStatus.completed.isTerminal)
+    assertTrue(PaymentIntentStatus.declined.isTerminal)
+    assertTrue(PaymentIntentStatus.expired.isTerminal)
+    assertFalse(PaymentIntentStatus.created.isTerminal)
+    assertFalse(PaymentIntentStatus.pending.isTerminal)
+  }
+
+  @Test
+  fun testPaymentPayloadHashDeterministic() {
+    val h1 = paymentPayloadHash("r1", 1000, "card", "note")
+    val h2 = paymentPayloadHash("r1", 1000, "card", "note")
+    val h3 = paymentPayloadHash("r2", 1000, "card", "note")
+    assertEquals(h1, h2)
+    assertNotEquals(h1, h3)
+    assertEquals(64, h1.length) // SHA-256 hex = 64 chars
+  }
+
+  @Test
+  fun testBankStateHashDeterministic() {
+    val bh1 = bankStateHash(1, 100_000)
+    val bh2 = bankStateHash(1, 100_000)
+    val bh3 = bankStateHash(2, 100_000)
+    assertEquals(bh1, bh2)
+    assertNotEquals(bh1, bh3)
+    assertEquals(64, bh1.length)
+  }
+
+  @Test
+  fun testPaymentIntentSnapshotFields() {
+    val snap = PaymentIntentSnapshot(
+      paymentIntentId = "pi-1",
+      idempotencyKey = "ik-1",
+      businessPayloadHash = "abc",
+      status = PaymentIntentStatus.pending,
+      returnStateHash = "def",
+    )
+    assertEquals("pi-1", snap.paymentIntentId)
+    assertEquals("ik-1", snap.idempotencyKey)
+    assertEquals("abc", snap.businessPayloadHash)
+    assertEquals(PaymentIntentStatus.pending, snap.status)
+    assertEquals("def", snap.returnStateHash)
+    assertFalse(snap.isExpired)
+  }
+
+  @Test
+  fun testSnapshotExpiryAfterRetentionWindow() {
+    val pastWindow = System.currentTimeMillis() -
+      (PaymentIntentSnapshot.TERMINAL_RETENTION_MS + 1000)
+    val expired = PaymentIntentSnapshot(
+      paymentIntentId = "pi-2",
+      idempotencyKey = "ik-2",
+      businessPayloadHash = "x",
+      status = PaymentIntentStatus.completed,
+      updatedAt = pastWindow,
+    )
+    assertTrue(expired.isExpired)
+  }
+
+  @Test
+  fun testSnapshotNotExpiredWithinRetentionWindow() {
+    val recent = PaymentIntentSnapshot(
+      paymentIntentId = "pi-3",
+      idempotencyKey = "ik-3",
+      businessPayloadHash = "y",
+      status = PaymentIntentStatus.completed,
+    )
+    assertFalse(recent.isExpired)
+  }
+
+  @Test
+  fun testActiveSnapshotNeverExpires() {
+    val active = PaymentIntentSnapshot(
+      paymentIntentId = "pi-4",
+      idempotencyKey = "ik-4",
+      businessPayloadHash = "z",
+      status = PaymentIntentStatus.pending,
+    )
+    assertFalse(active.isExpired)
+  }
+
+  @Test
+  fun testInMemoryStoreSaveAndLoad() = runBlocking {
+    val store = InMemoryPaymentIntentStore()
+    val snap = PaymentIntentSnapshot(
+      paymentIntentId = "pi-5",
+      idempotencyKey = "ik-5",
+      businessPayloadHash = "p",
+      status = PaymentIntentStatus.created,
+    )
+    store.save(snap)
+    val loaded = store.load("ik-5")
+    val missing = store.load("ik-missing")
+    assertNotNull(loaded)
+    assertEquals("ik-5", loaded?.idempotencyKey)
+    assertNull(missing)
+  }
+
+  @Test
+  fun testInMemoryStoreDelete() = runBlocking {
+    val store = InMemoryPaymentIntentStore()
+    val snap = PaymentIntentSnapshot(
+      paymentIntentId = "pi-6",
+      idempotencyKey = "ik-6",
+      businessPayloadHash = "q",
+      status = PaymentIntentStatus.created,
+    )
+    store.save(snap)
+    store.delete("ik-6")
+    val afterDelete = store.load("ik-6")
+    assertNull(afterDelete)
+  }
+
+  @Test
+  fun testInMemoryStoreLoadActiveFiltering() = runBlocking {
+    val store = InMemoryPaymentIntentStore()
+    store.save(PaymentIntentSnapshot("pi-a", "ik-a", "1", PaymentIntentStatus.pending))
+    store.save(PaymentIntentSnapshot("pi-b", "ik-b", "2", PaymentIntentStatus.created))
+    store.save(PaymentIntentSnapshot("pi-c", "ik-c", "3", PaymentIntentStatus.completed))
+    // Expired declined snapshot
+    val oldTime = System.currentTimeMillis() -
+      (PaymentIntentSnapshot.TERMINAL_RETENTION_MS + 60_000)
+    store.save(
+      PaymentIntentSnapshot(
+        paymentIntentId = "pi-d",
+        idempotencyKey = "ik-d",
+        businessPayloadHash = "4",
+        status = PaymentIntentStatus.declined,
+        updatedAt = oldTime,
+      )
+    )
+
+    val actives = store.loadActive()
+    val ids = actives.map { it.idempotencyKey }.toSet()
+    assertEquals(setOf("ik-a", "ik-b"), ids)
+  }
+
+  @Test
+  fun testResumeActiveIntentsWithoutStore() = runBlocking {
+    val client = MeridianClient(
+      baseURL = "http://localhost:8080/api/v1",
+      sessionId = "test-session",
+    )
+    val intents = client.resumeActiveIntents()
+    assertTrue(intents.isEmpty())
+  }
+
+  @Test
+  fun testResumeActiveIntentsWithStore() = runBlocking {
+    val store = InMemoryPaymentIntentStore()
+    store.save(PaymentIntentSnapshot("pi-x", "ik-x", "h", PaymentIntentStatus.pending))
+    store.save(PaymentIntentSnapshot("pi-y", "ik-y", "h", PaymentIntentStatus.completed))
+
+    val client = MeridianClient(
+      baseURL = "http://localhost:8080/api/v1",
+      sessionId = "test-session",
+      snapshotStore = store,
+    )
+    val actives = client.resumeActiveIntents()
+    assertEquals(1, actives.size)
+    assertEquals("ik-x", actives[0].idempotencyKey)
+  }
+
+  @Test
+  fun testSubmitPaymentPersistsSnapshotLifecycle() = runBlocking {
+    // Stand up a local HTTP server to simulate the payment endpoint
+    val server = com.sun.net.httpserver.HttpServer.create(
+      java.net.InetSocketAddress("127.0.0.1", 0), 0
+    )
+    val port = server.address.port
+    val baseUrl = "http://127.0.0.1:$port/api/v1"
+
+    val callCount = java.util.concurrent.atomic.AtomicInteger(0)
+    server.createContext("/api/v1/payments") { exchange ->
+      val call = callCount.incrementAndGet()
+      val responseBody = if (call == 1) {
+        """{"ok":false,"code":"PAYMENT_PENDING","paymentId":"pay-server-001","error":"Awaiting confirmation"}"""
+      } else {
+        """{"ok":true,"paymentId":"pay-server-001","state":{"version":2,"balance":999000,"transactions":[],"budgets":[]}}"""
+      }
+      val status = if (call == 1) 202 else 200
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(status, responseBody.length.toLong())
+      exchange.responseBody.write(responseBody.toByteArray())
+      exchange.close()
+    }
+    server.start()
+
+    val store = InMemoryPaymentIntentStore()
+    val client = MeridianClient(baseUrl, "test-session", store)
+    val key = "test-idempotency-key"
+
+    try {
+      // First call → pending
+      val r1 = client.submitPayment("rec-1", 1000, PaymentMethod.card, idempotencyKey = key)
+      assertFalse(r1.ok)
+      assertEquals("PAYMENT_PENDING", r1.code)
+
+      val snap1 = store.load(key)
+      assertNotNull(snap1)
+      assertEquals(PaymentIntentStatus.pending, snap1?.status)
+      assertEquals("pay-server-001", snap1?.paymentIntentId)
+
+      // Second call with same key → completed
+      val r2 = client.submitPayment("rec-1", 1000, PaymentMethod.card, idempotencyKey = key)
+      assertTrue(r2.ok)
+
+      val snap2 = store.load(key)
+      assertNotNull(snap2)
+      assertEquals(PaymentIntentStatus.completed, snap2?.status)
+      assertNotNull(snap2?.returnStateHash)
+    } finally {
+      server.stop(0)
+    }
+  }
 }

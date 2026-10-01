@@ -3,7 +3,7 @@ import Foundation
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -342,9 +342,239 @@ struct MeridianSDKChecks {
     }
 
     // Summary
+    print("\n=== PaymentIntentSnapshot checks ===\n")
+
+    // CHECK 21: PaymentIntentStatus terminal flags
+    print("21. PaymentIntentStatus terminal flags...")
+    let terminalStatuses: [PaymentIntentStatus] = [.completed, .declined, .expired]
+    let activeStatuses: [PaymentIntentStatus] = [.created, .pending]
+    let terminalOk = terminalStatuses.allSatisfy { $0.isTerminal }
+    let activeOk = activeStatuses.allSatisfy { !$0.isTerminal }
+    if terminalOk && activeOk {
+      print("  ✓ Terminal and active statuses correctly classified")
+      passed += 1
+    } else {
+      print("  ✗ PaymentIntentStatus.isTerminal mismatch")
+      failed += 1
+    }
+
+    // CHECK 22: paymentPayloadHash produces deterministic output
+    print("22. paymentPayloadHash deterministic...")
+    let h1 = paymentPayloadHash(recipientId: "r1", amountMinor: 1000, method: .card, note: "n")
+    let h2 = paymentPayloadHash(recipientId: "r1", amountMinor: 1000, method: .card, note: "n")
+    let h3 = paymentPayloadHash(recipientId: "r2", amountMinor: 1000, method: .card, note: "n")
+    if h1 == h2 && h1 != h3 && h1.count == 64 {
+      print("  ✓ paymentPayloadHash is stable and distinct: \(h1.prefix(12))…")
+      passed += 1
+    } else {
+      print("  ✗ Hash mismatch – h1=\(h1) h3=\(h3)")
+      failed += 1
+    }
+
+    // CHECK 23: bankStateHash produces deterministic output
+    print("23. bankStateHash deterministic...")
+    let bh1 = bankStateHash(version: 1, balance: 100_000)
+    let bh2 = bankStateHash(version: 1, balance: 100_000)
+    let bh3 = bankStateHash(version: 2, balance: 100_000)
+    if bh1 == bh2 && bh1 != bh3 && bh1.count == 64 {
+      print("  ✓ bankStateHash is stable and distinct: \(bh1.prefix(12))…")
+      passed += 1
+    } else {
+      print("  ✗ bankStateHash mismatch")
+      failed += 1
+    }
+
+    // CHECK 24: PaymentIntentSnapshot fields round-trip
+    print("24. PaymentIntentSnapshot fields...")
+    let snap = PaymentIntentSnapshot(
+      paymentIntentId: "pi-1",
+      idempotencyKey: "ik-1",
+      businessPayloadHash: "abc",
+      status: .pending,
+      returnStateHash: "def"
+    )
+    if snap.paymentIntentId == "pi-1"
+      && snap.idempotencyKey == "ik-1"
+      && snap.businessPayloadHash == "abc"
+      && snap.status == .pending
+      && snap.returnStateHash == "def"
+      && !snap.isExpired {
+      print("  ✓ Snapshot fields are correct")
+      passed += 1
+    } else {
+      print("  ✗ Snapshot fields mismatch")
+      failed += 1
+    }
+
+    // CHECK 25: Snapshot expiry for terminal status past retention window
+    print("25. Snapshot expiry after retention window...")
+    let pastWindow = Date().addingTimeInterval(-(PaymentIntentSnapshot.terminalRetentionWindow + 1))
+    let expired = PaymentIntentSnapshot(
+      paymentIntentId: "pi-2",
+      idempotencyKey: "ik-2",
+      businessPayloadHash: "x",
+      status: .completed,
+      updatedAt: pastWindow
+    )
+    let notExpired = PaymentIntentSnapshot(
+      paymentIntentId: "pi-3",
+      idempotencyKey: "ik-3",
+      businessPayloadHash: "y",
+      status: .completed
+    )
+    if expired.isExpired && !notExpired.isExpired {
+      print("  ✓ Expiry correctly tracks terminal retention window")
+      passed += 1
+    } else {
+      print("  ✗ Expiry logic failed: expired.isExpired=\(expired.isExpired) notExpired.isExpired=\(notExpired.isExpired)")
+      failed += 1
+    }
+
+    // CHECK 26: Active (non-terminal) snapshot is not expired
+    print("26. Active snapshot not expired...")
+    let active = PaymentIntentSnapshot(
+      paymentIntentId: "pi-4",
+      idempotencyKey: "ik-4",
+      businessPayloadHash: "z",
+      status: .pending
+    )
+    if !active.isExpired {
+      print("  ✓ Pending snapshot is not expired")
+      passed += 1
+    } else {
+      print("  ✗ Pending snapshot should not be expired")
+      failed += 1
+    }
+
+    // CHECK 27: InMemoryPaymentIntentStore save/load/delete
+    print("27. InMemoryPaymentIntentStore save/load/delete...")
+    let memStore = InMemoryPaymentIntentStore()
+    let snap27 = PaymentIntentSnapshot(
+      paymentIntentId: "pi-5",
+      idempotencyKey: "ik-5",
+      businessPayloadHash: "p",
+      status: .created
+    )
+    do {
+      try await memStore.save(snap27)
+      let loaded = try await memStore.load(idempotencyKey: "ik-5")
+      let missing = try await memStore.load(idempotencyKey: "ik-missing")
+      try await memStore.delete(idempotencyKey: "ik-5")
+      let afterDelete = try await memStore.load(idempotencyKey: "ik-5")
+      if loaded?.idempotencyKey == "ik-5"
+        && missing == nil
+        && afterDelete == nil {
+        print("  ✓ InMemoryPaymentIntentStore CRUD works correctly")
+        passed += 1
+      } else {
+        print("  ✗ Store CRUD mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Store error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 28: InMemoryPaymentIntentStore loadActive filters terminal/expired
+    print("28. InMemoryPaymentIntentStore loadActive filtering...")
+    let activeStore = InMemoryPaymentIntentStore()
+    do {
+      let pending = PaymentIntentSnapshot(
+        paymentIntentId: "pi-a", idempotencyKey: "ik-a",
+        businessPayloadHash: "1", status: .pending)
+      let created = PaymentIntentSnapshot(
+        paymentIntentId: "pi-b", idempotencyKey: "ik-b",
+        businessPayloadHash: "2", status: .created)
+      let done = PaymentIntentSnapshot(
+        paymentIntentId: "pi-c", idempotencyKey: "ik-c",
+        businessPayloadHash: "3", status: .completed)
+      let old = PaymentIntentSnapshot(
+        paymentIntentId: "pi-d", idempotencyKey: "ik-d",
+        businessPayloadHash: "4", status: .declined,
+        updatedAt: Date().addingTimeInterval(-(PaymentIntentSnapshot.terminalRetentionWindow + 60)))
+      try await activeStore.save(pending)
+      try await activeStore.save(created)
+      try await activeStore.save(done)
+      try await activeStore.save(old)
+      let actives = try await activeStore.loadActive()
+      let ids = Set(actives.map { $0.idempotencyKey })
+      // pending + created should appear; completed and expired-declined should not
+      if ids == Set(["ik-a", "ik-b"]) {
+        print("  ✓ loadActive returns only non-terminal, non-expired snapshots")
+        passed += 1
+      } else {
+        print("  ✗ loadActive returned unexpected ids: \(ids)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Store error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 29: MeridianClient.resumeActiveIntents without store returns empty
+    print("29. resumeActiveIntents without store returns empty...")
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://localhost:8080/api/v1",
+        sessionId: "test-session"
+      )
+      let intents = try await client.resumeActiveIntents()
+      if intents.isEmpty {
+        print("  ✓ resumeActiveIntents correctly returns [] when no store is configured")
+        passed += 1
+      } else {
+        print("  ✗ Expected empty, got \(intents.count) intent(s)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 30: MeridianClient snapshot lifecycle via InMemoryPaymentIntentStore
+    print("30. MeridianClient snapshot lifecycle via InMemoryPaymentIntentStore...")
+    do {
+      let lifecycleStore = InMemoryPaymentIntentStore()
+      // We can only test the store write/read path without a live server.
+      // Manually exercise the store API to verify it integrates cleanly.
+      let key = UUID().uuidString
+      let payloadHash = paymentPayloadHash(
+        recipientId: "northline-studio", amountMinor: 1000, method: .card, note: "test")
+      var snap = PaymentIntentSnapshot(
+        paymentIntentId: key,
+        idempotencyKey: key,
+        businessPayloadHash: payloadHash,
+        status: .created
+      )
+      try await lifecycleStore.save(snap)
+
+      // Transition to pending
+      snap.status = .pending
+      snap.paymentIntentId = "pay-server-001"
+      snap.returnStateHash = bankStateHash(version: 1, balance: 100_000)
+      snap.updatedAt = Date()
+      try await lifecycleStore.save(snap)
+
+      let loaded = try await lifecycleStore.load(idempotencyKey: key)
+      let actives = try await lifecycleStore.loadActive()
+      if loaded?.status == .pending
+        && loaded?.paymentIntentId == "pay-server-001"
+        && actives.count == 1 {
+        print("  ✓ Snapshot lifecycle: created → pending correctly stored and retrievable")
+        passed += 1
+      } else {
+        print("  ✗ Lifecycle mismatch: status=\(String(describing: loaded?.status)), actives=\(actives.count)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/30")
+    print("Failed: \(failed)/30")
 
     if failed > 0 {
       exit(1)

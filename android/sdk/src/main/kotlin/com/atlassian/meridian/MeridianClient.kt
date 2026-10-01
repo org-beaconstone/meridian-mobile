@@ -12,10 +12,15 @@ import java.nio.charset.StandardCharsets
  * Meridian API client for Kotlin/JVM and Android
  * Uses HttpURLConnection for universal JVM/Android compatibility
  * Coroutines for async operations with UI dispatcher where needed
+ *
+ * @param snapshotStore Optional store for resumable payment intent snapshots.
+ *   Pass an [InMemoryPaymentIntentStore] for tests or an EncryptedSharedPreferences-
+ *   backed store for Android production use. Omit for stateless operation.
  */
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val snapshotStore: PaymentIntentStore? = null,
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
@@ -128,13 +133,18 @@ class MeridianClient(
     request("GET", "/state", responseType = BankState::class.java)
 
   /**
-   * POST /payments - Submit a payment
+   * POST /payments - Submit a payment.
+   *
+   * When a [snapshotStore] is configured, this method persists a
+   * [PaymentIntentSnapshot] before and after the network call so the intent
+   * can be resumed if the process is interrupted.
+   *
    * @param recipientId Recipient ID
    * @param amountMinor Amount in GBP pence (integer)
    * @param method Payment method (card or bank)
    * @param note Optional note (max 200 chars)
    * @param scenario Simulation scenario
-   * @param idempotencyKey Unique key for idempotency
+   * @param idempotencyKey Unique key for idempotency (retain across retries)
    */
   suspend fun submitPayment(
     recipientId: String,
@@ -144,6 +154,23 @@ class MeridianClient(
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
   ): PaymentResponse {
+    val payloadHash = paymentPayloadHash(recipientId, amountMinor, method.name, note)
+
+    // Persist a created snapshot before sending so a crash during the request
+    // is recoverable with the original idempotency key.
+    snapshotStore?.let { store ->
+      if (store.load(idempotencyKey) == null) {
+        store.save(
+          PaymentIntentSnapshot(
+            paymentIntentId = idempotencyKey,
+            idempotencyKey = idempotencyKey,
+            businessPayloadHash = payloadHash,
+            status = PaymentIntentStatus.created,
+          )
+        )
+      }
+    }
+
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
@@ -152,13 +179,41 @@ class MeridianClient(
       scenario = scenario.name,
     )
 
-    return request(
+    val response = request(
       "POST",
       "/payments",
       payload,
       mapOf("Idempotency-Key" to idempotencyKey),
       PaymentResponse::class.java,
     )
+
+    // Update the snapshot to reflect the server's response status.
+    snapshotStore?.let { store ->
+      val newStatus = when {
+        response.ok -> PaymentIntentStatus.completed
+        response.code == "PAYMENT_PENDING" -> PaymentIntentStatus.pending
+        else -> PaymentIntentStatus.declined
+      }
+      val returnHash = response.state?.let { bankStateHash(it.version, it.balance) }
+      val serverIntentId = response.paymentId ?: response.transaction?.id ?: idempotencyKey
+
+      val updated = store.load(idempotencyKey)?.also {
+        it.paymentIntentId = serverIntentId
+        it.status = newStatus
+        it.returnStateHash = returnHash
+        it.updatedAt = System.currentTimeMillis()
+      } ?: PaymentIntentSnapshot(
+        paymentIntentId = serverIntentId,
+        idempotencyKey = idempotencyKey,
+        businessPayloadHash = payloadHash,
+        status = newStatus,
+        returnStateHash = returnHash,
+      )
+
+      store.save(updated)
+    }
+
+    return response
   }
 
   /**
@@ -190,4 +245,15 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  // MARK: - Resumption
+
+  /**
+   * Returns all non-terminal payment intent snapshots for the current account.
+   *
+   * Call this on app launch or after process recovery to detect in-flight
+   * payments that should be retried with their original idempotency keys.
+   */
+  suspend fun resumeActiveIntents(): List<PaymentIntentSnapshot> =
+    snapshotStore?.loadActive() ?: emptyList()
 }
