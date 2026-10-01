@@ -199,7 +199,8 @@ import MeridianSDK
   private func pay() async {
     guard let client, let attempt, !busy else { return }
     if outcome?.terminal == true { return }
-    if !intentLocked {
+    let alreadySent = await attempt.hasSubmitted()
+    if !alreadySent {
       if !consent { message = "Consent is required"; return }
       if isQuoteExpired(quoteExpiresAt: attempt.quoteExpiresAt, now: now) {
         message = "Quote expired. Refresh the quote before confirming."
@@ -207,17 +208,18 @@ import MeridianSDK
       }
     }
     busy = true
-    intentLocked = true
     generation += 1
     defer { busy = false }
     do {
       let submission = try await attempt.submit(now: now, consentAccepted: true) { body, key, hash in
         try await client.submitPaymentIntent(canonicalBody: body, idempotencyKey: key, payloadHash: hash)
       }
+      intentLocked = true
       outcome = submission
       message = submission.message
       if submission.disposition == .succeeded, let next = submission.state { state = next }
     } catch let error as MeridianError {
+      intentLocked = await attempt.hasSubmitted()
       switch error {
       case .duplicateSubmission, .quoteExpired, .validationError:
         message = error.errorDescription ?? "Payment was not submitted."
@@ -225,6 +227,7 @@ import MeridianSDK
         message = "Outcome may be unknown: \(error.localizedDescription). Retry keeps the same idempotency key and payload hash."
       }
     } catch {
+      intentLocked = await attempt.hasSubmitted()
       message = "Outcome may be unknown: \(error). Retry keeps the same idempotency key and payload hash."
     }
   }

@@ -101,7 +101,7 @@ describe('browser companion payment review', () => {
     expect(container.querySelector('[data-testid="review-method"]')?.textContent).toBe('Debit card');
     expect(container.querySelector('[data-testid="review-bank"]')?.textContent).toBe('Adyen');
     expect(container.querySelector('[data-testid="review-quote-expiry"]')?.textContent).toMatch(
-      /Sep 2026/,
+      /^\d{1,2} [A-Z][a-z]{2} \d{4}, \d{2}:\d{2} UTC$/,
     );
     expect(container.querySelector('[data-testid="review-consent"]')?.textContent).toMatch(
       /does not move real money/,

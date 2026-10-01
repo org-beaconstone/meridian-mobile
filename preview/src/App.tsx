@@ -304,11 +304,12 @@ export default function App() {
       setIntentOutcome(current.settledSubmission);
       return;
     }
-    if (!intentLocked && !consent) {
+    const alreadySent = current.hasSubmitted();
+    if (!alreadySent && !consent) {
       setError('Consent is required');
       return;
     }
-    if (!intentLocked && isQuoteExpired(current.quoteExpiresAt, new Date(nowTick))) {
+    if (!alreadySent && isQuoteExpired(current.quoteExpiresAt, new Date(nowTick))) {
       setError('Quote expired. Refresh the quote before confirming.');
       return;
     }
@@ -317,7 +318,6 @@ export default function App() {
       return;
     }
     submittingRef.current = true;
-    setIntentLocked(true);
     setBusy(true);
     setError('');
     try {
@@ -344,6 +344,7 @@ export default function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
     } finally {
+      setIntentLocked(current.hasSubmitted());
       submittingRef.current = false;
       setBusy(false);
     }

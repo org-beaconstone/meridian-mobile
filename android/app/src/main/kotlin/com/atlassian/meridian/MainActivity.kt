@@ -139,24 +139,30 @@ class MainActivity : ComponentActivity() {
           Button(onClick={
             val active=client
             if(active==null||busy) return@Button
-            if(!intentLocked && !consent) { message="Consent is required"; return@Button }
-            if(!intentLocked && expired) { message="Quote expired. Refresh the quote before confirming."; return@Button }
-            busy=true;intentLocked=true;revision++
+            val alreadySent=currentAttempt.hasSubmitted()
+            if(!alreadySent && !consent) { message="Consent is required"; return@Button }
+            if(!alreadySent && expired) { message="Quote expired. Refresh the quote before confirming."; return@Button }
+            busy=true;revision++
             scope.launch {
               try {
                 val submission=currentAttempt.submit(Date(tick), true) { body, key, hash ->
                   active.submitPaymentIntent(body, key, hash)
                 }
+                intentLocked=true
                 outcome=submission
                 message=submission.message
                 if(submission.disposition==IntentDisposition.succeeded) submission.state?.let { state=it }
               } catch(e:MeridianError.DuplicateSubmission) {
+                intentLocked=currentAttempt.hasSubmitted()
                 message=e.message?:"Payment is already being submitted."
               } catch(e:MeridianError.QuoteExpired) {
+                intentLocked=currentAttempt.hasSubmitted()
                 message=e.message
               } catch(e:MeridianError.ValidationError) {
+                intentLocked=currentAttempt.hasSubmitted()
                 message=e.message
               } catch(e:Exception) {
+                intentLocked=currentAttempt.hasSubmitted()
                 message="Outcome may be unknown: ${e.message}. Retry keeps the same idempotency key and payload hash."
               } finally { revision++;busy=false }
             }
