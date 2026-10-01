@@ -270,11 +270,7 @@ public enum MeridianError: LocalizedError {
 // MARK: - Amount Formatting
 
 public func money(_ pence: Int) -> String {
-  let pounds = Double(pence) / 100.0
-  let formatter = NumberFormatter()
-  formatter.numberStyle = .currency
-  formatter.locale = Locale(identifier: "en_GB")
-  return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
+  Money.fromLegacyGbpPence(pence).formatted(locale: Locale(identifier: "en_GB"))
 }
 
 /// Parse amount string to integer pence

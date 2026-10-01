@@ -341,10 +341,144 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: legacy GBP adapter
+    print("21. legacy GBP pence adapter...")
+    let legacy = Money.fromLegacyGbpPence(1050)
+    let roundTrip = try? legacy.legacyGbpPence()
+    let eurLegacy = try? Money(currencyCode: "EUR", minorUnits: 100, minorUnitExponent: 2).legacyGbpPence()
+    let wide = Money.fromLegacyGbpPence(Int(Int32.max) + 1)
+    let widePence = try? wide.legacyGbpPence()
+    if legacy.currencyCode == "GBP" && legacy.minorUnits == 1050 && legacy.minorUnitExponent == 2
+      && roundTrip == 1050 && eurLegacy == nil && widePence == nil
+    {
+      print("  ✓ legacy adapter round-trips 1050 and rejects EUR / Int32 overflow")
+      passed += 1
+    } else {
+      print("  ✗ legacy adapter mismatch")
+      failed += 1
+    }
+
+    // CHECK 22: conversion precision without floating point
+    print("22. conversion precision...")
+    do {
+      let euros = try Money.parse("10.5", currencyCode: "EUR", minorUnitExponent: 2)
+      let exact = try Money.parse("90071992547409.93", currencyCode: "EUR", minorUnitExponent: 2)
+      let sum = try Money.parse("0.10", currencyCode: "EUR", minorUnitExponent: 2)
+        .adding(try Money.parse("0.20", currencyCode: "EUR", minorUnitExponent: 2))
+      let viaFloat = Int64(("90071992547409.93" as NSString).doubleValue * 100.0)
+      if euros.minorUnits == 1050 && euros.plainDecimal() == "10.50"
+        && exact.minorUnits == 9_007_199_254_740_993 && exact.plainDecimal() == "90071992547409.93"
+        && sum.minorUnits == 30 && sum.plainDecimal() == "0.30"
+        && viaFloat != exact.minorUnits
+      {
+        print("  ✓ decimal conversion stays exact past the float mantissa")
+        passed += 1
+      } else {
+        print("  ✗ precision mismatch exact=\(exact.minorUnits) float=\(viaFloat) sum=\(sum.plainDecimal())")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ precision threw: \(error)")
+      failed += 1
+    }
+
+    // CHECK 23: overflow protection
+    print("23. overflow protection...")
+    var overflowed = 0
+    do { _ = try Money.parse("92233720368547759.00", currencyCode: "GBP", minorUnitExponent: 2) }
+    catch MoneyError.overflow { overflowed += 1 } catch { print("  unexpected parse error \(error)") }
+    do {
+      _ = try Money(currencyCode: "GBP", minorUnits: Int64.max, minorUnitExponent: 2)
+        .adding(try Money(currencyCode: "GBP", minorUnits: 1, minorUnitExponent: 2))
+    } catch MoneyError.overflow { overflowed += 1 } catch { print("  unexpected add error \(error)") }
+    do {
+      _ = try Money.fromLegacyGbpPence(1)
+        .adding(try Money(currencyCode: "EUR", minorUnits: 1, minorUnitExponent: 2))
+    } catch MoneyError.currencyMismatch { overflowed += 1 } catch { print("  unexpected mix error \(error)") }
+    do { _ = try Money(currencyCode: "EUR", minorUnits: 1, minorUnitExponent: 0) }
+    catch MoneyError.exponentMismatch { overflowed += 1 } catch { print("  unexpected exponent error \(error)") }
+    if overflowed == 4 {
+      print("  ✓ overflow, mixed currency, and EUR exponent are rejected")
+      passed += 1
+    } else {
+      print("  ✗ expected 4 rejections, got \(overflowed)")
+      failed += 1
+    }
+
+    // CHECK 24: migration JSON
+    print("24. migration JSON...")
+    do {
+      let legacyAmount = try MoneyMigration.decodeAmount("3500")
+      let legacyField = try MoneyMigration.decodeAmountField(
+        "amount",
+        in: #"{"id":"txn-001","amount":3500,"note":"Breakfast"}"#
+      )
+      let eur = try MoneyMigration.decodeAmountField(
+        "amount",
+        in: #"{"id":"txn-eu","amount":{"currencyCode":"EUR","minorUnits":199,"minorUnitExponent":2}}"#
+      )
+      let wideAmount = try MoneyMigration.decodeAmountField(
+        "amount",
+        in: #"{"amount":9007199254740993}"#
+      )
+      let reordered = try MoneyMigration.decodeAmount(
+        #"{"minorUnitExponent":2,"minorUnits":1050,"currencyCode":"EUR"}"#
+      )
+      let precise = try Money(currencyCode: "EUR", minorUnits: 9_007_199_254_740_993, minorUnitExponent: 2)
+      let encoded = precise.toJSON()
+      let decoded = try Money.fromJSON(encoded)
+      let legacyPence = try legacyField.legacyGbpPence()
+      let eurExpected = try Money(currencyCode: "EUR", minorUnits: 199, minorUnitExponent: 2)
+      var rejected = 0
+      if (try? MoneyMigration.decodeAmount("10.5")) == nil { rejected += 1 }
+      if (try? MoneyMigration.decodeAmount("9223372036854775808")) == nil { rejected += 1 }
+      if legacyAmount == Money.fromLegacyGbpPence(3500)
+        && legacyPence == 3500
+        && eur == eurExpected
+        && wideAmount.minorUnits == 9_007_199_254_740_993
+        && wideAmount.plainDecimal() == "90071992547409.93"
+        && reordered.currencyCode == "EUR" && reordered.minorUnits == 1050
+        && encoded == #"{"currencyCode":"EUR","minorUnits":9007199254740993,"minorUnitExponent":2}"#
+        && decoded == precise
+        && rejected == 2
+      {
+        print("  ✓ legacy integers and ISO-4217 objects decode exactly")
+        passed += 1
+      } else {
+        print("  ✗ JSON migration mismatch encoded=\(encoded)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ JSON migration threw: \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: locale formatting
+    print("25. EUR and GBP locale formatting...")
+    let en = Locale(identifier: "en_GB")
+    let de = Locale(identifier: "de_DE")
+    let fr = Locale(identifier: "fr_FR")
+    let gbp = Money.fromLegacyGbpPence(1_248_050).formatted(locale: en)
+    let eurEn = (try? Money(currencyCode: "EUR", minorUnits: 1050, minorUnitExponent: 2).formatted(locale: en)) ?? ""
+    let eurDe = (try? Money(currencyCode: "EUR", minorUnits: 1050, minorUnitExponent: 2).formatted(locale: de)) ?? ""
+    let eurDeNeg = (try? Money(currencyCode: "EUR", minorUnits: -1050, minorUnitExponent: 2).formatted(locale: de)) ?? ""
+    let eurFr = (try? Money(currencyCode: "EUR", minorUnits: 123_456, minorUnitExponent: 2).formatted(locale: fr)) ?? ""
+    let grouped = money(1_000_000)
+    if gbp == "£12,480.50" && eurEn == "€10.50" && eurDe == "10,50 €" && eurDeNeg == "-10,50 €"
+      && eurFr == "1\u{00A0}234,56\u{00A0}€" && grouped == "£10,000.00"
+    {
+      print("  ✓ locale formatting matches exponent and separators")
+      passed += 1
+    } else {
+      print("  ✗ format mismatch gbp=\(gbp) eurEn=\(eurEn) eurDe=\(eurDe) eurFr=\(eurFr) grouped=\(grouped)")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
