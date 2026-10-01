@@ -1,0 +1,7 @@
+{
+  "recipientId": "northline-studio",
+  "amount": { "minor": 2599, "currency": "GBP" },
+  "method": "bank",
+  "note": "Desk lamp",
+  "scenario": "success"
+}

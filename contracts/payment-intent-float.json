@@ -1,0 +1,7 @@
+{
+  "recipientId": "northline-studio",
+  "amountMinor": 10.5,
+  "method": "card",
+  "note": "Desk lamp",
+  "scenario": "success"
+}

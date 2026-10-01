@@ -1,0 +1,29 @@
+{
+  "demoDate": "2026-09-18",
+  "currency": "GBP",
+  "minorUnit": 2,
+  "recipients": [
+    {
+      "id": "northline-studio",
+      "name": "Northline Studio",
+      "initials": "NS",
+      "detail": "Design tools",
+      "category": "Shopping",
+      "color": "#142C35"
+    }
+  ],
+  "providers": [
+    {
+      "id": "adyen",
+      "name": "Adyen",
+      "description": "Card payment processor",
+      "methods": ["card"]
+    },
+    {
+      "id": "worldpay",
+      "name": "Worldpay",
+      "description": "Bank payment processor",
+      "methods": ["bank"]
+    }
+  ]
+}

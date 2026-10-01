@@ -1,0 +1,43 @@
+{
+  "demoDate": "",
+  "recipients": [
+    {
+      "id": "",
+      "name": "Broken",
+      "initials": "B",
+      "detail": "x",
+      "category": "NotACategory",
+      "color": "#fff"
+    },
+    {
+      "id": "northline-studio",
+      "name": "Northline Studio",
+      "initials": "NS",
+      "detail": "Design tools",
+      "category": "Shopping",
+      "color": "#142C35"
+    },
+    {
+      "id": "northline-studio",
+      "name": "Duplicate",
+      "initials": "NS",
+      "detail": "Design tools",
+      "category": "Shopping",
+      "color": "#142C35"
+    }
+  ],
+  "providers": [
+    {
+      "id": "adyen",
+      "name": "Adyen",
+      "description": "Card payment processor",
+      "methods": ["card"]
+    },
+    {
+      "id": "unexpected",
+      "name": "Unexpected",
+      "description": "Not in the native baseline",
+      "methods": ["card"]
+    }
+  ]
+}

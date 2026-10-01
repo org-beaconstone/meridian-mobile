@@ -98,6 +98,41 @@ public struct Transaction: Codable, Hashable {
     self.status = status
     self.note = note
   }
+
+  private enum CodingKeys: String, CodingKey {
+    case id, reference, recipientId, name, category, amount, date, provider, method, status, note
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    reference = try container.decode(String.self, forKey: .reference)
+    recipientId = try container.decode(String.self, forKey: .recipientId)
+    name = try container.decode(String.self, forKey: .name)
+    category = try container.decode(Category.self, forKey: .category)
+    let money = try container.decode(FlexibleMoney.self, forKey: .amount)
+    amount = money.minor
+    date = try container.decode(String.self, forKey: .date)
+    provider = try container.decode(ProviderId.self, forKey: .provider)
+    method = try container.decode(PaymentMethod.self, forKey: .method)
+    status = try container.decode(TransactionStatus.self, forKey: .status)
+    note = try container.decode(String.self, forKey: .note)
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(reference, forKey: .reference)
+    try container.encode(recipientId, forKey: .recipientId)
+    try container.encode(name, forKey: .name)
+    try container.encode(category, forKey: .category)
+    try container.encode(amount, forKey: .amount)
+    try container.encode(date, forKey: .date)
+    try container.encode(provider, forKey: .provider)
+    try container.encode(method, forKey: .method)
+    try container.encode(status, forKey: .status)
+    try container.encode(note, forKey: .note)
+  }
 }
 
 public struct Budget: Codable, Hashable {
@@ -160,6 +195,60 @@ public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
   public let providers: [Provider]
+  public let currency: String
+  public let minorUnit: Int
+
+  public init(
+    demoDate: String,
+    recipients: [Recipient],
+    providers: [Provider],
+    currency: String = "GBP",
+    minorUnit: Int = 2
+  ) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+    self.currency = currency
+    self.minorUnit = minorUnit
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case demoDate, recipients, providers, currency, minorUnit
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    demoDate = try container.decode(String.self, forKey: .demoDate)
+    recipients = try container.decode([Recipient].self, forKey: .recipients)
+    providers = try container.decode([Provider].self, forKey: .providers)
+    let decodedCurrency = try container.decodeIfPresent(String.self, forKey: .currency) ?? "GBP"
+    let decodedMinor = try container.decodeIfPresent(Int.self, forKey: .minorUnit) ?? 2
+    guard decodedCurrency == "GBP" else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .currency,
+        in: container,
+        debugDescription: "UNSUPPORTED_CURRENCY"
+      )
+    }
+    guard decodedMinor == 2 else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .minorUnit,
+        in: container,
+        debugDescription: "INVALID_MINOR_UNIT"
+      )
+    }
+    currency = decodedCurrency
+    minorUnit = decodedMinor
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(demoDate, forKey: .demoDate)
+    try container.encode(recipients, forKey: .recipients)
+    try container.encode(providers, forKey: .providers)
+    try container.encode(currency, forKey: .currency)
+    try container.encode(minorUnit, forKey: .minorUnit)
+  }
 }
 
 public struct PaymentResponse: Codable {
@@ -270,11 +359,7 @@ public enum MeridianError: LocalizedError {
 // MARK: - Amount Formatting
 
 public func money(_ pence: Int) -> String {
-  let pounds = Double(pence) / 100.0
-  let formatter = NumberFormatter()
-  formatter.numberStyle = .currency
-  formatter.locale = Locale(identifier: "en_GB")
-  return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
+  formatGbp(Int64(pence))
 }
 
 /// Parse amount string to integer pence

@@ -1,0 +1,90 @@
+{
+  "consumer": "meridian-mobile",
+  "provider": "meridian-api",
+  "currenciesAccepted": ["GBP"],
+  "cases": [
+    {
+      "fixture": "catalog-legacy.json",
+      "kind": "catalog",
+      "expect": "accepted",
+      "currency": "GBP",
+      "legacy": true
+    },
+    {
+      "fixture": "catalog-gbp-object.json",
+      "kind": "catalog",
+      "expect": "accepted",
+      "currency": "GBP",
+      "legacy": false
+    },
+    {
+      "fixture": "catalog-eur.json",
+      "kind": "catalog",
+      "expect": "UNSUPPORTED_CURRENCY"
+    },
+    {
+      "fixture": "catalog-malformed.json",
+      "kind": "catalog",
+      "expect": "MALFORMED_CATALOG",
+      "detailContains": "unknown_provider"
+    },
+    {
+      "fixture": "catalog-empty-id.json",
+      "kind": "catalog",
+      "expect": "MALFORMED_CATALOG",
+      "detailContains": "empty_recipient_id"
+    },
+    {
+      "fixture": "catalog-method-mismatch.json",
+      "kind": "catalog",
+      "expect": "MALFORMED_CATALOG",
+      "detailContains": "provider_method_mismatch"
+    },
+    {
+      "fixture": "payment-intent-legacy.json",
+      "kind": "intent",
+      "expect": "accepted",
+      "currency": "GBP",
+      "legacy": true,
+      "amountMinor": 2599,
+      "provider": "adyen"
+    },
+    {
+      "fixture": "payment-intent-gbp-object.json",
+      "kind": "intent",
+      "expect": "accepted",
+      "currency": "GBP",
+      "legacy": false,
+      "amountMinor": 2599,
+      "provider": "worldpay"
+    },
+    {
+      "fixture": "payment-intent-eur.json",
+      "kind": "intent",
+      "expect": "UNSUPPORTED_CURRENCY"
+    },
+    {
+      "fixture": "payment-intent-float.json",
+      "kind": "intent",
+      "expect": "MALFORMED_AMOUNT"
+    },
+    {
+      "fixture": "transaction-legacy.json",
+      "kind": "transaction",
+      "expect": "accepted",
+      "currency": "GBP",
+      "legacy": true,
+      "amountMinor": 3500,
+      "provider": "worldpay"
+    },
+    {
+      "fixture": "transaction-gbp-object.json",
+      "kind": "transaction",
+      "expect": "accepted",
+      "currency": "GBP",
+      "legacy": false,
+      "amountMinor": 3500,
+      "provider": "adyen"
+    }
+  ]
+}
