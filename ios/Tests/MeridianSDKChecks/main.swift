@@ -341,10 +341,140 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    func expect(_ name: String, _ condition: Bool, _ detail: String) {
+      let number = passed + failed + 1
+      print("\(number). \(name)...")
+      if condition {
+        print("  ✓ \(detail)")
+        passed += 1
+      } else {
+        print("  ✗ \(detail)")
+        failed += 1
+      }
+    }
+
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let draft = PaymentDraft(
+      recipientId: "northline-studio",
+      amountText: "12.50",
+      reference: "Studio deposit",
+      method: .card,
+      reviewing: true,
+      idempotencyKey: "pay-key-1"
+    )
+
+    let active = presentSession(sessionForPhase(.active, now: now), now: now)
+    expect("active session banner", active.phase == .active && active.tone == .success && active.action == nil && active.clockLabel == nil, active.title)
+
+    let expiring = presentSession(sessionForPhase(.expiring, now: now), now: now)
+    expect(
+      "expiring session shows time and refresh",
+      expiring.phase == .expiring && expiring.tone == .warning && expiring.action == .refresh
+        && expiring.remainingSeconds == SessionTiming.previewExpiringSeconds
+        && expiring.clockLabel == "1:30"
+        && expiring.message.contains("1 minute 30 seconds remaining")
+        && expiring.actionLabel == "Refresh session",
+      expiring.message
+    )
+
+    let boundary = presentSession(
+      .active(expiresAt: now.addingTimeInterval(TimeInterval(SessionTiming.expiringThresholdSeconds))),
+      now: now
+    )
+    expect("threshold is expiring", boundary.phase == .expiring && boundary.clockLabel == "2:00", boundary.clockLabel ?? "")
+
+    let stillActive = presentSession(
+      .active(expiresAt: now.addingTimeInterval(TimeInterval(SessionTiming.expiringThresholdSeconds + 1))),
+      now: now
+    )
+    expect("just outside threshold stays active", stillActive.phase == .active && stillActive.action == nil, stillActive.title)
+
+    let oneSecond = presentSession(.active(expiresAt: now.addingTimeInterval(1)), now: now)
+    expect("one second remaining", oneSecond.remainingSeconds == 1 && oneSecond.message.hasPrefix("1 second remaining") && oneSecond.clockLabel == "0:01", oneSecond.message)
+
+    let derivedExpired = presentSession(.active(expiresAt: now), now: now)
+    let explicitExpired = presentSession(.expired, now: now)
+    expect(
+      "elapsed active session presents as expired",
+      derivedExpired.phase == .expired && derivedExpired.tone == .danger && derivedExpired.action == .signIn
+        && derivedExpired.title == explicitExpired.title && derivedExpired.message == explicitExpired.message,
+      derivedExpired.message
+    )
+
+    let elsewhere = presentSession(.activeElsewhere(deviceName: "  "), now: now)
+    expect(
+      "active elsewhere recovery",
+      elsewhere.phase == .activeElsewhere && elsewhere.tone == .information && elsewhere.action == .continueHere
+        && elsewhere.message.contains("another device"),
+      elsewhere.message
+    )
+
+    let named = presentSession(.activeElsewhere(deviceName: "Meridian web"), now: now)
+    expect("named other device", named.message.contains("Meridian web"), named.message)
+
+    let signedOut = presentSession(.signedOut, now: now)
+    expect(
+      "signed out keeps payment context in guidance",
+      signedOut.phase == .signedOut && signedOut.tone == .neutral && signedOut.action == .signIn
+        && signedOut.message.contains("amount, recipient and reference"),
+      signedOut.title
+    )
+
+    let unknown = presentSession(.unknown, now: now)
+    expect(
+      "unknown session recovery",
+      unknown.phase == .unknown && unknown.tone == .attention && unknown.action == .tryAgain
+        && unknown.message.contains("payment details stay on this screen"),
+      unknown.title
+    )
+
+    let titles = SessionPhase.allCases.map { presentSession(sessionForPhase($0, now: now), now: now).title }
+    let tones = SessionPhase.allCases.map { presentSession(sessionForPhase($0, now: now), now: now).tone }
+    expect("distinct titles and tones", Set(titles).count == 6 && Set(tones).count == 6, titles.joined(separator: ", "))
+
+    expect("remaining phrases", formatRemaining(0) == "0 seconds" && formatRemaining(2) == "2 seconds" && formatRemaining(60) == "1 minute" && formatRemaining(61) == "1 minute 1 second" && formatRemaining(120) == "2 minutes", formatRemaining(61))
+
+    let refreshed = applySessionAction(session: sessionForPhase(.expiring, now: now), action: .refresh, now: now, apiReachable: true, payment: draft)
+    expect(
+      "refresh extends session and returns the same payment draft",
+      refreshed.payment == draft && refreshed.announcement.contains("unchanged"),
+      refreshed.announcement
+    )
+    if case let .active(expiresAt) = refreshed.session {
+      expect("refresh expiry window", expiresAt == now.addingTimeInterval(TimeInterval(SessionTiming.lengthSeconds)), "\(expiresAt)")
+    } else {
+      expect("refresh expiry window", false, "session was not active")
+    }
+
+    let held = CustomerSession.active(expiresAt: now.addingTimeInterval(45))
+    let failedRefresh = applySessionAction(session: held, action: .refresh, now: now, apiReachable: false, payment: draft)
+    expect(
+      "failed refresh keeps session and payment draft",
+      failedRefresh.session == held && failedRefresh.payment == draft && failedRefresh.announcement.contains("still here"),
+      failedRefresh.announcement
+    )
+
+    let signedIn = applySessionAction(session: .expired, action: .signIn, now: now, apiReachable: false, payment: draft)
+    expect("sign in from expired keeps draft", signedIn.payment == draft && signedIn.announcement.contains("Payment details are unchanged"), signedIn.announcement)
+
+    let continued = applySessionAction(session: .activeElsewhere(deviceName: "Meridian web"), action: .continueHere, now: now, apiReachable: false, payment: draft)
+    expect("continue here keeps draft", continued.payment == draft, continued.announcement)
+
+    let stillUnknown = applySessionAction(session: .unknown, action: .tryAgain, now: now, apiReachable: false, payment: draft)
+    expect(
+      "try again offline stays unknown without clearing draft",
+      stillUnknown.session == .unknown && stillUnknown.payment == draft && stillUnknown.announcement.contains("still here"),
+      stillUnknown.announcement
+    )
+
+    let confirmed = applySessionAction(session: .unknown, action: .tryAgain, now: now, apiReachable: true, payment: draft)
+    expect("try again online confirms session and keeps draft", confirmed.payment == draft && confirmed.announcement.contains("unchanged"), confirmed.announcement)
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

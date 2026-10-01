@@ -1,6 +1,8 @@
 import SwiftUI
 import MeridianSDK
 
+enum MeridianScreen { case payment, authentication }
+
 @main struct MeridianApp: App {
   var body: some Scene { WindowGroup { MeridianView().frame(minWidth: 350, minHeight: 650) } }
 }
@@ -19,7 +21,14 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @State private var screen = MeridianScreen.payment
+  @State private var session = CustomerSession.active(
+    expiresAt: Date().addingTimeInterval(TimeInterval(SessionTiming.lengthSeconds))
+  )
+  @State private var now = Date()
+  @State private var sessionNotice = ""
   var body: some View {
+    let banner = presentSession(session, now: now)
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         Text("meridian").font(.largeTitle).fontWeight(.semibold)
@@ -30,7 +39,21 @@ import MeridianSDK
           Button("Connect") { Task { await connect() } }.disabled(busy)
         }.textFieldStyle(.roundedBorder)
         Text(message).font(.callout).foregroundStyle(.secondary)
-        if let state {
+        Picker("Screen", selection: $screen) {
+          Text("Payment").tag(MeridianScreen.payment)
+          Text("Authentication").tag(MeridianScreen.authentication)
+        }
+        .pickerStyle(.segmented)
+        .accessibilityLabel("Payment or authentication")
+        SessionBannerView(model: banner) { action in Task { await handleSession(action) } }
+        if !sessionNotice.isEmpty {
+          Text(sessionNotice)
+            .font(.body)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        if screen == .authentication {
+          authentication(presented: banner.phase)
+        } else if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
             Text(money(state.balance)).font(.system(size: 38, weight: .medium))
@@ -57,8 +80,82 @@ import MeridianSDK
           ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
         }
       }.padding(24).frame(maxWidth: 550)
-    }.task {
+    }
+    .task {
       while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
+    }
+    .task {
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(1))
+        now = Date()
+      }
+    }
+  }
+  private func authentication(presented: SessionPhase) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Authentication").font(.title2)
+      Text("Alex Morgan").font(.headline)
+      Text("Fictional rehearsal profile. No password is collected and no identity provider is called.")
+        .font(.body)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      if presented == .active || presented == .expiring || presented == .activeElsewhere {
+        Button("Sign out") {
+          session = .signedOut
+          sessionNotice = "Signed out. Payment details are unchanged."
+        }
+        .accessibilityHint("Keeps the amount, recipient and reference already entered")
+      }
+      Picker("Preview session state", selection: previewBinding) {
+        ForEach(SessionPhase.allCases) { phase in
+          Text(phase.pickerLabel).tag(phase)
+        }
+      }
+      .accessibilityLabel("Preview session state")
+    }
+  }
+  private var previewBinding: Binding<SessionPhase> {
+    Binding(
+      get: { presentSession(session, now: now).phase },
+      set: { phase in
+        session = sessionForPhase(phase, now: Date())
+        now = Date()
+      }
+    )
+  }
+  private func handleSession(_ action: SessionBannerAction) async {
+    let reachable: Bool
+    if action == .refresh || action == .tryAgain {
+      reachable = await probeSession()
+    } else {
+      reachable = false
+    }
+    let draft = PaymentDraft(
+      recipientId: recipient,
+      amountText: amount,
+      reference: reference,
+      method: method,
+      reviewing: review,
+      idempotencyKey: key
+    )
+    let result = applySessionAction(
+      session: session,
+      action: action,
+      now: Date(),
+      apiReachable: reachable,
+      payment: draft
+    )
+    session = result.session
+    now = Date()
+    sessionNotice = result.announcement
+  }
+  private func probeSession() async -> Bool {
+    guard let client else { return false }
+    do {
+      _ = try await client.getHealth()
+      return true
+    } catch {
+      return false
     }
   }
   private func connect() async {

@@ -114,6 +114,83 @@ a {
   margin-left: auto;
   color: #52624c;
 }
+.session-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  padding: 1rem;
+  border: 1px solid transparent;
+  border-radius: 0.75rem;
+}
+.session-banner-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+}
+.session-banner h2 {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+.session-clock {
+  margin: 0;
+  font-size: 1.25rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.session-banner-message {
+  margin: 0;
+  color: inherit;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.session-action {
+  min-height: 2.75rem;
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid currentColor;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.session-banner--active {
+  background: #e7f2dd;
+  border-color: #7aaf78;
+  color: #1f4d32;
+}
+.session-banner--expiring {
+  background: #fff7d6;
+  border-color: #e2b203;
+  color: #533f04;
+}
+.session-banner--active-elsewhere {
+  background: #e9f2ff;
+  border-color: #1868db;
+  color: #0c3a7a;
+}
+.session-banner--signed-out {
+  background: #f4f5f7;
+  border-color: #8b9588;
+  color: #142c35;
+}
+.session-banner--expired {
+  background: #ffedeb;
+  border-color: #ae2a19;
+  color: #8d2517;
+}
+.session-banner--unknown {
+  background: #f3ede3;
+  border-color: #d5b77a;
+  color: #3d2e16;
+}
 .status-dot {
   width: 6px;
   height: 6px;
@@ -255,12 +332,15 @@ main {
 }
 .mobile-nav button {
   flex: 1;
+  min-width: 0;
   border: 0;
   background: none;
   color: #53664e;
   font-size: 11px;
+  line-height: 1.2;
   min-height: 45px;
   border-radius: 8px;
+  white-space: normal;
 }
 .mobile-nav button[aria-current='page'] {
   color: #142c35;

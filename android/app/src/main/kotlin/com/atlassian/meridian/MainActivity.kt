@@ -10,6 +10,11 @@ import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -37,6 +42,18 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  var screen by remember { mutableStateOf(MeridianScreen.Payment) }
+  var session by remember {
+    mutableStateOf(sessionForPhase(SessionPhase.ACTIVE, System.currentTimeMillis()))
+  }
+  var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+  var sessionNotice by remember { mutableStateOf("") }
+  LaunchedEffect(Unit) {
+    while (true) {
+      delay(1000)
+      nowMs = System.currentTimeMillis()
+    }
+  }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
@@ -58,7 +75,53 @@ class MainActivity : ComponentActivity() {
       else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
-    state?.let { current ->
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      MeridianScreen.entries.forEach { item ->
+        OutlinedButton(
+          onClick = { screen = item },
+          modifier = Modifier.semantics {
+            if (screen == item) selected = true
+            contentDescription = item.label
+          },
+        ) { Text(item.label) }
+      }
+    }
+    val banner = presentSession(session, nowMs)
+    SessionBannerView(banner) { action ->
+      val draft = PaymentDraft(recipient, amount, note, method, review, paymentKey)
+      scope.launch {
+        val reachable = if (
+          action == SessionBannerAction.REFRESH || action == SessionBannerAction.TRY_AGAIN
+        ) {
+          probeSession(client)
+        } else {
+          false
+        }
+        val result = applySessionAction(session, action, System.currentTimeMillis(), reachable, draft)
+        session = result.session
+        nowMs = System.currentTimeMillis()
+        sessionNotice = result.announcement
+      }
+    }
+    if (sessionNotice.isNotEmpty()) {
+      Text(sessionNotice, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+    }
+    if (screen == MeridianScreen.Authentication) {
+      AuthenticationScreen(
+        session = session,
+        nowEpochMs = nowMs,
+        onSignOut = {
+          session = CustomerSession.SignedOut
+          sessionNotice = "Signed out. Payment details are unchanged."
+        },
+        onPreview = { phase ->
+          val stamp = System.currentTimeMillis()
+          session = sessionForPhase(phase, stamp)
+          nowMs = stamp
+        },
+      )
+    }
+    if (screen == MeridianScreen.Payment) state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
       }
@@ -87,5 +150,15 @@ class MainActivity : ComponentActivity() {
       Text("Budgets",style=MaterialTheme.typography.h6)
       current.budgets.forEach {budget->Text("${budget.category} · ${money(budget.limit)}")}
     }
+  }
+}
+
+private suspend fun probeSession(client: MeridianClient?): Boolean {
+  if (client == null) return false
+  return try {
+    client.getHealth()
+    true
+  } catch (_: Exception) {
+    false
   }
 }
