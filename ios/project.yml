@@ -16,7 +16,9 @@ targets:
         SWIFT_VERSION: '5.0'
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Meridian
+        INFOPLIST_KEY_NSFaceIDUsageDescription: Confirm fictional rehearsal payments with Face ID.
         INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        CODE_SIGN_ENTITLEMENTS: App/Meridian.entitlements
     dependencies:
       - package: MeridianSDK
         product: MeridianSDK
