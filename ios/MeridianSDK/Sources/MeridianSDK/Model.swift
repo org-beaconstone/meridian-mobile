@@ -246,6 +246,7 @@ public enum MeridianError: LocalizedError {
   case missingSession
   case invalidAmount(String)
   case validationError(String)
+  case catalogUnavailable(String)
 
   public var errorDescription: String? {
     switch self {
@@ -263,6 +264,8 @@ public enum MeridianError: LocalizedError {
       return "Invalid amount: \(msg)"
     case let .validationError(msg):
       return "Validation error: \(msg)"
+    case let .catalogUnavailable(msg):
+      return "Catalog unavailable: \(msg)"
     }
   }
 }
