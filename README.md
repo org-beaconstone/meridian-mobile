@@ -40,8 +40,10 @@ gradle :app:assembleDebug
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
 
-## Deliberate baseline
+## Payment method selection
 
-Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+Native SwiftUI and Compose screens build the payment-method list from `GET /catalog`. The method selector is a bottom sheet grouped by each server descriptor, with a monogram logo and an eligibility state. A method that requires a bank shows a searchable bank selector. Both selectors show loading skeletons and empty states, and they use the full screen on a tablet-width layout or with large accessibility text. The client submits the catalog method (`card` or `bank`) and does not add a provider the catalog did not return. Amounts stay integer GBP pence. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.
+
+The phone-shaped page under `preview/` is a browser companion for the connected rehearsal. It is not the native selector.
 
 See [source context](https://github.com/org-beaconstone/meridian-api/blob/main/docs/context.md), [API contract](https://github.com/org-beaconstone/meridian-api/blob/main/docs/contract.md) and [connected runbook](https://github.com/org-beaconstone/meridian-api/blob/main/docs/connected-rehearsal.md). Existing Kaizen site remains standalone; no Java hosting is implied.
