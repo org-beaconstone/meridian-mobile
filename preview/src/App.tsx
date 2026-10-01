@@ -1,5 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import {
+  generateTraceId,
+  generateSpanId,
+  traceparent,
+  sha256Hex,
+  sanitizeForAudit,
+  type AuditLogEntry,
+  type PaymentJourneyEvent,
+  type PaymentOutcome,
+} from './telemetry';
+
+// Session-scoped trace ID: one stable identifier for all requests in this page load.
+const SESSION_TRACE_ID = generateTraceId();
 
 type Method = 'card' | 'bank';
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
@@ -41,6 +54,9 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
       headers: {
         'Content-Type': 'application/json',
         'X-Rehearsal-Session': room,
+        // Propagate distributed trace context on every outgoing request.
+        traceparent: traceparent(SESSION_TRACE_ID, generateSpanId()),
+        'X-Trace-Id': SESSION_TRACE_ID,
         ...(key ? { 'Idempotency-Key': key } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -94,6 +110,10 @@ export default function App() {
     revision = useRef(0),
     mutating = useRef(false),
     paymentKey = useRef(crypto.randomUUID());
+  // Catalog metadata for telemetry correlation (catalog age, method count).
+  const catalogFetchedAt = useRef<number | null>(null);
+  const catalogDemoDate = useRef<string | null>(null);
+  const catalogMethodCount = useRef<number | null>(null);
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -117,6 +137,10 @@ export default function App() {
           ) {
             setState(bankState(raw));
             setRecipients(catalog.recipients);
+            // Store catalog metadata for payment telemetry correlation.
+            catalogFetchedAt.current = Date.now();
+            catalogDemoDate.current = (catalog as { demoDate?: string }).demoDate ?? null;
+            catalogMethodCount.current = providers.length;
             setConnected(true);
           }
         }
@@ -167,8 +191,52 @@ export default function App() {
     setError('');
     paymentKey.current = crypto.randomUUID();
   }
+  /**
+   * Emits a telemetry event and (when sampled) an audit log entry for a payment attempt.
+   * Runs asynchronously so it never blocks the UI path.
+   */
+  async function recordPaymentTelemetry(
+    idempotencyKey: string,
+    paymentMethod: Method,
+    outcome: PaymentOutcome,
+    latencyMs: number,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const catalogAgeSeconds =
+      catalogFetchedAt.current !== null ? (Date.now() - catalogFetchedAt.current) / 1000 : null;
+
+    const event: PaymentJourneyEvent = {
+      traceId: SESSION_TRACE_ID,
+      catalogAgeSeconds,
+      methodCount: catalogMethodCount.current,
+      scaInvoked: paymentMethod === 'card',
+      latencyMs,
+      outcome,
+      timestamp: now,
+    };
+    // In production this would forward to an observability sink; log for rehearsal visibility.
+    console.debug('[telemetry]', event);
+
+    // Audit entry: hash the idempotency key, never store the raw value.
+    const hashedKey = await sha256Hex(idempotencyKey);
+    const entry: AuditLogEntry = {
+      traceId: SESSION_TRACE_ID,
+      timestamp: now,
+      action: outcome === 'error' ? 'PAYMENT_ERROR' : 'PAYMENT_SUBMITTED',
+      hashedIdempotencyKey: hashedKey,
+      catalogVersion: catalogDemoDate.current,
+      paymentMethod,
+      outcome,
+    };
+    // Sanitize before logging (defensive: removes URLs/tokens/credentials if any crept in).
+    console.debug('[audit]', {
+      ...entry,
+      action: sanitizeForAudit(entry.action),
+      outcome: sanitizeForAudit(entry.outcome),
+    });
+  }
+
   function review() {
-    const value = pence(amount);
     if (value === null) {
       setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
       return;
@@ -181,19 +249,30 @@ export default function App() {
     setStep('review');
   }
   async function confirm() {
+    const journeyStart = Date.now();
+    const idempotencyKey = paymentKey.current;
     try {
       setError('');
       const result = await mutate(
         '/payments',
         'POST',
         { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
+        idempotencyKey,
       );
+      const latencyMs = Date.now() - journeyStart;
+      const outcome: PaymentOutcome = result.ok
+        ? 'success'
+        : result.code === 'PAYMENT_PENDING'
+          ? 'pending'
+          : 'declined';
+      void recordPaymentTelemetry(idempotencyKey, method, outcome, latencyMs);
       if (result.ok) {
         setReceipt(result.transaction);
         setStep('done');
       } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
+      const latencyMs = Date.now() - journeyStart;
+      void recordPaymentTelemetry(idempotencyKey, method, 'error', latencyMs);
       setError(e instanceof Error ? e.message : 'Payment failed');
     }
   }

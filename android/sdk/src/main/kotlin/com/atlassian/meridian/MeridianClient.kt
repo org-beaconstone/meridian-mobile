@@ -9,16 +9,23 @@ import java.net.URL
 import java.nio.charset.StandardCharsets
 
 /**
- * Meridian API client for Kotlin/JVM and Android
- * Uses HttpURLConnection for universal JVM/Android compatibility
- * Coroutines for async operations with UI dispatcher where needed
+ * Meridian API client for Kotlin/JVM and Android.
+ * Uses HttpURLConnection for universal JVM/Android compatibility.
+ * Coroutines for async operations with UI dispatcher where needed.
  */
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val telemetryConfig: TelemetryConfig = TelemetryConfig(),
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+  private val traceContext = TraceContext()
+
+  // Catalog metadata captured during getCatalog() for telemetry correlation.
+  @Volatile private var catalogVersion: String? = null
+  @Volatile private var catalogFetchedAtMs: Long? = null
+  @Volatile private var catalogMethodCount: Int? = null
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -26,6 +33,9 @@ class MeridianClient(
       baseUrlNormalized.startsWith("http://") || baseUrlNormalized.startsWith("https://")
     ) { "Invalid URL: must start with http:// or https://" }
   }
+
+  /** The trace ID for this client session, for correlation in error reports. */
+  val traceId: String get() = traceContext.traceId
 
   // MARK: - Internal Request Method
 
@@ -46,6 +56,11 @@ class MeridianClient(
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
+
+      // Propagate distributed trace context on every outgoing request.
+      val spanId = TraceContext.newSpanId()
+      connection.setRequestProperty("traceparent", traceContext.traceparent(spanId))
+      connection.setRequestProperty("X-Trace-Id", traceContext.traceId)
 
       // Add additional headers (e.g., Idempotency-Key)
       additionalHeaders.forEach { (key, value) ->
@@ -116,10 +131,16 @@ class MeridianClient(
     request("GET", "/health", responseType = HealthResponse::class.java)
 
   /**
-   * GET /catalog - Fetch recipients and providers
+   * GET /catalog - Fetch recipients and providers.
+   * Catalog metadata (version, method count) is stored for telemetry correlation.
    */
-  suspend fun getCatalog(): CatalogResponse =
-    request("GET", "/catalog", responseType = CatalogResponse::class.java)
+  suspend fun getCatalog(): CatalogResponse {
+    val response = request("GET", "/catalog", responseType = CatalogResponse::class.java)
+    catalogVersion = response.demoDate
+    catalogFetchedAtMs = System.currentTimeMillis()
+    catalogMethodCount = response.providers.sumOf { it.methods.size }
+    return response
+  }
 
   /**
    * GET /state - Fetch current bank state
@@ -152,13 +173,43 @@ class MeridianClient(
       scenario = scenario.name,
     )
 
-    return request(
-      "POST",
-      "/payments",
-      payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
-      PaymentResponse::class.java,
-    )
+    val catalogAge = catalogFetchedAtMs?.let {
+      (System.currentTimeMillis() - it) / 1000.0
+    }
+    val startMs = System.currentTimeMillis()
+
+    val response: PaymentResponse
+    try {
+      response = request(
+        "POST",
+        "/payments",
+        payload,
+        mapOf("Idempotency-Key" to idempotencyKey),
+        PaymentResponse::class.java,
+      )
+    } catch (e: Exception) {
+      val latencyMs = System.currentTimeMillis() - startMs
+      emitTelemetry(PaymentOutcome.ERROR, method == PaymentMethod.card, latencyMs, catalogAge)
+      emitAudit("PAYMENT_ERROR", idempotencyKey, method.name, "error", sample = true)
+      throw e
+    }
+
+    val latencyMs = System.currentTimeMillis() - startMs
+    val outcome = when {
+      response.ok -> PaymentOutcome.SUCCESS
+      response.code == "PAYMENT_PENDING" -> PaymentOutcome.PENDING
+      else -> PaymentOutcome.DECLINED
+    }
+
+    emitTelemetry(outcome, method == PaymentMethod.card, latencyMs, catalogAge)
+
+    // Successful journeys are always audited; failed journeys respect the sampling rate.
+    val shouldAudit =
+      outcome == PaymentOutcome.SUCCESS ||
+        Math.random() < telemetryConfig.failedJourneySamplingRate
+    emitAudit("PAYMENT_SUBMITTED", idempotencyKey, method.name, outcome.name.lowercase(), shouldAudit)
+
+    return response
   }
 
   /**
@@ -190,4 +241,46 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  // MARK: - Telemetry Helpers
+
+  private fun emitTelemetry(
+    outcome: PaymentOutcome,
+    scaInvoked: Boolean,
+    latencyMs: Long,
+    catalogAge: Double?,
+  ) {
+    telemetryConfig.onEvent?.invoke(
+      PaymentJourneyEvent(
+        traceId = traceContext.traceId,
+        catalogAgeSeconds = catalogAge,
+        methodCount = catalogMethodCount,
+        scaInvoked = scaInvoked,
+        latencyMs = latencyMs,
+        outcome = outcome,
+        timestamp = isoNow(),
+      )
+    )
+  }
+
+  private fun emitAudit(
+    action: String,
+    idempotencyKey: String,
+    paymentMethod: String,
+    outcome: String,
+    sample: Boolean,
+  ) {
+    if (!sample) return
+    telemetryConfig.onAudit?.invoke(
+      AuditLogEntry(
+        traceId = traceContext.traceId,
+        timestamp = isoNow(),
+        action = action,
+        hashedIdempotencyKey = sha256Hex(idempotencyKey),
+        catalogVersion = catalogVersion,
+        paymentMethod = paymentMethod,
+        outcome = outcome,
+      )
+    )
+  }
 }

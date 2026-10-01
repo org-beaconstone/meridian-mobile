@@ -4,16 +4,25 @@ public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let traceContext: TraceContext
+  private let telemetryConfig: TelemetryConfig
+
+  // Catalog metadata captured during getCatalog() for telemetry correlation.
+  private var catalogVersion: String?
+  private var catalogFetchedAt: Date?
+  private var catalogMethodCount: Int?
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - telemetry: Configuration for payment telemetry and audit logging
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    telemetry: TelemetryConfig = TelemetryConfig()
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,7 +45,12 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.traceContext = TraceContext()
+    self.telemetryConfig = telemetry
   }
+
+  /// The trace ID for this client session, for correlation in error reports.
+  public var traceId: String { traceContext.traceId }
 
   // MARK: - Internal Request Method
 
@@ -52,6 +66,11 @@ public actor MeridianClient {
     request.httpMethod = method
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
+
+    // Propagate distributed trace context on every outgoing request.
+    let spanId = TraceContext.newSpanId()
+    request.setValue(traceContext.traceparent(spanId: spanId), forHTTPHeaderField: "traceparent")
+    request.setValue(traceContext.traceId, forHTTPHeaderField: "X-Trace-Id")
 
     // Add additional headers (e.g., Idempotency-Key)
     for (key, value) in additionalHeaders {
@@ -95,9 +114,14 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
-  /// GET /catalog - Fetch recipients and providers
+  /// GET /catalog - Fetch recipients and providers.
+  /// Catalog metadata (version, method count) is stored for telemetry correlation.
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    let response: CatalogResponse = try await request(method: "GET", path: "/catalog")
+    catalogVersion = response.demoDate
+    catalogFetchedAt = Date()
+    catalogMethodCount = response.providers.flatMap { $0.methods }.count
+    return response
   }
 
   /// GET /state - Fetch current bank state
@@ -129,12 +153,46 @@ public actor MeridianClient {
       scenario: scenario
     )
 
-    return try await request(
-      method: "POST",
-      path: "/payments",
-      body: payload,
-      additionalHeaders: ["Idempotency-Key": idempotencyKey]
-    )
+    let catalogAge = catalogFetchedAt.map { Date().timeIntervalSince($0) }
+    let start = Date()
+
+    let response: PaymentResponse
+    do {
+      response = try await request(
+        method: "POST",
+        path: "/payments",
+        body: payload,
+        additionalHeaders: ["Idempotency-Key": idempotencyKey]
+      )
+    } catch {
+      let latencyMs = Int(Date().timeIntervalSince(start) * 1000)
+      emitTelemetry(
+        outcome: .error, scaInvoked: method == .card,
+        latencyMs: latencyMs, catalogAge: catalogAge)
+      emitAudit(
+        action: "PAYMENT_ERROR", idempotencyKey: idempotencyKey,
+        paymentMethod: method.rawValue, outcome: "error", sample: true)
+      throw error
+    }
+
+    let latencyMs = Int(Date().timeIntervalSince(start) * 1000)
+    let outcome: PaymentOutcome =
+      response.ok ? .success
+      : (response.code == "PAYMENT_PENDING" ? .pending : .declined)
+
+    emitTelemetry(
+      outcome: outcome, scaInvoked: method == .card,
+      latencyMs: latencyMs, catalogAge: catalogAge)
+
+    // Successful journeys are always audited; failed journeys respect the sampling rate.
+    let shouldAudit =
+      outcome == .success
+      || Double.random(in: 0..<1) < telemetryConfig.failedJourneySamplingRate
+    emitAudit(
+      action: "PAYMENT_SUBMITTED", idempotencyKey: idempotencyKey,
+      paymentMethod: method.rawValue, outcome: outcome.rawValue, sample: shouldAudit)
+
+    return response
   }
 
   /// PATCH /budgets - Update budget for a category
@@ -161,5 +219,44 @@ public actor MeridianClient {
   /// GET /events - Fetch audit events
   public func getEvents() async throws -> EventsResponse {
     return try await request(method: "GET", path: "/events")
+  }
+
+  // MARK: - Telemetry Helpers
+
+  private func emitTelemetry(
+    outcome: PaymentOutcome,
+    scaInvoked: Bool,
+    latencyMs: Int,
+    catalogAge: Double?
+  ) {
+    guard let onEvent = telemetryConfig.onEvent else { return }
+    onEvent(PaymentJourneyEvent(
+      traceId: traceContext.traceId,
+      catalogAgeSeconds: catalogAge,
+      methodCount: catalogMethodCount,
+      scaInvoked: scaInvoked,
+      latencyMs: latencyMs,
+      outcome: outcome,
+      timestamp: isoNow()
+    ))
+  }
+
+  private func emitAudit(
+    action: String,
+    idempotencyKey: String,
+    paymentMethod: String,
+    outcome: String,
+    sample: Bool
+  ) {
+    guard sample, let onAudit = telemetryConfig.onAudit else { return }
+    onAudit(AuditLogEntry(
+      traceId: traceContext.traceId,
+      timestamp: isoNow(),
+      action: action,
+      hashedIdempotencyKey: sha256Hex(idempotencyKey),
+      catalogVersion: catalogVersion,
+      paymentMethod: paymentMethod,
+      outcome: outcome
+    ))
   }
 }
