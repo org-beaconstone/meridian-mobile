@@ -11,3 +11,11 @@ jobs:
         working-directory: ios
       - run: swift run MeridianSDKChecks
         working-directory: ios
+      - run: swift run MeridianContractChecks
+        working-directory: ios
+      - run: swift run MeridianScenarioChecks
+        working-directory: ios
+      - run: swift run MeridianSecurityChecks
+        working-directory: ios
+      - run: swift run MeridianA11yChecks
+        working-directory: ios
