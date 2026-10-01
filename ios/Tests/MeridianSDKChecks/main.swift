@@ -341,10 +341,265 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    func check(_ name: String, _ condition: Bool) {
+      if condition {
+        print("  ✓ \(name)")
+        passed += 1
+      } else {
+        print("  ✗ \(name)")
+        failed += 1
+      }
+    }
+
+    let payloadHash = businessPayloadHash(
+      customerAccountId: "acct-1",
+      recipientId: "northline-studio",
+      amountMinor: 2599,
+      method: .card,
+      note: "lunch"
+    )
+    print("21. business payload hash...")
+    check(
+      "canonical business payload hash",
+      payloadHash == "f7005a22f7deb113825ad2d2ec98e98abbd62f06fde119402dd062575bd863a6"
+    )
+    let escapedHash = businessPayloadHash(
+      customerAccountId: "acct-1",
+      recipientId: "northline-studio",
+      amountMinor: 100,
+      method: .bank,
+      note: "say \"hi\""
+    )
+    check(
+      "escaped note changes the hash",
+      escapedHash == "311d46ff743ceab3f78257a3b6313cf311f234079de3c0c32845de6266d978ef"
+        && escapedHash != businessPayloadHash(
+          customerAccountId: "acct-1",
+          recipientId: "northline-studio",
+          amountMinor: 101,
+          method: .bank,
+          note: "say \"hi\""
+        )
+    )
+
+    let settledState = PaymentReturnState(
+      ok: true,
+      paymentId: "pay-1",
+      code: nil,
+      error: nil,
+      stateVersion: 4,
+      balancePence: 1_245_451
+    )
+    print("22. return state hash...")
+    check(
+      "settled return state hash",
+      returnStateHash(settledState) == "b5249909bae8e7dd177a9d782f43300fb7e0ce1da42a696d0f5770227d68bb44"
+    )
+    let pendingState = PaymentReturnState(
+      ok: false,
+      paymentId: "pay-9",
+      code: "PAYMENT_PENDING",
+      error: "Awaiting confirmation",
+      stateVersion: nil,
+      balancePence: nil
+    )
+    check(
+      "pending return state hash",
+      returnStateHash(pendingState) == "a5ea41d10b6f195c073b33f96c57bb76cfee49de91d4a38c5220bd4ecb85197b"
+    )
+
+    print("23. status mapping...")
+    check("ok response is succeeded", paymentIntentStatus(for: PaymentResponse(ok: true, state: nil, transaction: nil, error: nil, code: nil, paymentId: "pay-1")) == .succeeded)
+    check("pending code stays active", paymentIntentStatus(for: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Awaiting confirmation", code: "PAYMENT_PENDING", paymentId: "pay-9")) == .pending)
+    check("declined code is terminal", paymentIntentStatus(for: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Declined", code: "PAYMENT_DECLINED", paymentId: nil)) == .declined)
+    check("unavailable stays retryable", paymentIntentStatus(for: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Down", code: "PROVIDER_UNAVAILABLE", paymentId: nil)) == .processing)
+    check("empty code stays retryable", paymentIntentStatus(for: PaymentResponse(ok: false, state: nil, transaction: nil, error: nil, code: nil, paymentId: nil)) == .processing)
+    check("validation failure is terminal", paymentIntentStatus(for: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Bad", code: "VALIDATION_ERROR", paymentId: nil)) == .failed)
+
+    func draft(account: String, intent: String, key: String, amount: Int = 2599) -> PaymentIntentDraft {
+      PaymentIntentDraft(
+        customerAccountId: account,
+        paymentIntentId: intent,
+        idempotencyKey: key,
+        recipientId: "northline-studio",
+        amountMinor: amount,
+        method: .card,
+        note: "lunch"
+      )
+    }
+
+    print("24. account isolation and required fields...")
+    let memory = InMemoryPaymentIntentSnapshotStore()
+    let repository = PaymentIntentSnapshotRepository(store: memory)
+    do {
+      let began = try repository.begin(draft(account: "acct-a", intent: "intent-aaa1", key: "idem-key-a1"), nowEpochMs: 1_000)
+      let snapshot = began.snapshot
+      check("new intent is active", began.created && began.payloadMatches && snapshot.status == .processing)
+      check(
+        "snapshot keeps intent, key, hash and empty return state",
+        snapshot.paymentIntentId == "intent-aaa1"
+          && snapshot.idempotencyKey == "idem-key-a1"
+          && snapshot.businessPayloadHash == businessPayloadHash(
+            customerAccountId: "acct-a",
+            recipientId: "northline-studio",
+            amountMinor: 2599,
+            method: .card,
+            note: "lunch"
+          )
+          && snapshot.returnState == nil
+          && snapshot.returnStateHash == nil
+      )
+      let otherAccount = try repository.resumeActive(customerAccountId: "acct-b", nowEpochMs: 1_000)
+      let hidden = try repository.load(customerAccountId: "acct-b", paymentIntentId: "intent-aaa1", nowEpochMs: 1_000)
+      check("other customer account cannot see the intent", otherAccount.isEmpty && hidden == nil)
+    } catch {
+      check("account isolation threw \(error)", false)
+    }
+
+    print("25. process recovery...")
+    do {
+      let recovered = try PaymentIntentSnapshotRepository(store: memory)
+        .resumeActive(customerAccountId: "acct-a", nowEpochMs: 9_000)
+      check(
+        "new repository finds the active intent and original key",
+        recovered.count == 1 && recovered[0].idempotencyKey == "idem-key-a1" && !recovered[0].status.isTerminal
+      )
+    } catch {
+      check("process recovery threw \(error)", false)
+    }
+
+    print("26. uncertain retry keeps the idempotency key...")
+    do {
+      let uncertain = try repository.markUncertain(customerAccountId: "acct-a", paymentIntentId: "intent-aaa1", nowEpochMs: 20)
+      let again = try repository.begin(draft(account: "acct-a", intent: "intent-bbb2", key: "idem-key-b2"), nowEpochMs: 30)
+      check(
+        "uncertain intent is resumed instead of replaced",
+        uncertain.status == .processing
+          && uncertain.idempotencyKey == "idem-key-a1"
+          && !again.created
+          && again.payloadMatches
+          && again.snapshot.idempotencyKey == "idem-key-a1"
+      )
+      let mismatch = try repository.begin(
+        draft(account: "acct-a", intent: "intent-ccc3", key: "idem-key-c3", amount: 2600),
+        nowEpochMs: 31
+      )
+      check(
+        "different payload does not mint a second active intent",
+        !mismatch.payloadMatches && mismatch.snapshot.idempotencyKey == "idem-key-a1" && mismatch.snapshot.amountMinor == 2599
+      )
+    } catch {
+      check("uncertain retry threw \(error)", false)
+    }
+
+    print("27. terminal retention window...")
+    let window = PaymentIntentRetention.terminalWindowMs
+    do {
+      let pending = try repository.recordOutcome(
+        customerAccountId: "acct-a",
+        paymentIntentId: "intent-aaa1",
+        response: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Awaiting confirmation", code: "PAYMENT_PENDING", paymentId: "pay-9"),
+        nowEpochMs: 40
+      )
+      let stillActive = try repository.resumeActive(customerAccountId: "acct-a", nowEpochMs: 41)
+      check(
+        "pending stores the return state hash and stays active",
+        pending.status == .pending
+          && pending.returnStateHash == "a5ea41d10b6f195c073b33f96c57bb76cfee49de91d4a38c5220bd4ecb85197b"
+          && stillActive.count == 1
+          && stillActive[0].idempotencyKey == "idem-key-a1"
+      )
+      let settled = try repository.recordOutcome(
+        customerAccountId: "acct-a",
+        paymentIntentId: "intent-aaa1",
+        response: PaymentResponse(
+          ok: true,
+          state: BankState(version: 4, balance: 1_245_451, transactions: [], budgets: []),
+          transaction: nil,
+          error: nil,
+          code: nil,
+          paymentId: "pay-1"
+        ),
+        nowEpochMs: 2_000
+      )
+      let duringWindow = try repository.load(customerAccountId: "acct-a", paymentIntentId: "intent-aaa1", nowEpochMs: 2_000 + window - 1)
+      let afterWindow = try repository.load(customerAccountId: "acct-a", paymentIntentId: "intent-aaa1", nowEpochMs: 2_000 + window)
+      let resumedAfterSuccess = try repository.resumeActive(customerAccountId: "acct-a", nowEpochMs: 2_000)
+      check(
+        "success records return state and leaves the active set",
+        settled.status == .succeeded
+          && settled.returnStateHash == "b5249909bae8e7dd177a9d782f43300fb7e0ce1da42a696d0f5770227d68bb44"
+          && settled.returnState?.balancePence == 1_245_451
+          && resumedAfterSuccess.isEmpty
+      )
+      check("terminal snapshot expires at the retention boundary", duringWindow != nil && afterWindow == nil)
+    } catch {
+      check("retention threw \(error)", false)
+    }
+
+    print("28. active intents ignore the retention window...")
+    do {
+      let fresh = PaymentIntentSnapshotRepository(store: InMemoryPaymentIntentSnapshotStore())
+      _ = try fresh.begin(draft(account: "acct-old", intent: "intent-old1", key: "idem-old-11"), nowEpochMs: 1_000)
+      let aged = try fresh.resumeActive(customerAccountId: "acct-old", nowEpochMs: 1_000 + window * 5)
+      check("old active intent is still resumable", aged.count == 1 && aged[0].idempotencyKey == "idem-old-11")
+      _ = try fresh.cancel(customerAccountId: "acct-old", paymentIntentId: "intent-old1", nowEpochMs: 50)
+      let afterCancel = try fresh.resumeActive(customerAccountId: "acct-old", nowEpochMs: 51)
+      let held = try fresh.load(customerAccountId: "acct-old", paymentIntentId: "intent-old1", nowEpochMs: 50 + window - 1)
+      let dropped = try fresh.load(customerAccountId: "acct-old", paymentIntentId: "intent-old1", nowEpochMs: 50 + window)
+      let replacement = try fresh.begin(draft(account: "acct-old", intent: "intent-new2", key: "idem-new-22"), nowEpochMs: 52)
+      check(
+        "cancelled intent is kept until the window ends",
+        afterCancel.isEmpty && held?.status == .cancelled && dropped == nil && replacement.created && replacement.snapshot.idempotencyKey == "idem-new-22"
+      )
+    } catch {
+      check("active expiry threw \(error)", false)
+    }
+
+    print("29. empty customer account is rejected...")
+    do {
+      _ = try repository.begin(draft(account: "", intent: "intent-aaa1", key: "idem-key-a1"), nowEpochMs: 1)
+      check("empty account should fail", false)
+    } catch PaymentIntentSnapshotError.invalidCustomerAccount {
+      check("empty customer account rejected", true)
+    } catch {
+      check("unexpected account error \(error)", false)
+    }
+
+    #if canImport(Security)
+    print("30. keychain round trip...")
+    let keychainAccount = "acct-" + UUID().uuidString.lowercased()
+    let keychain = KeychainPaymentIntentSnapshotStore()
+    do {
+      defer { try? keychain.delete(customerAccountId: keychainAccount, paymentIntentId: "intent-kc01") }
+      let stored = PaymentIntentSnapshotRepository(store: keychain)
+      let began = try stored.begin(
+        draft(account: keychainAccount, intent: "intent-kc01", key: "idem-key-kc"),
+        nowEpochMs: 70
+      )
+      let restarted = PaymentIntentSnapshotRepository(store: KeychainPaymentIntentSnapshotStore())
+      let active = try restarted.resumeActive(customerAccountId: keychainAccount, nowEpochMs: 71)
+      check(
+        "keychain restores the intent for the same customer account",
+        began.created && active.count == 1 && active[0].idempotencyKey == "idem-key-kc" && active[0].businessPayloadHash == began.snapshot.businessPayloadHash
+      )
+      let foreign = try restarted.resumeActive(customerAccountId: "acct-other", nowEpochMs: 72)
+      check("keychain service does not return another account", foreign.isEmpty)
+    } catch {
+      let text = String(describing: error)
+      if text.contains("SecItem") {
+        print("  SKIP keychain unavailable in this environment (\(text))")
+      } else {
+        check("keychain round trip threw \(text)", false)
+      }
+    }
+    #endif
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
