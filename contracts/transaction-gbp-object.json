@@ -1,0 +1,13 @@
+{
+  "id": "txn-002",
+  "reference": "REF-20260905-002",
+  "recipientId": "northline-studio",
+  "name": "Northline Studio",
+  "category": "Shopping",
+  "amount": { "minor": 3500, "currency": "GBP" },
+  "date": "2026-09-05",
+  "provider": "adyen",
+  "method": "card",
+  "status": "completed",
+  "note": "Lamp"
+}

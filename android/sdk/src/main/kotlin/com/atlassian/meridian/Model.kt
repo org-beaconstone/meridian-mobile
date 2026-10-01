@@ -46,6 +46,7 @@ data class Recipient(
   val color: String,
 ) : Serializable
 
+@com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = TransactionDeserializer::class)
 data class Transaction(
   val id: String,
   val reference: String,
@@ -91,6 +92,8 @@ data class CatalogResponse(
   val demoDate: String,
   val recipients: List<Recipient>,
   val providers: List<Provider>,
+  val currency: String = "GBP",
+  val minorUnit: Int = 2,
 ) : Serializable
 
 data class PaymentResponse(
@@ -155,8 +158,19 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
 // MARK: - Amount Formatting
 
 fun money(pence: Int): String {
-  val pounds = pence / 100.0
-  return "£%.2f".format(pounds)
+  val negative = pence < 0
+  val abs = kotlin.math.abs(pence.toLong())
+  val units = abs / 100
+  val frac = (abs % 100).toInt()
+  val digits = units.toString()
+  val grouped = buildString {
+    digits.forEachIndexed { index, ch ->
+      if (index > 0 && (digits.length - index) % 3 == 0) append(',')
+      append(ch)
+    }
+  }
+  val body = "£$grouped.${frac.toString().padStart(2, '0')}"
+  return if (negative) "-$body" else body
 }
 
 /**

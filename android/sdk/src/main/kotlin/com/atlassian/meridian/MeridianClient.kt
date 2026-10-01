@@ -118,8 +118,11 @@ class MeridianClient(
   /**
    * GET /catalog - Fetch recipients and providers
    */
-  suspend fun getCatalog(): CatalogResponse =
-    request("GET", "/catalog", responseType = CatalogResponse::class.java)
+  suspend fun getCatalog(): CatalogResponse {
+    val catalog = request("GET", "/catalog", responseType = CatalogResponse::class.java)
+    catalog.assertConsumerContract()
+    return catalog
+  }
 
   /**
    * GET /state - Fetch current bank state

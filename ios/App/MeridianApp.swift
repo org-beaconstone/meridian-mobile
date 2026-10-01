@@ -4,81 +4,223 @@ import MeridianSDK
 @main struct MeridianApp: App {
   var body: some Scene { WindowGroup { MeridianView().frame(minWidth: 350, minHeight: 650) } }
 }
+
 @MainActor struct MeridianView: View {
-  @State private var endpoint = "http://127.0.0.1:8080/api/v1"
-  @State private var room = "meridian-rehearsal"
+  @State private var model = PaymentScreenModel(
+    endpoint: "http://127.0.0.1:8080/api/v1",
+    room: "meridian-rehearsal"
+  )
   @State private var client: MeridianClient?
   @State private var state: BankState?
   @State private var catalog: CatalogResponse?
-  @State private var recipient = "northline-studio"
-  @State private var amount = ""
-  @State private var reference = ""
-  @State private var method: PaymentMethod = .card
-  @State private var key = UUID().uuidString
-  @State private var review = false
-  @State private var busy = false
-  @State private var message = "Connect to the Spring Boot API to start."
-  @State private var generation = 0
+  @State private var didRestore = false
+  @SceneStorage("meridian.checkpoint") private var checkpointJSON = ""
+  @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
   var body: some View {
+    let direction = layoutDirectionForLanguage(Locale.current.identifier) == "rtl" ? LayoutDirection.rightToLeft : LayoutDirection.leftToRight
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         Text("meridian").font(.largeTitle).fontWeight(.semibold)
+          .accessibilityAddTraits(.isHeader)
         Text("Native SwiftUI · Fictional payment rehearsal").font(.caption)
         Group {
-          TextField("API base URL", text: $endpoint)
-          TextField("Shared rehearsal room", text: $room)
-          Button("Connect") { Task { await connect() } }.disabled(busy)
+          TextField("API base URL", text: $model.endpoint)
+          TextField("Shared rehearsal room", text: $model.room)
+          Button("Connect") { Task { await connect() } }
+            .frame(minHeight: 44)
+            .disabled(model.busy)
         }.textFieldStyle(.roundedBorder)
-        Text(message).font(.callout).foregroundStyle(.secondary)
+        Text(model.message).font(.callout).foregroundStyle(.secondary)
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
-            Text(money(state.balance)).font(.system(size: 38, weight: .medium))
-            Text("Shared room: \(room)").font(.caption)
-          }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(Color(red:0.078,green:0.173,blue:0.208)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 16))
-          Text("Make a payment").font(.title2)
+            Text(money(state.balance))
+              .font(.system(size: scaledFontSize(base: 38, fontScale: fontScaleFor(bucket: fontBucket))))
+              .accessibilityLabel("Everyday account balance \(money(state.balance))")
+            Text("Shared room: \(model.runtime.checkpoint.sessionId)").font(.caption)
+          }
+          .padding(24)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(Color(red: 0.078, green: 0.173, blue: 0.208))
+          .foregroundStyle(.white)
+          .clipShape(RoundedRectangle(cornerRadius: 16))
+          .accessibilityElement(children: .combine)
+          Text("Make a payment").font(.title2).accessibilityAddTraits(.isHeader)
           if let catalog {
-            Picker("Recipient", selection: $recipient) { ForEach(catalog.recipients, id: \.id) { Text($0.name).tag($0.id) } }.disabled(review || busy)
+            Picker("Recipient", selection: $model.recipientId) {
+              ForEach(catalog.recipients, id: \.id) { Text($0.name).tag($0.id) }
+            }.disabled(model.reviewing || model.busy)
           }
-          TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
-          TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
-          Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
-          if review {
-            Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
-            Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
-            Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
+          TextField("Amount (GBP)", text: $model.amountInput).textFieldStyle(.roundedBorder).disabled(model.reviewing || model.busy)
+          TextField("Reference", text: $model.note).textFieldStyle(.roundedBorder).disabled(model.reviewing || model.busy)
+          Picker("Method", selection: $model.method) {
+            Text("Debit card · Adyen").tag(PaymentMethod.card)
+            Text("Bank payment · Worldpay").tag(PaymentMethod.bank)
+          }.disabled(model.reviewing || model.busy)
+          if model.reviewing {
+            Text("Confirm \(model.amountInput) GBP to \(model.recipientId)").font(.headline)
+            let a11y = confirmAccessibility()
+            Button("Confirm payment") { Task { await pay() } }
+              .buttonStyle(.borderedProminent)
+              .frame(minHeight: CGFloat(a11y.minimumTouchTargetPt))
+              .disabled(model.busy)
+              .accessibilityLabel(a11y.label)
+              .accessibilityHint(a11y.hint)
+            Button("Edit details") { model.edit(); persist() }
+              .frame(minHeight: 44)
+              .disabled(model.busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") {
+              _ = model.review()
+              persist()
+            }
+            .frame(minHeight: 44)
+            .disabled(model.busy)
           }
-          Text("Recent activity").font(.title2)
-          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
-          Text("September budgets").font(.title2)
-          ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
+          Text("Recent activity").font(.title2).accessibilityAddTraits(.isHeader)
+          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in
+            HStack {
+              VStack(alignment: .leading) {
+                Text(transaction.name)
+                Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)
+              }
+              Spacer()
+              Text(money(transaction.amount))
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(transaction.name), \(money(transaction.amount))")
+          }
+          Text("September budgets").font(.title2).accessibilityAddTraits(.isHeader)
+          ForEach(state.budgets, id: \.category) { budget in
+            HStack {
+              Text(budget.category.rawValue)
+              Spacer()
+              Text(money(budget.limit))
+            }
+            .accessibilityElement(children: .combine)
+          }
         }
       }.padding(24).frame(maxWidth: 550)
-    }.task {
-      while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
+    }
+    .environment(\.layoutDirection, direction)
+    .task {
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(2))
+        if !model.busy { await refresh() }
+      }
+    }
+    .onAppear {
+      guard !didRestore else { return }
+      didRestore = true
+      if !checkpointJSON.isEmpty, let restored = PaymentScreenModel.restore(checkpointJSON) {
+        model = restored
+      }
+    }
+    .onOpenURL { url in
+      _ = model.openReturn(url: url.absoluteString, nowMillis: nowMillis())
+      persist()
+    }
+    .onChange(of: model.amountInput) { _ in persist() }
+    .onChange(of: model.note) { _ in persist() }
+  }
+
+  private var fontBucket: String {
+    switch dynamicTypeSize {
+    case .xSmall, .small, .medium, .large, .xLarge:
+      return "standard"
+    case .xxLarge, .xxxLarge:
+      return "large"
+    default:
+      return "accessibility"
     }
   }
+
+  private func confirmAccessibility() -> AccessibilityDescriptor {
+    let name = catalog?.recipients.first { $0.id == model.recipientId }?.name ?? model.recipientId
+    return model.confirmationAccessibility(
+      recipientName: name,
+      language: Locale.current.identifier,
+      fontScale: fontScaleFor(bucket: fontBucket),
+      platform: "voiceover"
+    )
+  }
+
+  private func nowMillis() -> Int64 {
+    Int64((Date().timeIntervalSince1970 * 1000).rounded())
+  }
+
+  private func persist() {
+    guard didRestore else { return }
+    checkpointJSON = model.checkpointJSON()
+  }
+
   private func connect() async {
-    guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
-  }
-  private func refresh() async {
-    guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
-  }
-  private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
-    defer {busy=false}
+    guard model.connect() else { persist(); return }
     do {
-      let (minor,error)=parseAmount(amount)
-      guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
-      else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
-    } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+      client = try MeridianClient(baseURL: model.endpoint, sessionId: model.runtime.checkpoint.sessionId)
+      state = nil
+      catalog = nil
+      persist()
+      await refresh()
+    } catch {
+      model.message = String(describing: error)
+      persist()
+    }
+  }
+
+  private func refresh() async {
+    guard let client else { return }
+    let started = model.generation
+    do {
+      let next = try await client.getState()
+      let definitions = try await client.getCatalog()
+      if started == model.generation && !model.busy {
+        state = next
+        catalog = definitions
+        model.rememberCatalog(
+          CachedCatalog(
+            demoDate: definitions.demoDate,
+            currency: definitions.currency,
+            recipientIds: definitions.recipients.map(\.id),
+            providerIds: definitions.providers.map(\.id.rawValue)
+          ),
+          nowMillis: nowMillis()
+        )
+        model.message = "Connected to shared Java API"
+        persist()
+      }
+    } catch {
+      if started == model.generation {
+        model.message = "API unavailable: \(error)"
+        persist()
+      }
+    }
+  }
+
+  private func pay() async {
+    guard let client, let draft = model.submitInstruction(), !model.busy else { return }
+    model.busy = true
+    model.generation += 1
+    defer { model.busy = false; persist() }
+    let method: PaymentMethod = draft.method == "bank" ? .bank : .card
+    do {
+      let result = try await client.submitPayment(
+        recipientId: draft.recipientId,
+        amountMinor: draft.amountMinor,
+        method: method,
+        note: draft.note,
+        scenario: .success,
+        idempotencyKey: draft.idempotencyKey
+      )
+      if result.ok {
+        state = result.state
+        model.markSettled()
+      } else {
+        model.markUncertain(reason: result.error ?? "Payment pending. Retry the same payment, not a new one.")
+      }
+    } catch {
+      model.markUncertain(reason: "Outcome may be unknown: \(error). Retry preserves the payment key.")
+    }
   }
 }

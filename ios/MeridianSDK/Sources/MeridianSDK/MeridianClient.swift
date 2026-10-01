@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -97,7 +100,9 @@ public actor MeridianClient {
 
   /// GET /catalog - Fetch recipients and providers
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    let catalog: CatalogResponse = try await request(method: "GET", path: "/catalog")
+    try catalog.assertConsumerContract()
+    return catalog
   }
 
   /// GET /state - Fetch current bank state
