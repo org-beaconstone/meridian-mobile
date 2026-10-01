@@ -4,16 +4,20 @@ public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let snapshotStore: (any PaymentIntentStore)?
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - snapshotStore: Optional store for resumable payment intent snapshots.
+  ///     Pass a `KeychainPaymentIntentStore` for production; omit for stateless use.
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    snapshotStore: (any PaymentIntentStore)? = nil
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,6 +40,7 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.snapshotStore = snapshotStore
   }
 
   // MARK: - Internal Request Method
@@ -106,13 +111,18 @@ public actor MeridianClient {
   }
 
   /// POST /payments - Submit a payment
+  ///
+  /// When a `snapshotStore` is configured, this method persists a
+  /// `PaymentIntentSnapshot` before and after the network call so the intent
+  /// can be resumed if the process is interrupted.
+  ///
   /// - Parameters:
   ///   - recipientId: Recipient ID
   ///   - amountMinor: Amount in GBP pence (integer)
   ///   - method: Payment method (card or bank)
   ///   - note: Optional note (max 200 chars)
   ///   - scenario: Simulation scenario
-  ///   - idempotencyKey: Unique key for idempotency
+  ///   - idempotencyKey: Unique key for idempotency (retain across retries)
   public func submitPayment(
     recipientId: String,
     amountMinor: Int,
@@ -121,6 +131,28 @@ public actor MeridianClient {
     scenario: Scenario = .success,
     idempotencyKey: String
   ) async throws -> PaymentResponse {
+    let payloadHash = paymentPayloadHash(
+      recipientId: recipientId,
+      amountMinor: amountMinor,
+      method: method,
+      note: note
+    )
+
+    // Persist a created snapshot before sending so a crash during the request
+    // is recoverable with the original idempotency key.
+    if let store = snapshotStore {
+      let existing = try? await store.load(idempotencyKey: idempotencyKey)
+      if existing == nil {
+        let snapshot = PaymentIntentSnapshot(
+          paymentIntentId: idempotencyKey,
+          idempotencyKey: idempotencyKey,
+          businessPayloadHash: payloadHash,
+          status: .created
+        )
+        try await store.save(snapshot)
+      }
+    }
+
     let payload = PaymentRequest(
       recipientId: recipientId,
       amountMinor: amountMinor,
@@ -129,12 +161,51 @@ public actor MeridianClient {
       scenario: scenario
     )
 
-    return try await request(
+    let response: PaymentResponse = try await request(
       method: "POST",
       path: "/payments",
       body: payload,
       additionalHeaders: ["Idempotency-Key": idempotencyKey]
     )
+
+    // Update the snapshot to reflect the server's response status.
+    if let store = snapshotStore {
+      let newStatus: PaymentIntentStatus
+      if response.ok {
+        newStatus = .completed
+      } else if response.code == "PAYMENT_PENDING" {
+        newStatus = .pending
+      } else {
+        newStatus = .declined
+      }
+
+      let returnHash = response.state.map {
+        bankStateHash(version: $0.version, balance: $0.balance)
+      }
+
+      let serverIntentId = response.paymentId
+        ?? response.transaction?.id
+        ?? idempotencyKey
+
+      var updated = PaymentIntentSnapshot(
+        paymentIntentId: serverIntentId,
+        idempotencyKey: idempotencyKey,
+        businessPayloadHash: payloadHash,
+        status: newStatus,
+        returnStateHash: returnHash
+      )
+      // Preserve original createdAt by loading existing and mutating.
+      if var existing = try? await store.load(idempotencyKey: idempotencyKey) {
+        existing.paymentIntentId = serverIntentId
+        existing.status = newStatus
+        existing.returnStateHash = returnHash
+        existing.updatedAt = Date()
+        updated = existing
+      }
+      try await store.save(updated)
+    }
+
+    return response
   }
 
   /// PATCH /budgets - Update budget for a category
@@ -161,5 +232,16 @@ public actor MeridianClient {
   /// GET /events - Fetch audit events
   public func getEvents() async throws -> EventsResponse {
     return try await request(method: "GET", path: "/events")
+  }
+
+  // MARK: - Resumption
+
+  /// Returns all non-terminal payment intent snapshots for the current account.
+  ///
+  /// Call this on app launch or after process recovery to detect in-flight
+  /// payments that should be retried with their original idempotency keys.
+  public func resumeActiveIntents() async throws -> [PaymentIntentSnapshot] {
+    guard let store = snapshotStore else { return [] }
+    return try await store.loadActive()
   }
 }
