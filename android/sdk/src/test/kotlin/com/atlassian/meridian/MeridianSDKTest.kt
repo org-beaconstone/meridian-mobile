@@ -263,6 +263,64 @@ class MeridianSDKTest {
     assertEquals(1, response.recipients.size)
     assertEquals(1, response.providers.size)
     assertEquals("adyen", response.providers[0].id)
+    assertNull(response.providers[0].eligible)
+    assertNull(response.providers[0].banks)
+    assertTrue(response.providers[0].eligible != false)
+  }
+
+  @Test
+  fun testProviderIdEnumRemoved() {
+    assertNull(runCatching { Class.forName("com.atlassian.meridian.ProviderId") }.getOrNull())
+  }
+
+  @Test
+  fun testDynamicCatalogSelection() {
+    val json = """
+      {
+        "demoDate": "2026-09-18",
+        "recipients": [],
+        "providers": [
+          {"id": "desk-card", "name": "Card desk", "description": "Cards", "methods": ["card"], "eligible": true},
+          {"id": "desk-transfer", "name": "Transfer desk", "description": "Transfers", "methods": ["bank"], "logoUrl": "https://cdn.example/mark.png", "banks": [{"id": "harbour", "name": "Harbour Bank"}, {"id": "north-quay", "name": "North Quay"}]},
+          {"id": "desk-closed", "name": "Second card desk", "description": "Cards", "methods": ["card"], "eligible": false}
+        ]
+      }
+    """.trimIndent()
+
+    val catalog = mapper.readValue(json, CatalogResponse::class.java)
+    val groups = methodGroups(catalog.providers)
+    val choices = allMethodChoices(catalog.providers)
+    val transfer = choices.first { it.providerId == "desk-transfer" }
+    val kept = reconciledSelection(SelectionState("desk-transfer|bank|0", "harbour"), catalog.providers)
+    val dropped = reconciledSelection(SelectionState("missing", "harbour"), catalog.providers)
+
+    assertEquals(listOf("Cards", "Transfers"), groups.map { it.descriptor })
+    assertEquals(2, groups[0].methods.size)
+    assertFalse(groups[0].methods[1].eligible)
+    assertTrue(transfer.requiresBank)
+    assertEquals("TD", transfer.logoLabel)
+    assertEquals("Bank payment", transfer.methodLabel)
+    assertEquals("Debit card", methodLabel("card"))
+    assertEquals("harbour", kept.bankId)
+    assertEquals("desk-card|card|0", dropped.methodId)
+    assertNull(dropped.bankId)
+    assertEquals(listOf("north-quay"), filterBanks(transfer.banks, "quay").map { it.id })
+    assertEquals(bankSelectorEmptyMessage, bankEmptyMessage(emptyList(), ""))
+    assertEquals("No banks match \"zzz\".", bankEmptyMessage(transfer.banks, "zzz"))
+    assertEquals(SelectorContentState.loading, methodSelectorState(true, groups))
+    assertEquals(SelectorContentState.empty, methodSelectorState(false, emptyList()))
+    assertEquals(SelectorContentState.empty, bankSelectorState(false, transfer.banks, "zzz"))
+    assertEquals(SelectorContentState.ready, bankSelectorState(false, transfer.banks, "harbour"))
+    assertFalse(selectorUsesFullScreen(false, false))
+    assertTrue(selectorUsesFullScreen(true, false))
+    assertTrue(selectorUsesFullScreen(false, true))
+    assertFalse(isRegularSelectorWidth(599))
+    assertTrue(isRegularSelectorWidth(600))
+    assertFalse(isLargeAccessibilityText(1.29f))
+    assertTrue(isLargeAccessibilityText(1.3f))
+    assertEquals("NS", logoLabel("Northline Studio"))
+    assertEquals(PaymentMethod.bank, payableMethod("bank"))
+    assertNull(payableMethod("desk-transfer"))
   }
 
   @Test

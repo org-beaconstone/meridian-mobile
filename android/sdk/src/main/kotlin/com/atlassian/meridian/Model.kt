@@ -23,10 +23,6 @@ enum class PaymentMethod {
   card, bank
 }
 
-enum class ProviderId {
-  adyen, worldpay
-}
-
 enum class Scenario {
   success, declined, unavailable, pending
 }
@@ -72,11 +68,21 @@ data class BankState(
   val budgets: List<Budget>,
 ) : Serializable
 
+data class BankChoice(
+  val id: String = "",
+  val name: String = "",
+  val logoUrl: String? = null,
+) : Serializable
+
 data class Provider(
-  val id: String,
-  val name: String,
-  val description: String,
-  val methods: List<String>,
+  val id: String = "",
+  val name: String = "",
+  val description: String = "",
+  val methods: List<String> = emptyList(),
+  val logoUrl: String? = null,
+  val eligible: Boolean? = null,
+  val requiresBank: Boolean? = null,
+  val banks: List<BankChoice>? = null,
 ) : Serializable
 
 // MARK: - API Response Types

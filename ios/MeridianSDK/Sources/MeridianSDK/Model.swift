@@ -15,11 +15,6 @@ public enum PaymentMethod: String, Codable, Hashable {
   case bank
 }
 
-public enum ProviderId: String, Codable, Hashable {
-  case adyen
-  case worldpay
-}
-
 public enum Scenario: String, Codable {
   case success
   case declined
@@ -68,7 +63,7 @@ public struct Transaction: Codable, Hashable {
   public let category: Category
   public let amount: Int // integer GBP pence, positive (outgoing)
   public let date: String // ISO 8601
-  public let provider: ProviderId
+  public let provider: String
   public let method: PaymentMethod
   public let status: TransactionStatus
   public let note: String
@@ -81,7 +76,7 @@ public struct Transaction: Codable, Hashable {
     category: Category,
     amount: Int,
     date: String,
-    provider: ProviderId,
+    provider: String,
     method: PaymentMethod,
     status: TransactionStatus,
     note: String
@@ -129,22 +124,79 @@ public struct BankState: Codable, Hashable {
   }
 }
 
-public struct Provider: Codable, Hashable {
-  public let id: ProviderId
+public struct BankChoice: Codable, Hashable, Identifiable {
+  public let id: String
+  public let name: String
+  public let logoUrl: String?
+
+  public init(id: String, name: String, logoUrl: String? = nil) {
+    self.id = id
+    self.name = name
+    self.logoUrl = logoUrl
+  }
+}
+
+/// Server catalog descriptor. Provider ids and method ids are strings so a catalog
+/// change does not require a new client build. `requiresBank` is optional; when the
+/// server omits it, only methods named "bank" ask for a bank.
+public struct Provider: Codable, Hashable, Identifiable {
+  public let id: String
   public let name: String
   public let description: String
-  public let methods: [PaymentMethod]
+  public let methods: [String]
+  public let logoUrl: String?
+  public let eligible: Bool
+  public let requiresBank: Bool?
+  public let banks: [BankChoice]
+
+  enum CodingKeys: String, CodingKey {
+    case id, name, description, methods, logoUrl, eligible, requiresBank, banks
+  }
 
   public init(
-    id: ProviderId,
+    id: String,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [String],
+    logoUrl: String? = nil,
+    eligible: Bool = true,
+    requiresBank: Bool? = nil,
+    banks: [BankChoice] = []
   ) {
     self.id = id
     self.name = name
     self.description = description
     self.methods = methods
+    self.logoUrl = logoUrl
+    self.eligible = eligible
+    self.requiresBank = requiresBank
+    self.banks = banks
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+    description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+    methods = try container.decodeIfPresent([String].self, forKey: .methods) ?? []
+    logoUrl = try container.decodeIfPresent(String.self, forKey: .logoUrl)
+    eligible = try container.decodeIfPresent(Bool.self, forKey: .eligible) ?? true
+    requiresBank = try container.decodeIfPresent(Bool.self, forKey: .requiresBank)
+    banks = try container.decodeIfPresent([BankChoice].self, forKey: .banks) ?? []
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(name, forKey: .name)
+    try container.encode(description, forKey: .description)
+    try container.encode(methods, forKey: .methods)
+    try container.encodeIfPresent(logoUrl, forKey: .logoUrl)
+    try container.encode(eligible, forKey: .eligible)
+    try container.encodeIfPresent(requiresBank, forKey: .requiresBank)
+    if !banks.isEmpty {
+      try container.encode(banks, forKey: .banks)
+    }
   }
 }
 

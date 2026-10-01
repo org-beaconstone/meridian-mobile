@@ -281,7 +281,9 @@ struct MeridianSDKChecks {
         CatalogResponse.self,
         from: catalogJson.data(using: .utf8)!
       )
-      if catalog.demoDate == "2026-09-18" && catalog.recipients.count == 1 {
+      if catalog.demoDate == "2026-09-18" && catalog.recipients.count == 1
+        && catalog.providers.first?.id == "adyen" && catalog.providers.first?.eligible == true
+        && catalog.providers.first?.banks.isEmpty == true && catalog.providers.first?.requiresBank == nil {
         print("  ✓ CatalogResponse decoded: recipients=\(catalog.recipients.count), providers=\(catalog.providers.count)")
         passed += 1
       } else {
@@ -341,10 +343,62 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: catalog accepts provider ids outside any fixed enum
+    print("21. dynamic catalog descriptors...")
+    let dynamicJson = """
+    {
+      "demoDate": "2026-09-18",
+      "recipients": [],
+      "providers": [
+        {"id": "desk-card", "name": "Card desk", "description": "Cards", "methods": ["card"], "eligible": true},
+        {"id": "desk-transfer", "name": "Transfer desk", "description": "Transfers", "methods": ["bank"], "logoUrl": "https://cdn.example/mark.png", "banks": [{"id": "harbour", "name": "Harbour Bank"}, {"id": "north-quay", "name": "North Quay"}]},
+        {"id": "desk-closed", "name": "Second card desk", "description": "Cards", "methods": ["card"], "eligible": false}
+      ]
+    }
+    """
+    do {
+      let catalog = try JSONDecoder().decode(CatalogResponse.self, from: dynamicJson.data(using: .utf8)!)
+      let groups = methodGroups(from: catalog.providers)
+      let choices = allMethodChoices(from: catalog.providers)
+      let transfer = choices.first { $0.providerId == "desk-transfer" }
+      let kept = reconciledSelection(SelectionState(methodId: "desk-transfer|bank|0", bankId: "harbour"), providers: catalog.providers)
+      let dropped = reconciledSelection(SelectionState(methodId: "missing", bankId: "harbour"), providers: catalog.providers)
+      let searched = filterBanks(transfer?.banks ?? [], query: "quay")
+      if groups.map(\.descriptor) == ["Cards", "Transfers"]
+        && groups[0].methods.count == 2
+        && groups[0].methods[1].eligible == false
+        && transfer?.requiresBank == true
+        && transfer?.logoLabel == "TD"
+        && transfer?.methodLabel == "Bank payment"
+        && kept.bankId == "harbour"
+        && dropped.methodId == "desk-card|card|0"
+        && dropped.bankId == nil
+        && searched.map(\.id) == ["north-quay"]
+        && bankEmptyMessage(banks: [], query: "") == bankSelectorEmptyMessage
+        && methodSelectorState(loading: true, groups: groups) == .loading
+        && methodSelectorState(loading: false, groups: []) == .empty
+        && bankSelectorState(loading: false, banks: transfer?.banks ?? [], query: "zzz") == .empty
+        && selectorUsesFullScreen(isRegularWidth: false, isAccessibilityText: false) == false
+        && selectorUsesFullScreen(isRegularWidth: true, isAccessibilityText: false)
+        && selectorUsesFullScreen(isRegularWidth: false, isAccessibilityText: true)
+        && isRegularSelectorWidth(sizeClassRegular: false, widthPoints: 767) == false
+        && isRegularSelectorWidth(sizeClassRegular: false, widthPoints: 768) {
+        print("  ✓ Catalog methods group by descriptor, with banks, eligibility and layout")
+        passed += 1
+      } else {
+        print("  ✗ Dynamic catalog selection mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Dynamic catalog decoding failed: \(error)")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(total == 0 ? 0 : passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
