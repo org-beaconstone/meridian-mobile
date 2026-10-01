@@ -122,6 +122,53 @@ class MeridianClient(
     request("GET", "/catalog", responseType = CatalogResponse::class.java)
 
   /**
+   * GET /api/v2/payment-methods for one account scope, corridor, and GBP currency.
+   * Does not call a different provider when this request fails.
+   */
+  suspend fun getPaymentMethods(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP",
+  ): PaymentMethodsCatalog = fetchPaymentMethods(accountScope, corridor, currency).catalog
+
+  /**
+   * Same fetch as [getPaymentMethods], keeping the raw JSON for encrypted caching.
+   */
+  suspend fun fetchPaymentMethods(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP",
+  ): PaymentMethodsFetch {
+    val scope = CatalogScope.parse(accountScope, corridor, currency)
+    val url = paymentMethodsUrl(baseUrlNormalized, scope)
+    val raw = getJson(url)
+    if (raw.toByteArray(Charsets.UTF_8).size > MAX_CATALOG_BYTES) {
+      throw MeridianError.ValidationError("Payment method catalog is too large")
+    }
+    return PaymentMethodsFetch(parsePaymentMethodsCatalog(raw, scope), raw)
+  }
+
+  private suspend fun getJson(absoluteUrl: URL): String = withContext(Dispatchers.IO) {
+    val connection = absoluteUrl.openConnection() as HttpURLConnection
+    try {
+      connection.connectTimeout = 15_000
+      connection.readTimeout = 15_000
+      connection.requestMethod = "GET"
+      connection.setRequestProperty("Accept", "application/json")
+      connection.setRequestProperty("X-Rehearsal-Session", sessionId)
+      val statusCode = connection.responseCode
+      val stream = if (statusCode >= 400) connection.errorStream else connection.inputStream
+      val responseBody = stream?.bufferedReader()?.use { it.readText() } ?: ""
+      if (statusCode !in 200..299) {
+        throw MeridianError.HttpError(statusCode, responseBody.ifEmpty { "Unknown error" })
+      }
+      responseBody
+    } finally {
+      connection.disconnect()
+    }
+  }
+
+  /**
    * GET /state - Fetch current bank state
    */
   suspend fun getState(): BankState =
