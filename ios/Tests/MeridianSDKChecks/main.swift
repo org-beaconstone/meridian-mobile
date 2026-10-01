@@ -341,10 +341,17 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // --- Extended test suites ---
+    runContractChecks(passed: &passed, failed: &failed)
+    runScenarioChecks(passed: &passed, failed: &failed)
+    runSecurityChecks(passed: &passed, failed: &failed)
+    runAccessibilityChecks(passed: &passed, failed: &failed)
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
