@@ -25,6 +25,7 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import { buildTraceparent, generateSpanId, generateTraceId } from './domain/telemetry';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -33,7 +34,17 @@ class RequestError extends Error {
     super(message);
   }
 }
-async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
+async function request(
+  room: string,
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  key?: string,
+  journeyTraceId?: string,
+) {
+  // Each HTTP request gets its own span; the journey trace ID is stable for the whole payment flow.
+  const traceId = journeyTraceId ?? generateTraceId();
+  const traceparent = buildTraceparent(traceId, generateSpanId());
   let response: Response;
   try {
     response = await fetch('/api/v1' + path, {
@@ -41,6 +52,7 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
       headers: {
         'Content-Type': 'application/json',
         'X-Rehearsal-Session': room,
+        'X-Trace-ID': traceparent,
         ...(key ? { 'Idempotency-Key': key } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -93,7 +105,8 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef(crypto.randomUUID()),
+    traceId = useRef(generateTraceId());
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -135,7 +148,7 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
-  async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
+  async function mutate(path: string, httpMethod: string, body?: unknown, key?: string, journeyTraceId?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
     const generation = epoch.current;
@@ -143,7 +156,7 @@ export default function App() {
     setBusy(true);
     revision.current++;
     try {
-      const result = await request(room, path, httpMethod, body, key);
+      const result = await request(room, path, httpMethod, body, key, journeyTraceId);
       if (generation !== epoch.current) throw new Error('Room changed');
       if (result.state) setState(bankState(result.state));
       return result;
@@ -160,12 +173,14 @@ export default function App() {
     setError('');
     setReceipt(null);
     paymentKey.current = crypto.randomUUID();
+    traceId.current = generateTraceId();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
     paymentKey.current = crypto.randomUUID();
+    traceId.current = generateTraceId();
   }
   function review() {
     const value = pence(amount);
@@ -188,6 +203,7 @@ export default function App() {
         'POST',
         { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
         paymentKey.current,
+        traceId.current,
       );
       if (result.ok) {
         setReceipt(result.transaction);

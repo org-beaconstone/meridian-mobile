@@ -341,10 +341,240 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // MARK: - Telemetry checks
+
+    // CHECK 21: hashIdempotencyKey produces 64-char hex
+    print("21. hashIdempotencyKey produces 64-char hex...")
+    let hash21 = hashIdempotencyKey("some-key")
+    if hash21.count == 64 && hash21.allSatisfy({ $0.isHexDigit }) {
+      print("  ✓ hashIdempotencyKey: 64-char hex string")
+      passed += 1
+    } else {
+      print("  ✗ Expected 64 hex chars, got \(hash21.count) chars: \(hash21)")
+      failed += 1
+    }
+
+    // CHECK 22: hashIdempotencyKey is deterministic
+    print("22. hashIdempotencyKey is deterministic...")
+    let h22a = hashIdempotencyKey("deterministic-key")
+    let h22b = hashIdempotencyKey("deterministic-key")
+    if h22a == h22b {
+      print("  ✓ hashIdempotencyKey: same input → same hash")
+      passed += 1
+    } else {
+      print("  ✗ Hash is not deterministic")
+      failed += 1
+    }
+
+    // CHECK 23: hashIdempotencyKey is unique for different inputs
+    print("23. hashIdempotencyKey unique for different inputs...")
+    let h23a = hashIdempotencyKey("key-alpha")
+    let h23b = hashIdempotencyKey("key-beta")
+    if h23a != h23b {
+      print("  ✓ hashIdempotencyKey: different inputs → different hashes")
+      passed += 1
+    } else {
+      print("  ✗ Different keys produced the same hash")
+      failed += 1
+    }
+
+    // CHECK 24: hashIdempotencyKey known SHA-256 value
+    print("24. hashIdempotencyKey known SHA-256 value...")
+    let expected24 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    let actual24 = hashIdempotencyKey("test")
+    if actual24 == expected24 {
+      print("  ✓ SHA-256(\"test\") matches known value")
+      passed += 1
+    } else {
+      print("  ✗ Expected \(expected24), got \(actual24)")
+      failed += 1
+    }
+
+    // CHECK 25: sanitizeForLog strips query parameters
+    print("25. sanitizeForLog strips URL query parameters...")
+    let input25 = "https://provider.example.com/callback?token=abc123&session=xyz"
+    let result25 = sanitizeForLog(input25)
+    if result25.contains("?[REDACTED]") && !result25.contains("abc123") {
+      print("  ✓ sanitizeForLog: query params redacted")
+      passed += 1
+    } else {
+      print("  ✗ Query params not redacted: \(result25)")
+      failed += 1
+    }
+
+    // CHECK 26: sanitizeForLog redacts bearer token
+    print("26. sanitizeForLog redacts bearer token...")
+    let input26 = "Authorization: bearer eyJhbGciOiJSUzI1NiJ9.payload.sig"
+    let result26 = sanitizeForLog(input26)
+    if result26.contains("[REDACTED]") && !result26.contains("eyJhbGciOiJSUzI1NiJ9") {
+      print("  ✓ sanitizeForLog: bearer token redacted")
+      passed += 1
+    } else {
+      print("  ✗ Bearer token not redacted: \(result26)")
+      failed += 1
+    }
+
+    // CHECK 27: sanitizeForLog leaves plain text unchanged
+    print("27. sanitizeForLog leaves plain text unchanged...")
+    let input27 = "payment completed for recipient northline-studio"
+    let result27 = sanitizeForLog(input27)
+    if result27 == input27 {
+      print("  ✓ sanitizeForLog: plain text unchanged")
+      passed += 1
+    } else {
+      print("  ✗ Plain text was modified: \(result27)")
+      failed += 1
+    }
+
+    // CHECK 28: TraceContext.generate() produces 32-char traceId
+    print("28. TraceContext.generate() produces 32-char traceId...")
+    let ctx28 = TraceContext.generate()
+    if ctx28.traceId.count == 32 && ctx28.traceId.allSatisfy({ $0.isHexDigit }) {
+      print("  ✓ TraceContext.traceId: 32-char hex")
+      passed += 1
+    } else {
+      print("  ✗ traceId length=\(ctx28.traceId.count): \(ctx28.traceId)")
+      failed += 1
+    }
+
+    // CHECK 29: TraceContext.generate() produces 16-char spanId
+    print("29. TraceContext.generate() produces 16-char spanId...")
+    let ctx29 = TraceContext.generate()
+    if ctx29.spanId.count == 16 && ctx29.spanId.allSatisfy({ $0.isHexDigit }) {
+      print("  ✓ TraceContext.spanId: 16-char hex")
+      passed += 1
+    } else {
+      print("  ✗ spanId length=\(ctx29.spanId.count): \(ctx29.spanId)")
+      failed += 1
+    }
+
+    // CHECK 30: traceparent format is "00-{32hex}-{16hex}-01"
+    print("30. TraceContext.traceparent format...")
+    let ctx30 = TraceContext.generate()
+    let parts30 = ctx30.traceparent.split(separator: "-", maxSplits: 3).map(String.init)
+    if parts30.count == 4 && parts30[0] == "00" && parts30[1].count == 32
+        && parts30[2].count == 16 && parts30[3] == "01" {
+      print("  ✓ traceparent: 00-{32hex}-{16hex}-01")
+      passed += 1
+    } else {
+      print("  ✗ traceparent malformed: \(ctx30.traceparent)")
+      failed += 1
+    }
+
+    // CHECK 31: TraceContext.generate() produces unique IDs
+    print("31. TraceContext.generate() produces unique IDs...")
+    let ctx31a = TraceContext.generate()
+    let ctx31b = TraceContext.generate()
+    if ctx31a.traceId != ctx31b.traceId && ctx31a.spanId != ctx31b.spanId {
+      print("  ✓ TraceContext: unique traceId and spanId per generate()")
+      passed += 1
+    } else {
+      print("  ✗ TraceContext generated duplicate IDs")
+      failed += 1
+    }
+
+    // CHECK 32: TelemetryConfig default sampling rate
+    print("32. TelemetryConfig default sampling rate...")
+    let cfg32 = TelemetryConfig()
+    if cfg32.failedJourneySampleRate == 1.0 {
+      print("  ✓ TelemetryConfig: default failedJourneySampleRate = 1.0")
+      passed += 1
+    } else {
+      print("  ✗ Expected 1.0, got \(cfg32.failedJourneySampleRate)")
+      failed += 1
+    }
+
+    // CHECK 33: TelemetryConfig with custom rate
+    print("33. TelemetryConfig with custom rate 0.5...")
+    let cfg33 = TelemetryConfig(failedJourneySampleRate: 0.5)
+    if cfg33.failedJourneySampleRate == 0.5 {
+      print("  ✓ TelemetryConfig: custom rate 0.5 accepted")
+      passed += 1
+    } else {
+      print("  ✗ Expected 0.5, got \(cfg33.failedJourneySampleRate)")
+      failed += 1
+    }
+
+    // CHECK 34: AuditLogEntry.toLogLine() contains required fields and no raw key
+    print("34. AuditLogEntry.toLogLine() format and sanitization...")
+    let rawKey34 = "raw-idempotency-secret-key-7890"
+    let entry34 = AuditLogEntry(
+      traceId: "abcdef1234567890abcdef1234567890",
+      timestamp: "2026-09-18T12:00:00Z",
+      event: "payment.completed",
+      outcome: "success",
+      hashedIdempotencyKey: hashIdempotencyKey(rawKey34),
+      catalogAgeDays: 7,
+      methodCount: 2,
+      scaInvoked: false,
+      latencyMs: 120,
+      amountMinor: 2500,
+      paymentMethod: "card"
+    )
+    let line34 = entry34.toLogLine()
+    let ok34 = line34.contains("trace=abcdef1234567890abcdef1234567890")
+      && line34.contains("event=payment.completed")
+      && line34.contains("outcome=success")
+      && line34.contains("idem_hash=")
+      && line34.contains("catalog_age_days=7")
+      && line34.contains("method_count=2")
+      && line34.contains("sca=false")
+      && line34.contains("latency_ms=120")
+      && line34.contains("amount_pence=2500")
+      && line34.contains("method=card")
+      && !line34.contains(rawKey34)
+    if ok34 {
+      print("  ✓ AuditLogEntry.toLogLine(): fields present, raw key absent")
+      passed += 1
+    } else {
+      print("  ✗ Log line incorrect: \(line34)")
+      failed += 1
+    }
+
+    // CHECK 35: AuditLogEntry.toLogLine() omits nil fields
+    print("35. AuditLogEntry.toLogLine() omits nil fields...")
+    let entry35 = AuditLogEntry(
+      traceId: "abc",
+      timestamp: "2026-09-18T12:00:00Z",
+      event: "payment.completed"
+    )
+    let line35 = entry35.toLogLine()
+    let ok35 = !line35.contains("outcome=")
+      && !line35.contains("idem_hash=")
+      && !line35.contains("latency_ms=")
+      && line35.contains("trace=abc")
+      && line35.contains("event=payment.completed")
+    if ok35 {
+      print("  ✓ AuditLogEntry.toLogLine(): nil fields omitted")
+      passed += 1
+    } else {
+      print("  ✗ Nil fields included or required fields missing: \(line35)")
+      failed += 1
+    }
+
+    // CHECK 36: TelemetryConfig callback is invoked
+    print("36. TelemetryConfig callback is invoked...")
+    var callbackInvoked = false
+    let cfg36 = TelemetryConfig(
+      failedJourneySampleRate: 1.0,
+      onEntry: { _ in callbackInvoked = true }
+    )
+    let entry36 = AuditLogEntry(
+      traceId: "abc", timestamp: "2026-09-18T12:00:00Z", event: "payment.completed"
+    )
+    cfg36.onEntry(entry36)
+    if callbackInvoked {
+      print("  ✓ TelemetryConfig: onEntry callback invoked")
+      passed += 1
+    } else {
+      print("  ✗ TelemetryConfig: onEntry callback was not invoked")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/36")
+    print("Failed: \(failed)/36")
 
     if failed > 0 {
       exit(1)

@@ -7,6 +7,10 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.time.Instant
+import java.time.LocalDate
+import java.time.temporal.ChronoUnit
+import kotlin.random.Random
 
 /**
  * Meridian API client for Kotlin/JVM and Android
@@ -16,9 +20,13 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val telemetryConfig: TelemetryConfig = TelemetryConfig(),
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+
+  /** Cached catalog from the most recent [getCatalog] call, used for telemetry enrichment. */
+  @Volatile private var cachedCatalog: CatalogResponse? = null
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -35,6 +43,7 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
+    traceContext: TraceContext = TraceContext.generate(),
   ): T = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
@@ -46,6 +55,7 @@ class MeridianClient(
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
+      connection.setRequestProperty("X-Trace-ID", traceContext.traceparent)
 
       // Add additional headers (e.g., Idempotency-Key)
       additionalHeaders.forEach { (key, value) ->
@@ -117,9 +127,13 @@ class MeridianClient(
 
   /**
    * GET /catalog - Fetch recipients and providers
+   * Caches the response for telemetry enrichment of subsequent payment calls.
    */
-  suspend fun getCatalog(): CatalogResponse =
-    request("GET", "/catalog", responseType = CatalogResponse::class.java)
+  suspend fun getCatalog(): CatalogResponse {
+    val catalog = request("GET", "/catalog", responseType = CatalogResponse::class.java)
+    cachedCatalog = catalog
+    return catalog
+  }
 
   /**
    * GET /state - Fetch current bank state
@@ -129,6 +143,12 @@ class MeridianClient(
 
   /**
    * POST /payments - Submit a payment
+   *
+   * Emits a structured [AuditLogEntry] on every call via the configured [TelemetryConfig].
+   * The idempotency key is hashed (SHA-256) before logging; no raw key, token, or bank
+   * credential ever appears in telemetry. Failed-journey entries are subject to the
+   * configured [TelemetryConfig.failedJourneySampleRate].
+   *
    * @param recipientId Recipient ID
    * @param amountMinor Amount in GBP pence (integer)
    * @param method Payment method (card or bank)
@@ -144,21 +164,49 @@ class MeridianClient(
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
   ): PaymentResponse {
-    val payload = PaymentRequest(
-      recipientId = recipientId,
-      amountMinor = amountMinor,
-      method = method.name,
-      note = note,
-      scenario = scenario.name,
-    )
+    val trace = TraceContext.generate()
+    val startMs = System.currentTimeMillis()
+    var outcome = "error"
 
-    return request(
-      "POST",
-      "/payments",
-      payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
-      PaymentResponse::class.java,
-    )
+    try {
+      val payload = PaymentRequest(
+        recipientId = recipientId,
+        amountMinor = amountMinor,
+        method = method.name,
+        note = note,
+        scenario = scenario.name,
+      )
+
+      val response = request(
+        "POST",
+        "/payments",
+        payload,
+        mapOf("Idempotency-Key" to idempotencyKey),
+        PaymentResponse::class.java,
+        trace,
+      )
+
+      outcome = when {
+        response.ok -> "success"
+        response.code == "PAYMENT_PENDING" -> "pending"
+        else -> "declined"
+      }
+
+      return response
+    } catch (e: Exception) {
+      outcome = "error"
+      throw e
+    } finally {
+      val latencyMs = System.currentTimeMillis() - startMs
+      emitPaymentTelemetry(
+        trace = trace,
+        outcome = outcome,
+        idempotencyKey = idempotencyKey,
+        method = method,
+        amountMinor = amountMinor,
+        latencyMs = latencyMs,
+      )
+    }
   }
 
   /**
@@ -190,4 +238,48 @@ class MeridianClient(
    */
   suspend fun getEvents(): EventsResponse =
     request("GET", "/events", responseType = EventsResponse::class.java)
+
+  // MARK: - Private Telemetry Helpers
+
+  private fun emitPaymentTelemetry(
+    trace: TraceContext,
+    outcome: String,
+    idempotencyKey: String,
+    method: PaymentMethod,
+    amountMinor: Int,
+    latencyMs: Long,
+  ) {
+    // Successful journeys are always logged; failed journeys are subject to sampling.
+    val sampled = outcome == "success" || Random.nextDouble() < telemetryConfig.failedJourneySampleRate
+    if (!sampled) return
+
+    val catalog = cachedCatalog
+    val catalogAgeDays = catalog?.let {
+      try {
+        ChronoUnit.DAYS.between(LocalDate.parse(it.demoDate), LocalDate.now())
+      } catch (ignored: Exception) {
+        null
+      }
+    }
+    val methodCount = catalog?.providers?.sumOf { it.methods.size }
+
+    // SCA (PSD2) applies to bank-method payments and to journeys that returned pending.
+    val scaInvoked = method == PaymentMethod.bank || outcome == "pending"
+
+    val entry = AuditLogEntry(
+      traceId = trace.traceId,
+      timestamp = Instant.now().toString(),
+      event = "payment.completed",
+      outcome = outcome,
+      hashedIdempotencyKey = hashIdempotencyKey(idempotencyKey),
+      catalogAgeDays = catalogAgeDays,
+      methodCount = methodCount,
+      scaInvoked = scaInvoked,
+      latencyMs = latencyMs,
+      amountMinor = amountMinor,
+      paymentMethod = method.name,
+    )
+
+    telemetryConfig.onEntry(entry)
+  }
 }
