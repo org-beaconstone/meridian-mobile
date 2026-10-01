@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
     Text(message)
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
+        Column(Modifier.padding(22.dp)){Text("Everyday account");Text(current.balanceMoney.format(),style=MaterialTheme.typography.h3);Text("Room: $room")}
       }
       Text("Make a payment",style=MaterialTheme.typography.h6)
       catalog?.recipients?.forEach { person ->
@@ -83,9 +83,9 @@ class MainActivity : ComponentActivity() {
         TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
-      current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
+      current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${transaction.amountMoney.format()} · ${transaction.provider}")}
       Text("Budgets",style=MaterialTheme.typography.h6)
-      current.budgets.forEach {budget->Text("${budget.category} · ${money(budget.limit)}")}
+      current.budgets.forEach {budget->Text("${budget.category} · ${budget.limitMoney.format()}")}
     }
   }
 }

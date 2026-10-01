@@ -154,10 +154,7 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
 
 // MARK: - Amount Formatting
 
-fun money(pence: Int): String {
-  val pounds = pence / 100.0
-  return "£%.2f".format(pounds)
-}
+fun money(pence: Int): String = Money.fromLegacyGbpPence(pence).format()
 
 /**
  * Parse amount string to integer pence

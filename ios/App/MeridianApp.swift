@@ -33,7 +33,7 @@ import MeridianSDK
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
-            Text(money(state.balance)).font(.system(size: 38, weight: .medium))
+            Text(state.balanceMoney.formatted()).font(.system(size: 38, weight: .medium))
             Text("Shared room: \(room)").font(.caption)
           }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(Color(red:0.078,green:0.173,blue:0.208)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 16))
           Text("Make a payment").font(.title2)
@@ -52,9 +52,9 @@ import MeridianSDK
             Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
-          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
+          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(transaction.amountMoney.formatted()) } }
           Text("September budgets").font(.title2)
-          ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
+          ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(budget.limitMoney.formatted())} }
         }
       }.padding(24).frame(maxWidth: 550)
     }.task {
