@@ -15,11 +15,6 @@ public enum PaymentMethod: String, Codable, Hashable {
   case bank
 }
 
-public enum ProviderId: String, Codable, Hashable {
-  case adyen
-  case worldpay
-}
-
 public enum Scenario: String, Codable {
   case success
   case declined
@@ -68,7 +63,7 @@ public struct Transaction: Codable, Hashable {
   public let category: Category
   public let amount: Int // integer GBP pence, positive (outgoing)
   public let date: String // ISO 8601
-  public let provider: ProviderId
+  public let provider: String // provider id string from server (e.g. "adyen", "worldpay")
   public let method: PaymentMethod
   public let status: TransactionStatus
   public let note: String
@@ -81,7 +76,7 @@ public struct Transaction: Codable, Hashable {
     category: Category,
     amount: Int,
     date: String,
-    provider: ProviderId,
+    provider: String,
     method: PaymentMethod,
     status: TransactionStatus,
     note: String
@@ -130,16 +125,16 @@ public struct BankState: Codable, Hashable {
 }
 
 public struct Provider: Codable, Hashable {
-  public let id: ProviderId
+  public let id: String // server-assigned provider id string
   public let name: String
   public let description: String
-  public let methods: [PaymentMethod]
+  public let methods: [String]
 
   public init(
-    id: ProviderId,
+    id: String,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [String]
   ) {
     self.id = id
     self.name = name
@@ -147,6 +142,111 @@ public struct Provider: Codable, Hashable {
     self.methods = methods
   }
 }
+
+// MARK: - Payment Method Descriptors
+
+/// A server-driven descriptor representing one selectable payment option.
+/// Derived from the catalog `/catalog` providers list; each provider × method
+/// combination yields one descriptor shown in the method-selector bottom sheet.
+public struct PaymentMethodDescriptor: Identifiable, Hashable {
+  /// Stable composite key: "\(providerId):\(method.rawValue)"
+  public let id: String
+  public let providerId: String
+  public let providerName: String
+  public let method: PaymentMethod
+  /// Human-readable label shown in the picker row (e.g. "Debit card").
+  public let label: String
+  /// SF Symbol name for the leading icon.
+  public let logoSymbol: String
+  /// Whether the user must also choose a destination bank.
+  public let requiresBankChoice: Bool
+  /// False when the server marks this combination ineligible.
+  public let eligible: Bool
+
+  public init(
+    id: String,
+    providerId: String,
+    providerName: String,
+    method: PaymentMethod,
+    label: String,
+    logoSymbol: String,
+    requiresBankChoice: Bool,
+    eligible: Bool
+  ) {
+    self.id = id
+    self.providerId = providerId
+    self.providerName = providerName
+    self.method = method
+    self.label = label
+    self.logoSymbol = logoSymbol
+    self.requiresBankChoice = requiresBankChoice
+    self.eligible = eligible
+  }
+}
+
+/// A selectable destination bank shown in the bank-selector bottom sheet.
+public struct BankOption: Identifiable, Hashable {
+  public let id: String
+  public let name: String
+  public let sortCode: String
+
+  public init(id: String, name: String, sortCode: String) {
+    self.id = id
+    self.name = name
+    self.sortCode = sortCode
+  }
+}
+
+/// Build `PaymentMethodDescriptor` entries from the catalog provider list.
+/// Order follows the server-returned provider and method ordering.
+public func paymentMethodDescriptors(from providers: [Provider]) -> [PaymentMethodDescriptor] {
+  var result: [PaymentMethodDescriptor] = []
+  for provider in providers {
+    for methodStr in provider.methods {
+      guard let method = PaymentMethod(rawValue: methodStr) else { continue }
+      let label: String
+      let symbol: String
+      let requiresBank: Bool
+      switch method {
+      case .card:
+        label = "Debit card"
+        symbol = "creditcard.fill"
+        requiresBank = false
+      case .bank:
+        label = "Bank payment"
+        symbol = "building.columns.fill"
+        requiresBank = true
+      }
+      result.append(
+        PaymentMethodDescriptor(
+          id: "\(provider.id):\(methodStr)",
+          providerId: provider.id,
+          providerName: provider.name,
+          method: method,
+          label: label,
+          logoSymbol: symbol,
+          requiresBankChoice: requiresBank,
+          eligible: true
+        )
+      )
+    }
+  }
+  return result
+}
+
+/// Simulated UK bank list used for bank-payment demos.
+/// Presented in the searchable bank-selector sheet when the chosen method
+/// has `requiresBankChoice == true`.
+public let demoBanks: [BankOption] = [
+  BankOption(id: "barclays",   name: "Barclays",      sortCode: "20-00-00"),
+  BankOption(id: "hsbc",       name: "HSBC",          sortCode: "40-00-00"),
+  BankOption(id: "lloyds",     name: "Lloyds",        sortCode: "30-00-00"),
+  BankOption(id: "natwest",    name: "NatWest",       sortCode: "60-00-00"),
+  BankOption(id: "nationwide", name: "Nationwide",    sortCode: "07-00-00"),
+  BankOption(id: "santander",  name: "Santander",     sortCode: "09-00-00"),
+  BankOption(id: "monzo",      name: "Monzo",         sortCode: "04-00-04"),
+  BankOption(id: "starling",   name: "Starling Bank", sortCode: "60-83-71"),
+]
 
 // MARK: - API Response Types
 
