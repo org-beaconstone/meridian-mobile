@@ -374,4 +374,132 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - PaymentMethodDescriptor Tests
+
+  @Test
+  fun testPaymentMethodDescriptorsCardProvider() {
+    val providers = listOf(
+      Provider(id = "adyen", name = "Adyen", description = "Card processor", methods = listOf("card"))
+    )
+    val descriptors = paymentMethodDescriptors(providers)
+
+    assertEquals(1, descriptors.size)
+    assertEquals("adyen:card", descriptors[0].id)
+    assertEquals("adyen", descriptors[0].providerId)
+    assertEquals("Adyen", descriptors[0].providerName)
+    assertEquals(PaymentMethod.card, descriptors[0].method)
+    assertEquals("Debit card", descriptors[0].label)
+    assertFalse(descriptors[0].requiresBankChoice)
+    assertTrue(descriptors[0].eligible)
+  }
+
+  @Test
+  fun testPaymentMethodDescriptorsBankProvider() {
+    val providers = listOf(
+      Provider(id = "worldpay", name = "Worldpay", description = "Bank transfer", methods = listOf("bank"))
+    )
+    val descriptors = paymentMethodDescriptors(providers)
+
+    assertEquals(1, descriptors.size)
+    assertEquals("worldpay:bank", descriptors[0].id)
+    assertEquals(PaymentMethod.bank, descriptors[0].method)
+    assertEquals("Bank payment", descriptors[0].label)
+    assertTrue(descriptors[0].requiresBankChoice)
+    assertTrue(descriptors[0].eligible)
+  }
+
+  @Test
+  fun testPaymentMethodDescriptorsMultipleProviders() {
+    val providers = listOf(
+      Provider(id = "adyen", name = "Adyen", description = "", methods = listOf("card")),
+      Provider(id = "worldpay", name = "Worldpay", description = "", methods = listOf("bank")),
+    )
+    val descriptors = paymentMethodDescriptors(providers)
+
+    assertEquals(2, descriptors.size)
+    assertEquals("adyen", descriptors[0].providerId)
+    assertEquals("worldpay", descriptors[1].providerId)
+  }
+
+  @Test
+  fun testPaymentMethodDescriptorsSkipsUnknownMethods() {
+    val providers = listOf(
+      Provider(id = "x", name = "X", description = "", methods = listOf("wire", "card"))
+    )
+    val descriptors = paymentMethodDescriptors(providers)
+
+    assertEquals(1, descriptors.size)
+    assertEquals(PaymentMethod.card, descriptors[0].method)
+  }
+
+  @Test
+  fun testPaymentMethodDescriptorsEmptyCatalog() {
+    val descriptors = paymentMethodDescriptors(emptyList())
+    assertTrue(descriptors.isEmpty())
+  }
+
+  @Test
+  fun testPaymentMethodDescriptorsProviderWithMultipleMethods() {
+    val providers = listOf(
+      Provider(id = "multi", name = "Multi", description = "", methods = listOf("card", "bank"))
+    )
+    val descriptors = paymentMethodDescriptors(providers)
+
+    assertEquals(2, descriptors.size)
+    assertEquals("multi:card", descriptors[0].id)
+    assertEquals("multi:bank", descriptors[1].id)
+  }
+
+  // MARK: - BankOption Tests
+
+  @Test
+  fun testDemoBanksNotEmpty() {
+    assertTrue(demoBanks.isNotEmpty())
+    assertEquals(8, demoBanks.size)
+  }
+
+  @Test
+  fun testDemoBanksHaveRequiredFields() {
+    val barclays = demoBanks.first { it.id == "barclays" }
+    assertEquals("Barclays", barclays.name)
+    assertEquals("20-00-00", barclays.sortCode)
+  }
+
+  @Test
+  fun testBankOptionSearchFilterCaseInsensitive() {
+    val query = "lloy"
+    val filtered = demoBanks.filter { it.name.contains(query, ignoreCase = true) }
+    assertEquals(1, filtered.size)
+    assertEquals("lloyds", filtered[0].id)
+  }
+
+  @Test
+  fun testBankOptionSearchFilterEmptyQueryReturnsAll() {
+    val filtered = demoBanks.filter { it.name.contains("", ignoreCase = true) }
+    assertEquals(demoBanks.size, filtered.size)
+  }
+
+  @Test
+  fun testBankOptionSearchFilterNoMatch() {
+    val filtered = demoBanks.filter { it.name.contains("zzznotabank", ignoreCase = true) }
+    assertTrue(filtered.isEmpty())
+  }
+
+  // MARK: - Transaction provider as String
+
+  @Test
+  fun testTransactionProviderIsString() {
+    val json = """
+      {
+        "id": "txn-1", "reference": "REF-1", "recipientId": "rec-1",
+        "name": "Test", "category": "Shopping", "amount": 500,
+        "date": "2026-09-01", "provider": "adyen",
+        "method": "card", "status": "completed", "note": ""
+      }
+    """.trimIndent()
+
+    val txn = mapper.readValue(json, Transaction::class.java)
+    assertEquals("adyen", txn.provider)
+  }
 }

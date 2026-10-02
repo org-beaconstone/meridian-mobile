@@ -341,10 +341,149 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: paymentMethodDescriptors derives card descriptor from catalog
+    print("21. paymentMethodDescriptors card descriptor...")
+    let cardProvider = Provider(id: "adyen", name: "Adyen", description: "Card processor", methods: ["card"])
+    let cardDescriptors = paymentMethodDescriptors(from: [cardProvider])
+    if cardDescriptors.count == 1,
+       cardDescriptors[0].id == "adyen:card",
+       cardDescriptors[0].method == .card,
+       cardDescriptors[0].providerId == "adyen",
+       cardDescriptors[0].providerName == "Adyen",
+       cardDescriptors[0].requiresBankChoice == false,
+       cardDescriptors[0].eligible == true {
+      print("  ✓ Card descriptor correct: id=\(cardDescriptors[0].id)")
+      passed += 1
+    } else {
+      print("  ✗ Card descriptor mismatch, got: \(cardDescriptors)")
+      failed += 1
+    }
+
+    // CHECK 22: paymentMethodDescriptors derives bank descriptor from catalog
+    print("22. paymentMethodDescriptors bank descriptor...")
+    let bankProvider = Provider(id: "worldpay", name: "Worldpay", description: "Bank transfer", methods: ["bank"])
+    let bankDescriptors = paymentMethodDescriptors(from: [bankProvider])
+    if bankDescriptors.count == 1,
+       bankDescriptors[0].id == "worldpay:bank",
+       bankDescriptors[0].method == .bank,
+       bankDescriptors[0].requiresBankChoice == true,
+       bankDescriptors[0].logoSymbol == "building.columns.fill" {
+      print("  ✓ Bank descriptor correct: requiresBankChoice=\(bankDescriptors[0].requiresBankChoice)")
+      passed += 1
+    } else {
+      print("  ✗ Bank descriptor mismatch, got: \(bankDescriptors)")
+      failed += 1
+    }
+
+    // CHECK 23: paymentMethodDescriptors handles multiple providers
+    print("23. paymentMethodDescriptors multiple providers...")
+    let multiDescriptors = paymentMethodDescriptors(from: [cardProvider, bankProvider])
+    if multiDescriptors.count == 2,
+       multiDescriptors[0].providerId == "adyen",
+       multiDescriptors[1].providerId == "worldpay" {
+      print("  ✓ Multiple providers: \(multiDescriptors.count) descriptors, order preserved")
+      passed += 1
+    } else {
+      print("  ✗ Expected 2 descriptors in provider order, got: \(multiDescriptors.count)")
+      failed += 1
+    }
+
+    // CHECK 24: paymentMethodDescriptors skips unknown method strings
+    print("24. paymentMethodDescriptors skips unknown methods...")
+    let unknownProvider = Provider(id: "x", name: "X", description: "", methods: ["wire", "card"])
+    let mixed = paymentMethodDescriptors(from: [unknownProvider])
+    if mixed.count == 1 && mixed[0].method == .card {
+      print("  ✓ Unknown method 'wire' skipped, 'card' retained")
+      passed += 1
+    } else {
+      print("  ✗ Expected 1 descriptor ('card'), got: \(mixed.count)")
+      failed += 1
+    }
+
+    // CHECK 25: paymentMethodDescriptors empty catalog yields empty list
+    print("25. paymentMethodDescriptors empty catalog...")
+    let empty = paymentMethodDescriptors(from: [])
+    if empty.isEmpty {
+      print("  ✓ Empty catalog yields empty descriptor list")
+      passed += 1
+    } else {
+      print("  ✗ Expected empty list, got \(empty.count) descriptors")
+      failed += 1
+    }
+
+    // CHECK 26: demoBanks contains expected entries
+    print("26. demoBanks list...")
+    let barclays = demoBanks.first(where: { $0.id == "barclays" })
+    let monzo = demoBanks.first(where: { $0.id == "monzo" })
+    if demoBanks.count == 8, barclays?.sortCode == "20-00-00", monzo?.name == "Monzo" {
+      print("  ✓ demoBanks has \(demoBanks.count) entries, sort codes present")
+      passed += 1
+    } else {
+      print("  ✗ demoBanks unexpected content, count=\(demoBanks.count)")
+      failed += 1
+    }
+
+    // CHECK 27: BankOption filtering by name (case-insensitive)
+    print("27. BankOption search filtering...")
+    let queryLloyds = "lloy"
+    let filtered = demoBanks.filter { $0.name.localizedCaseInsensitiveContains(queryLloyds) }
+    if filtered.count == 1 && filtered[0].id == "lloyds" {
+      print("  ✓ Search 'lloy' matches Lloyds only")
+      passed += 1
+    } else {
+      print("  ✗ Expected 1 match for 'lloy', got \(filtered.count)")
+      failed += 1
+    }
+
+    // CHECK 28: Transaction decodes provider as String (not enum)
+    print("28. Transaction provider is String...")
+    let txnJson = """
+    {
+      "id": "txn-1", "reference": "REF-1", "recipientId": "rec-1",
+      "name": "Test", "category": "Shopping", "amount": 500,
+      "date": "2026-09-01", "provider": "adyen",
+      "method": "card", "status": "completed", "note": ""
+    }
+    """
+    do {
+      let decoder = JSONDecoder()
+      let txn = try decoder.decode(Transaction.self, from: txnJson.data(using: .utf8)!)
+      if txn.provider == "adyen" {
+        print("  ✓ Transaction.provider decoded as String: \"\(txn.provider)\"")
+        passed += 1
+      } else {
+        print("  ✗ Expected provider \"adyen\", got \"\(txn.provider)\"")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Decoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 29: Provider.id decodes as String
+    print("29. Provider.id is String...")
+    let providerJson = """
+    {"id": "worldpay", "name": "Worldpay", "description": "Bank transfer", "methods": ["bank"]}
+    """
+    do {
+      let decoder = JSONDecoder()
+      let provider = try decoder.decode(Provider.self, from: providerJson.data(using: .utf8)!)
+      if provider.id == "worldpay" {
+        print("  ✓ Provider.id decoded as String: \"\(provider.id)\"")
+        passed += 1
+      } else {
+        print("  ✗ Expected id \"worldpay\", got \"\(provider.id)\"")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Decoding failed: \(error)")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/29")
+    print("Failed: \(failed)/29")
 
     if failed > 0 {
       exit(1)

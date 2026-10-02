@@ -23,10 +23,6 @@ enum class PaymentMethod {
   card, bank
 }
 
-enum class ProviderId {
-  adyen, worldpay
-}
-
 enum class Scenario {
   success, declined, unavailable, pending
 }
@@ -54,7 +50,7 @@ data class Transaction(
   val category: String,
   val amount: Int, // integer GBP pence, positive (outgoing)
   val date: String, // ISO 8601
-  val provider: String,
+  val provider: String, // provider id string from server (e.g. "adyen", "worldpay")
   val method: String,
   val status: String,
   val note: String,
@@ -73,11 +69,96 @@ data class BankState(
 ) : Serializable
 
 data class Provider(
-  val id: String,
+  val id: String, // server-assigned provider id string
   val name: String,
   val description: String,
   val methods: List<String>,
 ) : Serializable
+
+// MARK: - Payment Method Descriptors
+
+/**
+ * A server-driven descriptor representing one selectable payment option.
+ * Derived from the catalog `/catalog` providers list; each provider × method
+ * combination yields one descriptor shown in the method-selector bottom sheet.
+ */
+data class PaymentMethodDescriptor(
+  /** Stable composite key: "${providerId}:${method}" */
+  val id: String,
+  val providerId: String,
+  val providerName: String,
+  val method: PaymentMethod,
+  /** Human-readable label shown in the picker row (e.g. "Debit card"). */
+  val label: String,
+  /** Material icon name for the leading icon. */
+  val iconName: String,
+  /** Whether the user must also choose a destination bank. */
+  val requiresBankChoice: Boolean,
+  /** False when the server marks this combination ineligible. */
+  val eligible: Boolean,
+) : Serializable
+
+/** A selectable destination bank shown in the bank-selector bottom sheet. */
+data class BankOption(
+  val id: String,
+  val name: String,
+  val sortCode: String,
+) : Serializable
+
+/**
+ * Build [PaymentMethodDescriptor] entries from the catalog provider list.
+ * Order follows the server-returned provider and method ordering.
+ */
+fun paymentMethodDescriptors(providers: List<Provider>): List<PaymentMethodDescriptor> {
+  val result = mutableListOf<PaymentMethodDescriptor>()
+  for (provider in providers) {
+    for (methodStr in provider.methods) {
+      val method = try {
+        PaymentMethod.valueOf(methodStr)
+      } catch (_: IllegalArgumentException) {
+        null
+      } ?: continue
+      val label: String
+      val iconName: String
+      val requiresBank: Boolean
+      when (method) {
+        PaymentMethod.card -> {
+          label = "Debit card"
+          iconName = "credit_card"
+          requiresBank = false
+        }
+        PaymentMethod.bank -> {
+          label = "Bank payment"
+          iconName = "account_balance"
+          requiresBank = true
+        }
+      }
+      result += PaymentMethodDescriptor(
+        id = "${provider.id}:$methodStr",
+        providerId = provider.id,
+        providerName = provider.name,
+        method = method,
+        label = label,
+        iconName = iconName,
+        requiresBankChoice = requiresBank,
+        eligible = true,
+      )
+    }
+  }
+  return result
+}
+
+/** Simulated UK bank list used for bank-payment demos. */
+val demoBanks: List<BankOption> = listOf(
+  BankOption(id = "barclays",   name = "Barclays",      sortCode = "20-00-00"),
+  BankOption(id = "hsbc",       name = "HSBC",          sortCode = "40-00-00"),
+  BankOption(id = "lloyds",     name = "Lloyds",        sortCode = "30-00-00"),
+  BankOption(id = "natwest",    name = "NatWest",       sortCode = "60-00-00"),
+  BankOption(id = "nationwide", name = "Nationwide",    sortCode = "07-00-00"),
+  BankOption(id = "santander",  name = "Santander",     sortCode = "09-00-00"),
+  BankOption(id = "monzo",      name = "Monzo",         sortCode = "04-00-04"),
+  BankOption(id = "starling",   name = "Starling Bank", sortCode = "60-83-71"),
+)
 
 // MARK: - API Response Types
 
