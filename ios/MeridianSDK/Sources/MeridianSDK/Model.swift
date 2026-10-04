@@ -15,9 +15,24 @@ public enum PaymentMethod: String, Codable, Hashable {
   case bank
 }
 
-public enum ProviderId: String, Codable, Hashable {
+/// Static checkout binding. Catalog hydration must not add a case or retarget a timed-out payment.
+public enum ProviderId: String, Codable, Hashable, CaseIterable {
   case adyen
   case worldpay
+
+  public var paymentMethod: PaymentMethod {
+    switch self {
+    case .adyen: return .card
+    case .worldpay: return .bank
+    }
+  }
+
+  public var checkoutLabel: String {
+    switch self {
+    case .adyen: return "Debit card · Adyen"
+    case .worldpay: return "Bank payment · Worldpay"
+    }
+  }
 }
 
 public enum Scenario: String, Codable {
@@ -148,6 +163,101 @@ public struct Provider: Codable, Hashable {
   }
 }
 
+/// Network catalog provider. The id is a string so hydration does not depend on `ProviderId`.
+public struct DynamicProvider: Codable, Hashable, Identifiable {
+  public let id: String
+  public let name: String
+  public let description: String
+  public let methods: [String]
+  public let currencies: [String]
+  public let corridors: [PaymentCorridor]
+
+  public init(
+    id: String,
+    name: String,
+    description: String,
+    methods: [String],
+    currencies: [String] = [],
+    corridors: [PaymentCorridor] = []
+  ) {
+    self.id = id
+    self.name = name
+    self.description = description
+    self.methods = methods
+    self.currencies = currencies
+    self.corridors = corridors
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case name
+    case description
+    case methods
+    case currencies
+    case supportedCurrencies
+    case corridors
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    name = try container.decodeIfPresent(String.self, forKey: .name) ?? id
+    description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+    methods = try container.decodeIfPresent([String].self, forKey: .methods) ?? []
+    let primary = try container.decodeIfPresent([String].self, forKey: .currencies)
+    let alternate = try container.decodeIfPresent([String].self, forKey: .supportedCurrencies)
+    currencies = primary ?? alternate ?? []
+    if let loose = try? container.decode([LooseCorridor].self, forKey: .corridors) {
+      corridors = loose.compactMap { $0.corridor() }
+    } else {
+      corridors = []
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(name, forKey: .name)
+    try container.encode(description, forKey: .description)
+    try container.encode(methods, forKey: .methods)
+    try container.encode(currencies, forKey: .currencies)
+    try container.encode(corridors, forKey: .corridors)
+  }
+}
+
+public struct PaymentCorridor: Codable, Hashable, Identifiable {
+  public let id: String
+  public let method: String
+  public let currency: String
+  public let country: String
+
+  public init(id: String, method: String, currency: String, country: String) {
+    self.id = id
+    self.method = method
+    self.currency = currency
+    self.country = country
+  }
+}
+
+private struct LooseCorridor: Decodable {
+  let id: String?
+  let method: String?
+  let currency: String?
+  let country: String?
+
+  func corridor() -> PaymentCorridor? {
+    guard let method, !method.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return nil
+    }
+    return PaymentCorridor(
+      id: id ?? "",
+      method: method,
+      currency: currency ?? "",
+      country: country ?? ""
+    )
+  }
+}
+
 // MARK: - API Response Types
 
 public struct HealthResponse: Codable {
@@ -159,7 +269,13 @@ public struct HealthResponse: Codable {
 public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
-  public let providers: [Provider]
+  public let providers: [DynamicProvider]
+
+  public init(demoDate: String, recipients: [Recipient], providers: [DynamicProvider]) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+  }
 }
 
 public struct PaymentResponse: Codable {

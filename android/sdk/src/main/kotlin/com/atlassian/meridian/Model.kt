@@ -1,5 +1,7 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.annotation.JsonAlias
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
@@ -23,8 +25,20 @@ enum class PaymentMethod {
   card, bank
 }
 
+/** Static checkout binding. Catalog hydration must not add a constant or retarget a timed-out payment. */
 enum class ProviderId {
-  adyen, worldpay
+  adyen,
+  worldpay;
+
+  fun paymentMethod(): PaymentMethod = when (this) {
+    adyen -> PaymentMethod.card
+    worldpay -> PaymentMethod.bank
+  }
+
+  fun checkoutLabel(): String = when (this) {
+    adyen -> "Debit card · Adyen"
+    worldpay -> "Bank payment · Worldpay"
+  }
 }
 
 enum class Scenario {
@@ -79,6 +93,26 @@ data class Provider(
   val methods: List<String>,
 ) : Serializable
 
+/** Network catalog provider. The id stays a string so hydration does not use [ProviderId]. */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class DynamicProvider(
+  val id: String = "",
+  val name: String = "",
+  val description: String = "",
+  val methods: List<String> = emptyList(),
+  @JsonAlias("supportedCurrencies")
+  val currencies: List<String> = emptyList(),
+  val corridors: List<PaymentCorridor> = emptyList(),
+) : Serializable
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class PaymentCorridor(
+  val id: String = "",
+  val method: String = "",
+  val currency: String = "",
+  val country: String = "",
+) : Serializable
+
 // MARK: - API Response Types
 
 data class HealthResponse(
@@ -87,10 +121,11 @@ data class HealthResponse(
   val simulation: Boolean,
 ) : Serializable
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CatalogResponse(
   val demoDate: String,
   val recipients: List<Recipient>,
-  val providers: List<Provider>,
+  val providers: List<DynamicProvider>,
 ) : Serializable
 
 data class PaymentResponse(

@@ -2,6 +2,7 @@ package com.atlassian.meridian
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
@@ -16,6 +17,7 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val timeoutMillis: Int = 15_000,
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
@@ -35,14 +37,17 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
+    require2xx: Boolean = false,
   ): T = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
     val connection = url.openConnection() as HttpURLConnection
     try {
-      connection.connectTimeout = 15000
-      connection.readTimeout = 15000
+      connection.instanceFollowRedirects = false
+      connection.useCaches = false
+      connection.connectTimeout = timeoutMillis
+      connection.readTimeout = timeoutMillis
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
@@ -71,6 +76,10 @@ class MeridianClient(
       }
 
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
+
+      if (require2xx && statusCode !in 200..299) {
+        throw MeridianError.HttpError(statusCode, responseBody.ifEmpty { "Catalog unavailable" })
+      }
 
       // Check HTTP status and handle errors
       when {
@@ -116,10 +125,36 @@ class MeridianClient(
     request("GET", "/health", responseType = HealthResponse::class.java)
 
   /**
-   * GET /catalog - Fetch recipients and providers
+   * GET /catalog - Fetch recipients and the Adyen/Worldpay baseline.
    */
   suspend fun getCatalog(): CatalogResponse =
-    request("GET", "/catalog", responseType = CatalogResponse::class.java)
+    projectBaselineCatalog(
+      request(
+        "GET",
+        "/catalog",
+        responseType = CatalogResponse::class.java,
+        require2xx = true,
+      )
+    )
+
+  /**
+   * GET /catalog, then the encrypted local cache when the device is offline or the API times out or returns 5xx.
+   * One request only: a timeout never contacts another host.
+   */
+  suspend fun loadCatalog(cache: CatalogCache): CatalogLoad {
+    return try {
+      val catalog = getCatalog()
+      cache.save(sessionId, catalog)
+      CatalogLoad(catalog, CatalogOrigin.network)
+    } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      if (catalogFailureUsesCache(error)) {
+        val saved = cache.load(sessionId)
+        if (saved != null) return CatalogLoad(saved, CatalogOrigin.cache)
+      }
+      CatalogLoad(null, null)
+    }
+  }
 
   /**
    * GET /state - Fetch current bank state
