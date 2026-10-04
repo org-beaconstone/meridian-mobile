@@ -91,6 +91,10 @@ data class CatalogResponse(
   val demoDate: String,
   val recipients: List<Recipient>,
   val providers: List<Provider>,
+  /** "legacy" for the two-provider document, "dynamic" for the catalog-methods document. */
+  val schema: String = "legacy",
+  /** Recognized currency codes. Legacy documents stay GBP. */
+  val currencies: List<String> = listOf("GBP"),
 ) : Serializable
 
 data class PaymentResponse(
@@ -157,6 +161,14 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
 fun money(pence: Int): String {
   val pounds = pence / 100.0
   return "£%.2f".format(pounds)
+}
+
+/**
+ * Format an integer minor-unit amount. The shared ledger stays GBP pence.
+ * EUR is a display control only, still backed by an integer minor unit.
+ */
+fun formatMinor(minor: Int, currency: String): String {
+  return if (currency == "EUR") "€%.2f".format(minor / 100.0) else money(minor)
 }
 
 /**

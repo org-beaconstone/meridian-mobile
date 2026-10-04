@@ -297,6 +297,150 @@ class MeridianSDKTest {
   }
 
   @Test
+  fun testLegacyAndDynamicCatalogDecoding() {
+    val legacy = """
+      {"demoDate":"2026-09-18","recipients":[],"providers":[
+        {"id":"adyen","name":"Adyen","description":"Card processor","methods":["card"]},
+        {"id":"worldpay","name":"Worldpay","description":"Bank payment","methods":["bank"]}
+      ]}
+    """.trimIndent()
+    val legacyCatalog = CatalogDecoder.decode(legacy)
+    assertNotNull(legacyCatalog)
+    assertEquals("legacy", legacyCatalog!!.schema)
+    assertEquals(listOf("adyen", "worldpay"), legacyCatalog.providers.map { it.id })
+    assertEquals(listOf("GBP"), legacyCatalog.currencies)
+
+    val dynamic = """
+      {"schema":"dynamic","demoDate":"2026-09-18","currencies":[{"code":"EUR"},{"code":"USD"},"GBP"],
+       "methods":[
+         {"providerId":"adyen","label":"Adyen","method":"card"},
+         {"providerId":"worldpay","name":"Worldpay","rail":"bank"},
+         {"providerId":"extra","name":"Extra rail","method":"card"}
+       ]}
+    """.trimIndent()
+    val dynamicCatalog = CatalogDecoder.decode(dynamic)
+    assertNotNull(dynamicCatalog)
+    assertEquals("dynamic", dynamicCatalog!!.schema)
+    assertEquals(listOf("adyen", "worldpay"), dynamicCatalog.providers.map { it.id })
+    assertEquals(listOf("EUR", "GBP"), dynamicCatalog.currencies)
+    assertNull(CatalogDecoder.decode("not-json"))
+  }
+
+  @Test
+  fun testFeatureFlagKillSwitchCacheAndTelemetry() {
+    assertEquals(false to "legacy", FeatureFlagParser.parse("{}"))
+    assertEquals(
+      false to "legacy",
+      FeatureFlagParser.parse("""{"flags":{"enable_mobile_eu_payments":{"enabled":true,"killSwitch":true}}}"""),
+    )
+    assertEquals(
+      true to "dynamic",
+      FeatureFlagParser.parse("""{"enable_mobile_eu_payments":{"enabled":true,"variant":"dynamic"}}"""),
+    )
+    assertNull(FeatureFlagParser.parse("[]"))
+
+    val cache = InMemoryFeatureFlagCache()
+    val stored = FeatureFlagEvaluation(enabled = true, variant = "dynamic", source = "remote")
+    cache.write(FeatureFlags.cacheKey("room-a"), stored)
+    assertEquals(stored, cache.read(FeatureFlags.cacheKey("room-a")))
+    assertNull(cache.read(FeatureFlags.cacheKey("room-b")))
+
+    val legacyEvent = PaymentTelemetry.event(FeatureFlagEvaluation.legacy("cache"), "key-1", "room-a", "EUR")
+    assertEquals("legacy", legacyEvent.variant)
+    assertEquals("GBP", legacyEvent.currency)
+    assertEquals("enable_mobile_eu_payments=legacy", PaymentTelemetry.headerValue(legacyEvent))
+    val dynamicEvent = PaymentTelemetry.event(stored, "key-1", "room-a", "EUR")
+    assertEquals("dynamic", dynamicEvent.variant)
+    assertEquals("EUR", dynamicEvent.currency)
+    assertEquals("€10.50", formatMinor(1050, "EUR"))
+  }
+
+  @Test
+  fun testRemoteFlagCacheAndPaymentHeader() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    val baseUrl = "http://127.0.0.1:$port/api/v1"
+    val enabled = java.util.concurrent.atomic.AtomicBoolean(true)
+    val seenFlags = mutableListOf<String>()
+
+    server.createContext("/api/v1/flags") { exchange ->
+      val session = exchange.requestHeaders.getFirst("X-Rehearsal-Session")
+      assertEquals("flag-room", session)
+      val body = if (enabled.get()) {
+        """{"enable_mobile_eu_payments":{"enabled":true,"variant":"dynamic"}}"""
+      } else {
+        """{"enable_mobile_eu_payments":{"enabled":false,"variant":"dynamic","killSwitch":true}}"""
+      }
+      val bytes = body.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.createContext("/api/v1/catalog") { exchange ->
+      val body = """{"schema":"dynamic","demoDate":"2026-09-18","recipients":[],"currencies":["EUR","GBP"],"methods":[{"providerId":"adyen","name":"Adyen","method":"card"},{"providerId":"worldpay","name":"Worldpay","method":"bank"},{"providerId":"extra","name":"Extra rail","method":"card"}]}"""
+      val bytes = body.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.createContext("/api/v1/payments") { exchange ->
+      seenFlags.add(exchange.requestHeaders.getFirst("X-Meridian-Flag"))
+      val body = """{"ok":true,"paymentId":"tx-1"}"""
+      val bytes = body.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val cache = InMemoryFeatureFlagCache()
+      val client = MeridianClient(baseUrl, "flag-room", cache)
+      val on = runBlocking { client.evaluateEuPaymentsFlag() }
+      assertTrue(on.enabled)
+      assertEquals("dynamic", on.variant)
+      assertEquals("remote", on.source)
+      val catalog = runBlocking { client.getCatalog() }
+      assertEquals(listOf("adyen", "worldpay"), catalog.providers.map { it.id })
+      runBlocking {
+        client.submitPayment("northline-studio", 100, PaymentMethod.card, idempotencyKey = "same-key", displayCurrency = "EUR")
+      }
+      assertEquals(listOf("enable_mobile_eu_payments=dynamic"), seenFlags)
+      assertEquals("EUR", client.paymentTelemetry().single().currency)
+
+      enabled.set(false)
+      val off = runBlocking { client.evaluateEuPaymentsFlag() }
+      assertFalse(off.enabled)
+      assertEquals("legacy", off.variant)
+      assertEquals(off, cache.read(FeatureFlags.cacheKey("flag-room"))?.copy(source = off.source))
+      runBlocking {
+        client.submitPayment("northline-studio", 100, PaymentMethod.card, idempotencyKey = "same-key", displayCurrency = "EUR")
+      }
+      assertEquals("enable_mobile_eu_payments=legacy", seenFlags.last())
+      assertEquals("GBP", client.paymentTelemetry().last().currency)
+      assertEquals("same-key", client.paymentTelemetry().last().idempotencyKey)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testFlagReadFallsBackToCache() {
+    val cache = InMemoryFeatureFlagCache()
+    cache.write(
+      FeatureFlags.cacheKey("flag-room"),
+      FeatureFlagEvaluation(enabled = true, variant = "dynamic", source = "remote"),
+    )
+    val client = MeridianClient("http://127.0.0.1:9/api/v1", "flag-room", cache)
+    val evaluation = runBlocking { client.evaluateEuPaymentsFlag() }
+    assertTrue(evaluation.enabled)
+    assertEquals("dynamic", evaluation.variant)
+    assertEquals("cache", evaluation.source)
+  }
+
+  @Test
   fun testHttpTransportWithIdempotency() {
     // Start a simple HTTP server on localhost:0 (random port)
     val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)

@@ -20,11 +20,18 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  decodeCatalog,
+  type DecodedCatalog,
+  type FeatureFlagEvaluation,
+  legacyFlag,
+  parseFeatureFlag,
+  paymentMethodChoices,
+  paymentTelemetryEvent,
+  readFlagCache,
+  writeFlagCache,
+} from './domain/featureFlags';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -33,7 +40,35 @@ class RequestError extends Error {
     super(message);
   }
 }
-async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
+async function loadFlag(room: string): Promise<FeatureFlagEvaluation> {
+  try {
+    const response = await fetch('/api/v1/flags', {
+      headers: { 'X-Rehearsal-Session': room },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (response.status === 404) {
+      const evaluation = legacyFlag('remote');
+      writeFlagCache(localStorage, room, evaluation);
+      return evaluation;
+    }
+    if (response.ok) {
+      const parsed = parseFeatureFlag(await response.json());
+      if (parsed) {
+        const evaluation: FeatureFlagEvaluation = {
+          ...legacyFlag('remote'),
+          enabled: parsed.enabled,
+          variant: parsed.variant,
+        };
+        writeFlagCache(localStorage, room, evaluation);
+        return evaluation;
+      }
+    }
+  } catch {
+    // Use the cached evaluation, then the legacy default.
+  }
+  return readFlagCache(localStorage, room) ?? legacyFlag('default');
+}
+async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string, flagHeader?: string) {
   let response: Response;
   try {
     response = await fetch('/api/v1' + path, {
@@ -42,6 +77,7 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
         'Content-Type': 'application/json',
         'X-Rehearsal-Session': room,
         ...(key ? { 'Idempotency-Key': key } : {}),
+        ...(flagHeader ? { 'X-Meridian-Flag': flagHeader } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(15000),
@@ -76,6 +112,9 @@ export default function App() {
   const [roomInput, setRoomInput] = useState(room);
   const [state, setState] = useState<State | null>(null);
   const [recipients, setRecipients] = useState<Recipient[]>([]);
+  const [catalogDoc, setCatalogDoc] = useState<DecodedCatalog | null>(null);
+  const [flag, setFlag] = useState<FeatureFlagEvaluation | null>(null);
+  const [currency, setCurrency] = useState<'GBP' | 'EUR'>('GBP');
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -93,21 +132,35 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef(crypto.randomUUID()),
+    flagWasEnabled = useRef(false);
+  useEffect(() => {
+    if (!flag) return;
+    if (flagWasEnabled.current && !flag.enabled) {
+      setCurrency('GBP');
+      setMethod('card');
+      if (step === 'review') setStep('details');
+    }
+    flagWasEnabled.current = flag.enabled;
+  }, [flag, step]);
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
     setState(null);
+    setFlag(null);
+    setCatalogDoc(null);
+    setCurrency('GBP');
     setConnected(false);
     setError('');
     async function poll() {
       const version = revision.current;
       try {
         if (!mutating.current) {
-          const [raw, catalog] = await Promise.all([
+          const [raw, catalog, evaluation] = await Promise.all([
             request(room, '/state'),
             request(room, '/catalog'),
+            loadFlag(room),
           ]);
           if (
             !closed &&
@@ -117,6 +170,9 @@ export default function App() {
           ) {
             setState(bankState(raw));
             setRecipients(catalog.recipients);
+            setCatalogDoc(decodeCatalog(catalog));
+            setFlag(evaluation);
+            if (!evaluation.enabled) setCurrency('GBP');
             setConnected(true);
           }
         }
@@ -135,7 +191,7 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
-  async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
+  async function mutate(path: string, httpMethod: string, body?: unknown, key?: string, flagHeader?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
     const generation = epoch.current;
@@ -143,7 +199,7 @@ export default function App() {
     setBusy(true);
     revision.current++;
     try {
-      const result = await request(room, path, httpMethod, body, key);
+      const result = await request(room, path, httpMethod, body, key, flagHeader);
       if (generation !== epoch.current) throw new Error('Room changed');
       if (result.state) setState(bankState(result.state));
       return result;
@@ -183,11 +239,13 @@ export default function App() {
   async function confirm() {
     try {
       setError('');
+      const event = paymentTelemetryEvent(flag, paymentKey.current, currency);
       const result = await mutate(
         '/payments',
         'POST',
         { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
         paymentKey.current,
+        event.header,
       );
       if (result.ok) {
         setReceipt(result.transaction);
@@ -296,10 +354,19 @@ export default function App() {
                   </section>
                 </>
               )}
-              {page === 'Pay' && (
+              {page === 'Pay' && !flag && (
+                <section className="mobile-card">
+                  <h1>Checking payment configuration…</h1>
+                  <p>The payment form waits for the feature flag before it renders.</p>
+                </section>
+              )}
+              {page === 'Pay' && flag && (
                 <section className="mobile-card">
                   <h1>{step === 'done' ? 'Taken care of.' : 'Make a payment'}</h1>
                   <p>Fictional money. Shared rehearsal account.</p>
+                  <p data-testid="flag-variant">
+                    Flag enable_mobile_eu_payments · {flag.variant}
+                  </p>
                   {step === 'details' && (
                     <form
                       onSubmit={(e) => {
@@ -319,7 +386,29 @@ export default function App() {
                           </option>
                         ))}
                       </select>
-                      <label htmlFor="mobile-amount">Amount (GBP)</label>
+                      {flag.enabled && (
+                        <fieldset>
+                          <legend>Currency</legend>
+                          {(['GBP', 'EUR'] as const).map((code) => (
+                            <label
+                              className={'mobile-method ' + (currency === code ? 'selected' : '')}
+                              key={code}
+                            >
+                              <input
+                                type="radio"
+                                name="currency"
+                                checked={currency === code}
+                                onChange={() => setCurrency(code)}
+                              />
+                              <span>
+                                {code}
+                                <small>{code === 'EUR' ? 'Euro display' : 'Pound sterling'}</small>
+                              </span>
+                            </label>
+                          ))}
+                        </fieldset>
+                      )}
+                      <label htmlFor="mobile-amount">Amount ({flag.enabled && currency === 'EUR' ? 'EUR' : 'GBP'})</label>
                       <input
                         id="mobile-amount"
                         inputMode="decimal"
@@ -338,7 +427,7 @@ export default function App() {
                       />
                       <fieldset>
                         <legend>Payment method</legend>
-                        {providers.map((provider) => (
+                        {paymentMethodChoices(flag, catalogDoc).map((provider) => (
                           <label
                             className={
                               'mobile-method ' + (method === provider.method ? 'selected' : '')
@@ -367,9 +456,15 @@ export default function App() {
                     <>
                       <div className="mobile-review">
                         <span>To {selected?.name}</span>
-                        <strong>{money(pence(amount) || 0)}</strong>
+                        <strong>
+                          {flag.enabled && currency === 'EUR'
+                            ? new Intl.NumberFormat('en-IE', { style: 'currency', currency: 'EUR' }).format(
+                                (pence(amount) || 0) / 100,
+                              )
+                            : money(pence(amount) || 0)}
+                        </strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {paymentMethodChoices(flag, catalogDoc).find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
                         </p>
                       </div>

@@ -156,10 +156,54 @@ public struct HealthResponse: Codable {
   public let simulation: Bool
 }
 
-public struct CatalogResponse: Codable {
+public struct CatalogResponse: Codable, Equatable {
   public let demoDate: String
   public let recipients: [Recipient]
   public let providers: [Provider]
+  /// "legacy" for the two-provider document, "dynamic" for the catalog-methods document.
+  public let schema: String
+  /// Recognized currency codes. Legacy documents stay GBP.
+  public let currencies: [String]
+
+  public init(
+    demoDate: String,
+    recipients: [Recipient],
+    providers: [Provider],
+    schema: String = "legacy",
+    currencies: [String] = ["GBP"]
+  ) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+    self.schema = schema
+    self.currencies = currencies
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case demoDate
+    case recipients
+    case providers
+    case schema
+    case currencies
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    demoDate = try container.decode(String.self, forKey: .demoDate)
+    recipients = try container.decode([Recipient].self, forKey: .recipients)
+    providers = try container.decode([Provider].self, forKey: .providers)
+    schema = try container.decodeIfPresent(String.self, forKey: .schema) ?? "legacy"
+    currencies = try container.decodeIfPresent([String].self, forKey: .currencies) ?? ["GBP"]
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(demoDate, forKey: .demoDate)
+    try container.encode(recipients, forKey: .recipients)
+    try container.encode(providers, forKey: .providers)
+    try container.encode(schema, forKey: .schema)
+    try container.encode(currencies, forKey: .currencies)
+  }
 }
 
 public struct PaymentResponse: Codable {
@@ -275,6 +319,15 @@ public func money(_ pence: Int) -> String {
   formatter.numberStyle = .currency
   formatter.locale = Locale(identifier: "en_GB")
   return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
+}
+
+/// Format an integer minor-unit amount. The shared ledger stays GBP pence.
+/// EUR is a display control only, still backed by an integer minor unit.
+public func formatMinor(_ minor: Int, currency: String) -> String {
+  if currency == "EUR" {
+    return String(format: "€%.2f", Double(minor) / 100.0)
+  }
+  return money(minor)
 }
 
 /// Parse amount string to integer pence
