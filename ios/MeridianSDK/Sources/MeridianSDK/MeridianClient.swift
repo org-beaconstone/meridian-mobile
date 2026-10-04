@@ -4,16 +4,26 @@ public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let retryPolicy: RetryPolicy
+  private let sleeper: @Sendable (Int) async -> Void
+  private var healthTask: Task<Void, Never>?
+  private var healthSnapshot: SessionHealthSnapshot = .unknown
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - retryPolicy: Gateway retry schedule for HTTP 502 and 504
+  ///   - sleeper: Delay used between payment retries
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession = .shared,
+    retryPolicy: RetryPolicy = RetryPolicy(),
+    sleeper: @escaping @Sendable (Int) async -> Void = { millis in
+      try? await Task.sleep(nanoseconds: UInt64(millis) * 1_000_000)
+    }
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -36,6 +46,13 @@ public actor MeridianClient {
     self.baseURL = url
     self.sessionId = sessionId
     self.session = urlSession
+    self.retryPolicy = retryPolicy
+    self.sleeper = sleeper
+  }
+
+  private func makeURL(path: String) -> URL {
+    let suffix = path.hasPrefix("/") ? path : "/" + path
+    return URL(string: baseURL.absoluteString + suffix) ?? baseURL
   }
 
   // MARK: - Internal Request Method
@@ -46,7 +63,7 @@ public actor MeridianClient {
     body: Encodable? = nil,
     additionalHeaders: [String: String] = [:]
   ) async throws -> T {
-    let url = baseURL.appendingPathComponent(path)
+    let url = makeURL(path: path)
 
     var request = URLRequest(url: url)
     request.httpMethod = method
@@ -95,6 +112,59 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
+  /// GET /session/health — corridor and rail status for this rehearsal session.
+  /// Full path is `{baseURL}/session/health`, which is `/api/v1/session/health` for the shared API.
+  public func getSessionHealth() async throws -> SessionHealth {
+    return try await request(method: "GET", path: "/session/health")
+  }
+
+  public func latestSessionHealth() -> SessionHealthSnapshot {
+    healthSnapshot
+  }
+
+  /// Polls `/session/health` until the returned stream is cancelled.
+  /// A missing endpoint is reported as unreachable and is not treated as a corridor outage.
+  public func pollSessionHealth(every interval: Duration = .seconds(5)) -> AsyncStream<SessionHealthSnapshot> {
+    healthTask?.cancel()
+    let (stream, continuation) = AsyncStream<SessionHealthSnapshot>.makeStream()
+    let task = Task {
+      while !Task.isCancelled {
+        let snapshot = await self.loadSessionHealth()
+        continuation.yield(snapshot)
+        try? await Task.sleep(for: interval)
+      }
+      continuation.finish()
+    }
+    healthTask = task
+    continuation.onTermination = { @Sendable _ in
+      task.cancel()
+    }
+    return stream
+  }
+
+  public func stopSessionHealthPolling() {
+    healthTask?.cancel()
+    healthTask = nil
+  }
+
+  public func loadSessionHealth() async -> SessionHealthSnapshot {
+    let snapshot: SessionHealthSnapshot
+    do {
+      let health = try await getSessionHealth()
+      snapshot = SessionHealthSnapshot(health: health, reachable: true, detail: nil)
+    } catch let error as MeridianError {
+      if case let .httpError(status, _) = error, status == 404 {
+        snapshot = SessionHealthSnapshot(health: nil, reachable: false, detail: "Session health is not available")
+      } else {
+        snapshot = SessionHealthSnapshot(health: nil, reachable: false, detail: error.localizedDescription)
+      }
+    } catch {
+      snapshot = SessionHealthSnapshot(health: nil, reachable: false, detail: error.localizedDescription)
+    }
+    healthSnapshot = snapshot
+    return snapshot
+  }
+
   /// GET /catalog - Fetch recipients and providers
   public func getCatalog() async throws -> CatalogResponse {
     return try await request(method: "GET", path: "/catalog")
@@ -128,12 +198,33 @@ public actor MeridianClient {
       note: note,
       scenario: scenario
     )
-
-    return try await request(
-      method: "POST",
-      path: "/payments",
-      body: payload,
-      additionalHeaders: ["Idempotency-Key": idempotencyKey]
+    let headers = ["Idempotency-Key": idempotencyKey]
+    var lastStatus = 0
+    var lastMessage = ""
+    var attempt = 1
+    while attempt <= retryPolicy.maxAttempts {
+      do {
+        return try await request(
+          method: "POST",
+          path: "/payments",
+          body: payload,
+          additionalHeaders: headers
+        )
+      } catch let error as MeridianError {
+        guard case let .httpError(status, message) = error, retryPolicy.retriesHTTPStatus(status) else {
+          throw error
+        }
+        lastStatus = status
+        lastMessage = message
+        if attempt == retryPolicy.maxAttempts { break }
+        await sleeper(retryPolicy.delayMillis(beforeAttempt: attempt + 1))
+        attempt += 1
+      }
+    }
+    throw MeridianError.retriesExhausted(
+      statusCode: lastStatus,
+      attempts: retryPolicy.maxAttempts,
+      message: lastMessage
     )
   }
 

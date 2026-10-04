@@ -25,6 +25,14 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  corridorNotice,
+  isGatewayRetryStatus,
+  parseSessionHealth,
+  railLabel,
+  runGatewayRetries,
+  type SessionHealth,
+} from './domain/resilience';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -90,10 +98,17 @@ export default function App() {
   const [receipt, setReceipt] = useState<Transaction | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
+  const [retryable, setRetryable] = useState(false);
+  const [health, setHealth] = useState<SessionHealth | null>(null);
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef<string>(crypto.randomUUID()),
+    heldAttempt = useRef<{
+      key: string;
+      fingerprint: string;
+      payload: { recipientId: string; amountMinor: number; method: Method; note: string; scenario: string };
+    } | null>(null);
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -135,6 +150,78 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
+  useEffect(() => {
+    let closed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function pollHealth() {
+      try {
+        const response = await fetch('/api/v1/session/health', {
+          headers: { Accept: 'application/json', 'X-Rehearsal-Session': room },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (closed) return;
+        if (!response.ok) {
+          setHealth(null);
+          return;
+        }
+        setHealth(parseSessionHealth(await response.json()));
+      } catch {
+        if (!closed) setHealth(null);
+      } finally {
+        if (!closed) timer = setTimeout(pollHealth, 5000);
+      }
+    }
+    void pollHealth();
+    return () => {
+      closed = true;
+      clearTimeout(timer);
+    };
+  }, [room]);
+  async function postPayment(activeRoom: string, body: unknown, key: string) {
+    return runGatewayRetries(async () => {
+      let response: Response;
+      try {
+        response = await fetch('/api/v1/payments', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Rehearsal-Session': activeRoom,
+            'Idempotency-Key': key,
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        });
+      } catch {
+        return {
+          type: 'stop' as const,
+          error: new RequestError(
+            'Connection lost. Outcome may be unknown. Retry this same payment after reconnecting.',
+            'NETWORK_ERROR',
+          ),
+        };
+      }
+      if (isGatewayRetryStatus(response.status)) return { type: 'retry' as const, status: response.status };
+      let data: {
+        ok?: boolean;
+        error?: string;
+        code?: string;
+        state?: State;
+        transaction?: Transaction;
+      } = {};
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
+      if (!response.ok) {
+        return {
+          type: 'stop' as const,
+          error: new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR'),
+        };
+      }
+      return { type: 'success' as const, value: data };
+    });
+  }
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
@@ -143,7 +230,10 @@ export default function App() {
     setBusy(true);
     revision.current++;
     try {
-      const result = await request(room, path, httpMethod, body, key);
+      const result =
+        path === '/payments' && key
+          ? await postPayment(room, body, key)
+          : await request(room, path, httpMethod, body, key);
       if (generation !== epoch.current) throw new Error('Room changed');
       if (result.state) setState(bankState(result.state));
       return result;
@@ -159,21 +249,33 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
+    setRetryable(false);
+    heldAttempt.current = null;
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
-    paymentKey.current = crypto.randomUUID();
+    setRetryable(false);
+    if (!heldAttempt.current) paymentKey.current = crypto.randomUUID();
+  }
+  function fingerprint(amountMinor: number, payMethod: Method = method) {
+    return JSON.stringify({ recipient, amountMinor, method: payMethod, note });
+  }
+  function acceptAlternate(next: Method) {
+    if (heldAttempt.current?.key === paymentKey.current) paymentKey.current = crypto.randomUUID();
+    setMethod(next);
   }
   function review() {
     const value = pence(amount);
     if (value === null) {
+      setRetryable(false);
       setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
       return;
     }
     if (!state || value > state.balance) {
+      setRetryable(false);
       setError('Insufficient balance');
       return;
     }
@@ -181,23 +283,77 @@ export default function App() {
     setStep('review');
   }
   async function confirm() {
+    const amountMinor = pence(amount);
+    if (amountMinor === null) return;
+    const currentFingerprint = fingerprint(amountMinor);
+    let key: string = paymentKey.current;
+    if (heldAttempt.current?.fingerprint === currentFingerprint) {
+      key = heldAttempt.current.key;
+      paymentKey.current = key;
+    } else if (heldAttempt.current?.key === key) {
+      key = crypto.randomUUID();
+      paymentKey.current = key;
+    }
     try {
       setError('');
+      setRetryable(false);
       const result = await mutate(
         '/payments',
         'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
+        { recipientId: recipient, amountMinor, method, note, scenario },
+        key,
       );
       if (result.ok) {
+        heldAttempt.current = null;
+        setRetryable(false);
         setReceipt(result.transaction);
         setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      } else {
+        heldAttempt.current = {
+          key,
+          fingerprint: currentFingerprint,
+          payload: { recipientId: recipient, amountMinor, method, note, scenario },
+        };
+        setRetryable(true);
+        setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      }
     } catch (e) {
+      heldAttempt.current = {
+        key,
+        fingerprint: currentFingerprint,
+        payload: { recipientId: recipient, amountMinor, method, note, scenario },
+      };
+      setRetryable(true);
+      setError(e instanceof Error ? e.message : 'Payment failed');
+    }
+  }
+  async function retryHeld() {
+    const held = heldAttempt.current;
+    if (!held) return;
+    try {
+      setError('');
+      setRetryable(false);
+      const result = await mutate('/payments', 'POST', held.payload, held.key);
+      if (result.ok) {
+        heldAttempt.current = null;
+        setRetryable(false);
+        setReceipt(result.transaction);
+        setStep('done');
+        if (fingerprint(held.payload.amountMinor, held.payload.method) === fingerprint(pence(amount) ?? -1)) {
+          setAmount('');
+          setNote('');
+        }
+      } else {
+        setRetryable(true);
+        setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      }
+    } catch (e) {
+      setRetryable(true);
       setError(e instanceof Error ? e.message : 'Payment failed');
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const railNotice = corridorNotice(health, method);
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -226,9 +382,38 @@ export default function App() {
           <span>{room}</span>
         </div>
         <main>
+          {railNotice?.type === 'switch' && (
+            <div role="status" className="resilience-banner rail">
+              {railLabel(railNotice.selected)} is {railNotice.reason} in corridor {railNotice.corridorId}.{' '}
+              {railLabel(railNotice.alternate)} is eligible. Choosing it does not send the payment.
+              <button
+                type="button"
+                className="banner-action"
+                disabled={busy}
+                onClick={() => acceptAlternate(railNotice.alternate)}
+              >
+                {railNotice.alternate === 'card' ? 'Use debit card' : 'Use bank payment'}
+              </button>
+            </div>
+          )}
+          {railNotice?.type === 'unavailable' && (
+            <div role="status" className="resilience-banner rail">
+              {railNotice.message}
+            </div>
+          )}
           {error && (
             <div role="alert" className="error-message">
               {error}
+              {retryable && (
+                <button
+                  type="button"
+                  className="banner-action"
+                  disabled={busy || !connected}
+                  onClick={() => void retryHeld()}
+                >
+                  Retry payment
+                </button>
+              )}
             </div>
           )}
           {notice && (

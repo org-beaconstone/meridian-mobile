@@ -243,6 +243,7 @@ public enum MeridianError: LocalizedError {
   case invalidURL
   case decodingError(String)
   case httpError(statusCode: Int, message: String)
+  case retriesExhausted(statusCode: Int, attempts: Int, message: String)
   case missingSession
   case invalidAmount(String)
   case validationError(String)
@@ -257,6 +258,8 @@ public enum MeridianError: LocalizedError {
       return "Decoding error: \(msg)"
     case let .httpError(code, msg):
       return "HTTP \(code): \(msg)"
+    case let .retriesExhausted(code, attempts, _):
+      return "Gateway HTTP \(code) after \(attempts) attempts. The payment key is unchanged."
     case .missingSession:
       return "Session ID is required"
     case let .invalidAmount(msg):
