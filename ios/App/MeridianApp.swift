@@ -47,7 +47,7 @@ import MeridianSDK
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
-            Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
+            Button("Edit details") { review=false; key=UUID().uuidString; Task { await client?.recordSca(dropped: true) } }.disabled(busy)
           } else {
             Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
           }
@@ -76,6 +76,9 @@ import MeridianSDK
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
+      let biometric=await client.measureBiometricPrompt()
+      await client.recordSca(dropped: false)
+      if !biometric.withinSlo { message="Biometric prompt \(biometric.durationMs) ms missed the 300 ms rehearsal SLO" }
       let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
       if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
       else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}

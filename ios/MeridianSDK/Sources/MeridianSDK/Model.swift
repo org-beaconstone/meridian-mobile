@@ -156,6 +156,19 @@ public struct HealthResponse: Codable {
   public let simulation: Bool
 }
 
+public struct SessionHealthResponse: Codable {
+  public let status: String
+  public let session: String?
+}
+
+/// GBP integer pence quote. The rehearsal does not settle another currency.
+public struct FxQuoteResponse: Codable {
+  public let base: String
+  public let quote: String
+  public let amountMinor: Int
+  public let quoteAmountMinor: Int
+}
+
 public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
