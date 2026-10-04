@@ -10,6 +10,8 @@ import MeridianSDK
   @State private var client: MeridianClient?
   @State private var state: BankState?
   @State private var catalog: CatalogResponse?
+  @State private var catalogFailed = false
+  @State private var showMethods = false
   @State private var recipient = "northline-studio"
   @State private var amount = ""
   @State private var reference = ""
@@ -19,7 +21,16 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  private var methodSheet: PaymentMethodSheetModel {
+    if let catalog { return paymentMethodSheetModel(providers: catalog.providers) }
+    if catalogFailed { return PaymentMethodSheetModel(loading: false, options: []) }
+    return PaymentMethodSheetModel(loading: true, options: [])
+  }
+  private var selectedMethodTitle: String {
+    methodSheet.options.first { $0.method == method }?.title ?? "Payment method"
+  }
   var body: some View {
+    ZStack {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         Text("meridian").font(.largeTitle).fontWeight(.semibold)
@@ -42,14 +53,32 @@ import MeridianSDK
           }
           TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
-          Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          Button { showMethods = true } label: {
+            HStack {
+              VStack(alignment: .leading, spacing: 2) {
+                Text("Payment method").font(.caption)
+                Text(selectedMethodTitle)
+              }
+              Spacer()
+              Image(systemName: "chevron.up")
+            }
+            .frame(minHeight: 48)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          }
+          .disabled(review || busy)
+          .accessibilityLabel("Payment method, \(selectedMethodTitle)")
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
             Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") {
+              let (value,error)=parseAmount(amount)
+              guard value != nil else {message=error ?? "Invalid amount";return}
+              guard reference.count<=200 else {message="Reference is too long"; return}
+              if let blocked = paymentMethodBlockMessage(selected: method, model: methodSheet) { message = blocked; return }
+              key=UUID().uuidString; review=true; message="Review before confirming. No real money moves."
+            }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
           ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
@@ -57,21 +86,58 @@ import MeridianSDK
           ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
         }
       }.padding(24).frame(maxWidth: 550)
-    }.task {
+    }
+    if showMethods {
+      ZStack(alignment: .bottom) {
+        Color.black.opacity(0.45)
+          .ignoresSafeArea()
+          .onTapGesture { showMethods = false }
+          .accessibilityLabel("Dismiss payment methods")
+          .accessibilityAddTraits(.isButton)
+        PaymentMethodSheet(
+          model: methodSheet,
+          selection: method,
+          onSelect: { chosen in method = chosen; showMethods = false },
+          onClose: { showMethods = false }
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+      }
+    }
+    }
+    .task {
       while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
     }
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
+    generation += 1; state=nil; catalog=nil; catalogFailed=false; showMethods=false; review=false; key=UUID().uuidString
     do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    do {
+      let next=try await client.getState()
+      if started==generation && !busy { state=next }
+    } catch {
+      if started==generation && !busy { message="API unavailable: \(error)" }
+    }
+    guard started==generation && !busy else { return }
+    do {
+      let definitions=try await client.getCatalog()
+      guard started==generation && !busy else { return }
+      catalog=definitions; catalogFailed=false
+      if state != nil { message="Connected to shared Java API" }
+    } catch {
+      if started==generation && !busy {
+        if catalog == nil { catalogFailed=true }
+        message="API unavailable: \(error)"
+      }
+    }
   }
   private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
+    guard let client, !busy else {return}
+    if let blocked = paymentMethodBlockMessage(selected: method, model: methodSheet) { message=blocked; return }
+    busy=true; generation += 1
     defer {busy=false}
     do {
       let (minor,error)=parseAmount(amount)

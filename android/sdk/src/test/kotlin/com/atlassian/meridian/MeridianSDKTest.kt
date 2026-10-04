@@ -374,4 +374,101 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  @Test
+  fun testPaymentSheetFollowsCatalogOrder() {
+    val model = paymentMethodSheetModel(
+      listOf(
+        Provider("worldpay", "Worldpay", "Bank transfer processor", listOf("bank")),
+        Provider("adyen", "Adyen", "Card payment processor", listOf("card")),
+        Provider("adyen", "Adyen", "Card payment processor", listOf("card")),
+      ),
+    )
+    assertFalse(model.loading)
+    assertEquals(2, model.options.size)
+    assertEquals("Worldpay", model.options[0].title)
+    assertEquals(PaymentMethod.bank, model.options[0].method)
+    assertTrue(model.options[0].selectable)
+    assertEquals("Select Worldpay, radio button, 1 of 2", model.options[0].accessibilityLabel)
+    assertEquals("Adyen Card", model.options[1].title)
+    assertEquals("Select Adyen Card, radio button, 2 of 2", model.options[1].accessibilityLabel)
+    assertEquals(PaymentMethod.bank, submittablePaymentMethod(PaymentMethod.bank, model))
+  }
+
+  @Test
+  fun testUnavailableMethodIsNotReplaced() {
+    val model = paymentMethodSheetModel(
+      listOf(
+        Provider("adyen", "Adyen", "Card", listOf("card"), "unavailable"),
+        Provider("worldpay", "Worldpay", "Bank", listOf("bank"), "degraded"),
+      ),
+    )
+    assertEquals(2, model.options.size)
+    assertFalse(model.options[0].selectable)
+    assertEquals(PAYMENT_METHOD_UNAVAILABLE_TEXT, model.options[0].helperText)
+    assertFalse(model.options[1].selectable)
+    assertNull(submittablePaymentMethod(PaymentMethod.card, model))
+    assertEquals(PAYMENT_METHOD_UNAVAILABLE_TEXT, paymentMethodBlockMessage(PaymentMethod.card, model))
+  }
+
+  @Test
+  fun testNonGbpCorridorDisablesMethods() {
+    val model = paymentMethodSheetModel(
+      listOf(Provider("adyen", "Adyen", "Card", listOf("card"))),
+      CorridorContext(region = "FR", currency = "EUR"),
+    )
+    assertEquals(1, model.options.size)
+    assertFalse(model.options[0].selectable)
+    assertEquals(PAYMENT_METHOD_UNAVAILABLE_TEXT, model.options[0].helperText)
+  }
+
+  @Test
+  fun testLoadingPlaceholdersAndUnknownCatalogEntries() {
+    val loading = paymentMethodSheetModel(null)
+    assertTrue(loading.loading)
+    assertEquals(2, loading.placeholderCount)
+    assertTrue(loading.options.isEmpty())
+    assertEquals("Payment methods are still loading.", paymentMethodBlockMessage(PaymentMethod.card, loading))
+
+    val json = """
+      {
+        "demoDate": "2026-09-18",
+        "recipients": [],
+        "providers": [
+          {"id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card", "other"]},
+          {"id": "unlisted", "name": "Unlisted", "description": "Ignored", "methods": ["card"]},
+          {"id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"], "availability": "unavailable"}
+        ]
+      }
+    """.trimIndent()
+    val catalog = mapper.readValue(json, CatalogResponse::class.java)
+    val model = paymentMethodSheetModel(catalog.providers)
+    assertEquals(3, catalog.providers.size)
+    assertEquals(2, model.options.size)
+    assertEquals("Adyen Card", model.options[0].title)
+    assertTrue(model.options[0].selectable)
+    assertNull(model.options[0].helperText)
+    assertEquals("Worldpay", model.options[1].title)
+    assertFalse(model.options[1].selectable)
+    assertEquals(PAYMENT_METHOD_UNAVAILABLE_TEXT, model.options[1].helperText)
+    assertNull(submittablePaymentMethod(PaymentMethod.bank, model))
+    assertEquals(PaymentMethod.card, submittablePaymentMethod(PaymentMethod.card, model))
+  }
+
+  @Test
+  fun testMissingAvailabilityDefaultsToAvailable() {
+    val json = """
+      {
+        "demoDate": "2026-09-18",
+        "recipients": [],
+        "providers": [
+          {"id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"]}
+        ]
+      }
+    """.trimIndent()
+    val catalog = mapper.readValue(json, CatalogResponse::class.java)
+    assertNull(catalog.providers[0].availability)
+    val model = paymentMethodSheetModel(catalog.providers)
+    assertTrue(model.options[0].selectable)
+  }
 }
