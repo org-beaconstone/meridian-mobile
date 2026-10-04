@@ -341,10 +341,128 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: legacy catalog decoder
+    print("21. legacy catalog decoder...")
+    let legacyCatalog = """
+    {"demoDate":"2026-09-18","recipients":[{"id":"alice-001","name":"Alice","initials":"A","detail":"GH Bank","category":"Shopping","color":"#007AFF"}],"providers":[{"id":"adyen","name":"Adyen","description":"Card processor","methods":["card"]},{"id":"worldpay","name":"Worldpay","description":"Bank payment","methods":["bank"]}]}
+    """
+    if let catalog = PaymentCatalogDecoder.decode(legacyCatalog.data(using: .utf8)!),
+      catalog.schema == "legacy",
+      catalog.providers.count == 2,
+      catalog.currencies == ["GBP"] {
+      print("  ✓ Legacy catalog kept both baseline providers")
+      passed += 1
+    } else {
+      print("  ✗ Legacy catalog decoder mismatch")
+      failed += 1
+    }
+
+    // CHECK 22: dynamic catalog decoder ignores unknown providers
+    print("22. dynamic catalog decoder...")
+    let dynamicCatalog = """
+    {"schema":"dynamic","demoDate":"2026-09-18","recipients":[],"currencies":[{"code":"EUR"},{"code":"USD"},"GBP"],"methods":[{"providerId":"adyen","label":"Adyen","method":"card"},{"providerId":"worldpay","name":"Worldpay","rail":"bank"},{"providerId":"extra","name":"Extra rail","method":"card"}]}
+    """
+    if let catalog = PaymentCatalogDecoder.decode(dynamicCatalog.data(using: .utf8)!),
+      catalog.schema == "dynamic",
+      catalog.providers.map(\.id) == [.adyen, .worldpay],
+      catalog.currencies == ["EUR", "GBP"] {
+      print("  ✓ Dynamic catalog decoded without the unknown provider")
+      passed += 1
+    } else {
+      print("  ✗ Dynamic catalog decoder mismatch")
+      failed += 1
+    }
+
+    // CHECK 23: non-object catalog does not throw
+    print("23. non-object catalog...")
+    if PaymentCatalogDecoder.decode(Data("[]".utf8)) == nil && PaymentCatalogDecoder.decode(Data("not-json".utf8)) == nil {
+      print("  ✓ Non-object catalog returned nil")
+      passed += 1
+    } else {
+      print("  ✗ Non-object catalog should return nil")
+      failed += 1
+    }
+
+    // CHECK 24: kill switch and enabled flag parsing
+    print("24. feature flag parsing...")
+    let missing = FeatureFlagParser.parse(Data("{}".utf8))
+    let killed = FeatureFlagParser.parse(Data(#"{"flags":{"enable_mobile_eu_payments":{"enabled":true,"killSwitch":true}}}"#.utf8))
+    let enabled = FeatureFlagParser.parse(Data(#"{"enable_mobile_eu_payments":{"enabled":true,"variant":"dynamic"}}"#.utf8))
+    if missing?.enabled == false, missing?.variant == "legacy",
+      killed?.enabled == false, killed?.variant == "legacy",
+      enabled?.enabled == true, enabled?.variant == "dynamic" {
+      print("  ✓ Flag parser maps kill switch to legacy and enabled to dynamic")
+      passed += 1
+    } else {
+      print("  ✗ Flag parser mismatch")
+      failed += 1
+    }
+
+    // CHECK 25: invalid flag payload
+    print("25. invalid flag payload...")
+    if FeatureFlagParser.parse(Data("[]".utf8)) == nil {
+      print("  ✓ Invalid flag payload returned nil")
+      passed += 1
+    } else {
+      print("  ✗ Invalid flag payload should return nil")
+      failed += 1
+    }
+
+    // CHECK 26: flag cache round trip
+    print("26. flag cache...")
+    let cache = InMemoryFeatureFlagCache()
+    let stored = FeatureFlagEvaluation(key: FeatureFlags.mobileEuPayments, enabled: true, variant: "dynamic", source: "remote")
+    cache.write(key: FeatureFlags.cacheKey(sessionId: "room-a"), evaluation: stored)
+    let readBack = cache.read(key: FeatureFlags.cacheKey(sessionId: "room-a"))
+    let otherRoom = cache.read(key: FeatureFlags.cacheKey(sessionId: "room-b"))
+    if readBack == stored && otherRoom == nil {
+      print("  ✓ Flag cache is scoped to the rehearsal room")
+      passed += 1
+    } else {
+      print("  ✗ Flag cache mismatch")
+      failed += 1
+    }
+
+    // CHECK 27: telemetry tags the active variant
+    print("27. payment telemetry...")
+    let legacyEvent = PaymentTelemetry.event(
+      evaluation: .legacy(source: "cache"),
+      idempotencyKey: "key-1",
+      sessionId: "room-a",
+      displayCurrency: "EUR"
+    )
+    let dynamicEvent = PaymentTelemetry.event(
+      evaluation: FeatureFlagEvaluation(key: FeatureFlags.mobileEuPayments, enabled: true, variant: "dynamic", source: "remote"),
+      idempotencyKey: "key-1",
+      sessionId: "room-a",
+      displayCurrency: "EUR"
+    )
+    if legacyEvent.variant == "legacy", legacyEvent.currency == "GBP",
+      PaymentTelemetry.headerValue(legacyEvent) == "enable_mobile_eu_payments=legacy",
+      dynamicEvent.variant == "dynamic", dynamicEvent.currency == "EUR",
+      PaymentTelemetry.headerValue(dynamicEvent) == "enable_mobile_eu_payments=dynamic" {
+      print("  ✓ Telemetry tags legacy and dynamic variants")
+      passed += 1
+    } else {
+      print("  ✗ Telemetry mismatch")
+      failed += 1
+    }
+
+    // CHECK 28: euro display keeps integer minor units
+    print("28. euro display format...")
+    if formatMinor(1050, currency: "EUR") == "€10.50" && formatMinor(1050, currency: "GBP") == "£10.50" {
+      print("  ✓ Minor-unit formatting stays integer-based")
+      passed += 1
+    } else {
+      print("  ✗ formatMinor mismatch: EUR=\(formatMinor(1050, currency: "EUR")) GBP=\(formatMinor(1050, currency: "GBP"))")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

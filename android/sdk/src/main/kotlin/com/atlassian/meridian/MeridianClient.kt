@@ -16,9 +16,12 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val flagCache: FeatureFlagCache = FileFeatureFlagCache(),
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+  private val telemetry = mutableListOf<PaymentTelemetryEvent>()
+  @Volatile private var flagEvaluation = FeatureFlagEvaluation.legacy("default")
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -29,13 +32,14 @@ class MeridianClient(
 
   // MARK: - Internal Request Method
 
-  private suspend fun <T> request(
+  private data class HttpResult(val status: Int, val body: String)
+
+  private suspend fun exchange(
     method: String,
     path: String,
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
-    responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
+  ): HttpResult = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
@@ -62,7 +66,6 @@ class MeridianClient(
         }
       }
 
-      // Read response
       val statusCode = connection.responseCode
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
@@ -71,39 +74,50 @@ class MeridianClient(
       }
 
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
+      HttpResult(statusCode, responseBody)
+    } finally {
+      connection.disconnect()
+    }
+  }
 
-      // Check HTTP status and handle errors
-      when {
-        statusCode >= 200 && statusCode < 300 -> {
-          // Success
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
-          }
+  private suspend fun <T> request(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+    responseType: Class<T>,
+  ): T {
+    val result = exchange(method, path, body, additionalHeaders)
+    val statusCode = result.status
+    val responseBody = result.body
+
+    // Check HTTP status and handle errors
+    return when {
+      statusCode in 200..299 -> {
+        try {
+          mapper.readValue(responseBody, responseType)
+        } catch (e: Exception) {
+          throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
         }
+      }
 
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
-          // These are expected error statuses, parse the response
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.HttpError(
-              statusCode,
-              responseBody.ifEmpty { "Unknown error" }
-            )
-          }
-        }
-
-        else -> {
+      statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
+        try {
+          mapper.readValue(responseBody, responseType)
+        } catch (e: Exception) {
           throw MeridianError.HttpError(
             statusCode,
             responseBody.ifEmpty { "Unknown error" }
           )
         }
       }
-    } finally {
-      connection.disconnect()
+
+      else -> {
+        throw MeridianError.HttpError(
+          statusCode,
+          responseBody.ifEmpty { "Unknown error" }
+        )
+      }
     }
   }
 
@@ -116,10 +130,65 @@ class MeridianClient(
     request("GET", "/health", responseType = HealthResponse::class.java)
 
   /**
-   * GET /catalog - Fetch recipients and providers
+   * GET /catalog - Fetch recipients and providers.
+   * Accepts the legacy two-provider document and the dynamic methods document.
    */
-  suspend fun getCatalog(): CatalogResponse =
-    request("GET", "/catalog", responseType = CatalogResponse::class.java)
+  suspend fun getCatalog(): CatalogResponse {
+    val result = exchange("GET", "/catalog")
+    if (result.status !in 200..299) {
+      throw MeridianError.HttpError(result.status, result.body.ifEmpty { "Unknown error" })
+    }
+    return CatalogDecoder.decode(result.body)
+      ?: throw MeridianError.DecodingError("Catalog response was not a JSON object")
+  }
+
+  /**
+   * GET /flags - Evaluate enable_mobile_eu_payments before payment UI is shown.
+   * Network and decode failures use the room cache, then the legacy kill-switch default.
+   * This method does not throw.
+   */
+  suspend fun evaluateEuPaymentsFlag(): FeatureFlagEvaluation {
+    val cacheKey = FeatureFlags.cacheKey(sessionId)
+    try {
+      val result = exchange("GET", "/flags")
+      if (result.status in 200..299) {
+        val parsed = FeatureFlagParser.parse(result.body)
+        if (parsed != null) {
+          val evaluation = FeatureFlagEvaluation(
+            key = FeatureFlags.mobileEuPayments,
+            enabled = parsed.first,
+            variant = parsed.second,
+            source = "remote",
+          )
+          flagCache.write(cacheKey, evaluation)
+          flagEvaluation = evaluation
+          return evaluation
+        }
+      } else if (result.status == 404) {
+        val evaluation = FeatureFlagEvaluation.legacy("remote")
+        flagCache.write(cacheKey, evaluation)
+        flagEvaluation = evaluation
+        return evaluation
+      }
+    } catch (_: Exception) {
+      // Fall through to the cached evaluation.
+    }
+    flagCache.read(cacheKey)?.let { cached ->
+      val evaluation = cached.copy(
+        variant = if (cached.enabled) cached.variant else "legacy",
+        source = "cache",
+      )
+      flagEvaluation = evaluation
+      return evaluation
+    }
+    val fallback = FeatureFlagEvaluation.legacy("default")
+    flagEvaluation = fallback
+    return fallback
+  }
+
+  fun currentFlag(): FeatureFlagEvaluation = flagEvaluation
+
+  fun paymentTelemetry(): List<PaymentTelemetryEvent> = synchronized(telemetry) { telemetry.toList() }
 
   /**
    * GET /state - Fetch current bank state
@@ -135,6 +204,7 @@ class MeridianClient(
    * @param note Optional note (max 200 chars)
    * @param scenario Simulation scenario
    * @param idempotencyKey Unique key for idempotency
+   * @param displayCurrency GBP or EUR display control. Ledger submission stays integer minor units.
    */
   suspend fun submitPayment(
     recipientId: String,
@@ -143,6 +213,7 @@ class MeridianClient(
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
+    displayCurrency: String = "GBP",
   ): PaymentResponse {
     val payload = PaymentRequest(
       recipientId = recipientId,
@@ -151,12 +222,17 @@ class MeridianClient(
       note = note,
       scenario = scenario.name,
     )
+    val event = PaymentTelemetry.event(flagEvaluation, idempotencyKey, sessionId, displayCurrency)
+    synchronized(telemetry) { telemetry.add(event) }
 
     return request(
       "POST",
       "/payments",
       payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
+      mapOf(
+        "Idempotency-Key" to idempotencyKey,
+        "X-Meridian-Flag" to PaymentTelemetry.headerValue(event),
+      ),
       PaymentResponse::class.java,
     )
   }
