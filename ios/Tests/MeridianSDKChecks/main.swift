@@ -341,13 +341,112 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let extra = runPaymentInputChecks()
+    passed += extra.passed
+    failed += extra.failed
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+}
+
+private struct CheckTally {
+  var passed = 0
+  var failed = 0
+}
+
+private func runPaymentInputChecks() -> CheckTally {
+  var tally = CheckTally()
+
+  func check(_ name: String, _ ok: Bool) {
+    if ok {
+      print("  ✓ \(name)")
+      tally.passed += 1
+    } else {
+      print("  ✗ \(name)")
+      tally.failed += 1
+    }
+  }
+
+  print("21. amount bounds and spoken label...")
+  let lower = evaluateAmount("0.01")
+  check("£0.01 is 1 pence", lower.isValid && lower.minorUnits == 1 && lower.prefix == "£")
+  check("0.01 is spoken as 0 pounds and 1 penny", lower.spoken == "0 pounds and 1 penny")
+  let typical = evaluateAmount("£10.50")
+  check("£10.50 is 1050 pence", typical.minorUnits == 1050 && typical.spoken == "10 pounds and 50 pence")
+  check("1 pound is singular", evaluateAmount("1").spoken == "1 pound and 0 pence")
+  check("1 penny is singular", amountSpokenLabel(101) == "1 pound and 1 penny")
+  check("grouped thousands parse", evaluateAmount("1,000.50").minorUnits == 100_050)
+  check("zero is below the lower bound", evaluateAmount("0.00").helper == "Amount must be at least £0.01")
+  check("upper bound is £10,000.00", evaluateAmount("10000.01").helper == "Amount cannot exceed £10,000.00")
+  check("comma decimal is rejected", evaluateAmount("10,50").helper == "Use a decimal point for pence, for example 10.50")
+  check("maximum amount is valid", evaluateAmount("10000.00").minorUnits == 1_000_000)
+  check("empty amount is not valid", !evaluateAmount("").isValid && evaluateAmount("").spoken == "No amount entered")
+
+  print("22. IBAN MOD-97 and format errors...")
+  let spaced = validateIban("gb82 west 1234 5698 7654 32")
+  check("spaced GB IBAN is valid", spaced.isValid && spaced.normalized == "GB82WEST12345698765432")
+  check("hyphenated DE IBAN is valid", validateIban("DE89-3704-0044-0532-0130-00").isValid)
+  check("French IBAN is valid", validateIban("FR14 2004 1010 0505 0001 3M02 606").isValid)
+  check("Dutch IBAN is valid", validateIban("NL91ABNA0417164300").isValid)
+  check("Norwegian IBAN is valid", validateIban("NO9386011117947").isValid)
+  check("IBAN groups wrap every four characters", formatIbanGroups("DE89370400440532013000") == "DE89 3704 0044 0532 0130 00")
+  check(
+    "bad checksum is described",
+    validateIban("GB82WEST12345698765433").helper == "IBAN checksum is invalid. Check the account number and try again"
+  )
+  check(
+    "short IBAN explains the missing characters",
+    validateIban("DE89 3704").helper == "IBANs for Germany are 22 characters. Enter 14 more characters"
+  )
+  check(
+    "long IBAN explains the country length",
+    validateIban("DE893704004405320130000").helper == "IBANs for Germany are 22 characters"
+  )
+  check("empty IBAN asks for input", validateIban("  ").helper == "Enter the recipient IBAN")
+  check(
+    "punctuation is rejected",
+    validateIban("DE89 3704 0044 0532 0130 0!").helper == "IBAN can contain only letters and numbers"
+  )
+  check(
+    "non-European country is rejected",
+    validateIban("US64SVBKUS6S3300958879").helper == "Enter a European IBAN. US is not a supported country code"
+  )
+  check(
+    "check digits must be numbers",
+    validateIban("DEAB370400440532013000").helper == "The two characters after the country code must be digits"
+  )
+
+  print("23. draft survives transitions and failures...")
+  let draft = PaymentEntry(
+    amount: "10.50",
+    iban: "DE89370400440532013000",
+    reference: "Rent",
+    recipientId: "northline-studio",
+    method: "bank",
+    idempotencyKey: "key-1",
+    reviewing: false
+  )
+  check("valid bank draft can be reviewed", paymentReviewError(draft) == nil)
+  check("bank draft requires an IBAN", paymentReviewError(PaymentEntry(amount: "10.50", method: "bank")) == "Enter the recipient IBAN")
+  check("card draft does not require an IBAN", paymentReviewError(PaymentEntry(amount: "10.50", method: "card")) == nil)
+  let reviewing = reducePaymentEntry(draft, .review(newKey: "key-2"))
+  check("review keeps the amount and IBAN", reviewing.amount == "10.50" && reviewing.iban == draft.iban && reviewing.reviewing && reviewing.idempotencyKey == "key-2")
+  let editing = reducePaymentEntry(reviewing, .edit(newKey: "key-3"))
+  check("edit keeps the amount and IBAN", editing.amount == "10.50" && editing.iban == draft.iban && !editing.reviewing)
+  check("network failure keeps the draft and key", reducePaymentEntry(reviewing, .networkFailure) == reviewing)
+  check("pending keeps the draft and key", reducePaymentEntry(reviewing, .pending) == reviewing)
+  let done = reducePaymentEntry(reviewing, .completed(newKey: "key-5"))
+  check(
+    "completion clears the inputs and keeps the recipient",
+    done.amount.isEmpty && done.iban.isEmpty && done.reference.isEmpty && done.recipientId == "northline-studio" && done.idempotencyKey == "key-5"
+  )
+  return tally
 }

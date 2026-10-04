@@ -277,32 +277,42 @@ public func money(_ pence: Int) -> String {
   return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
 }
 
-/// Parse amount string to integer pence
-/// - Parameter input: Amount string (e.g., "10.50", "10", "10.5")
+/// Parse an amount string to integer GBP pence.
+/// Accepts a leading £ and en_GB thousands separators. Bounds are £0.01 to £10,000.00.
+/// - Parameter input: Amount string (e.g., "10.50", "£10", "1,000.5")
 /// - Returns: Tuple of (pence: Int?, error: String?)
 public func parseAmount(_ input: String) -> (Int?, String?) {
-  let trimmed = input.trimmingCharacters(in: .whitespaces)
+  var trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+  if trimmed.hasPrefix("£") {
+    trimmed = String(trimmed.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+  }
 
-  // Empty or whitespace only
   if trimmed.isEmpty {
     return (nil, "Amount is required")
   }
 
-  // Check for sign, exponent, or invalid characters
   if trimmed.contains("-") || trimmed.contains("+") || trimmed.lowercased().contains("e") {
     return (nil, "Amount cannot contain sign or exponent notation")
   }
 
-  // Must be numeric with optional decimal point
-  let pattern = "^\\d+(\\.\\d*)?$"
-  let regex = try? NSRegularExpression(pattern: pattern)
-  let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
-  guard regex?.firstMatch(in: trimmed, range: range) != nil else {
+  let normalized: String
+  if trimmed.contains(",") {
+    if trimmed.range(of: #"^\d{1,3}(,\d{3})+(\.\d*)?$"#, options: .regularExpression) != nil {
+      normalized = trimmed.replacingOccurrences(of: ",", with: "")
+    } else if trimmed.range(of: #"^\d+,\d{1,2}$"#, options: .regularExpression) != nil {
+      return (nil, "Use a decimal point for pence, for example 10.50")
+    } else {
+      return (nil, "Amount must be a valid number")
+    }
+  } else {
+    normalized = trimmed
+  }
+
+  guard normalized.range(of: #"^\d+(\.\d*)?$"#, options: .regularExpression) != nil else {
     return (nil, "Amount must be a valid number")
   }
 
-  // Check decimal places and parse
-  let parts = trimmed.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+  let parts = normalized.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
   if parts.count == 2 && parts[1].count > 2 {
     return (nil, "Amount must have at most 2 decimal places")
   }
@@ -316,16 +326,17 @@ public func parseAmount(_ input: String) -> (Int?, String?) {
     return (nil, "Amount is not a valid integer")
   }
 
-  guard pounds <= 10000 else { return (nil, "Amount cannot exceed £10,000") }
+  if pounds > 10_000 {
+    return (nil, "Amount cannot exceed £10,000.00")
+  }
   let totalPence = pounds * 100 + pence
 
-  // Validate range: 1 to 1,000,000 pence (£10,000)
   if totalPence <= 0 {
-    return (nil, "Amount must be greater than zero")
+    return (nil, "Amount must be at least £0.01")
   }
 
   if totalPence > 1_000_000 {
-    return (nil, "Amount cannot exceed £10,000")
+    return (nil, "Amount cannot exceed £10,000.00")
   }
 
   return (totalPence, nil)
