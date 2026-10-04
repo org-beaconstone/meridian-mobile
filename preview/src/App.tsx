@@ -25,6 +25,14 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  createScaEngine,
+  rehearsalPaymentBody,
+  verifyScaToken,
+  type ScaEngine,
+  type ScaVerification,
+} from './domain/sca';
+import { ScaSheet } from './ScaSheet';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -90,6 +98,8 @@ export default function App() {
   const [receipt, setReceipt] = useState<Transaction | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
+  const [sca, setSca] = useState<ScaEngine | null>(null);
+  const [authorization, setAuthorization] = useState<ScaVerification | null>(null);
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
@@ -159,12 +169,16 @@ export default function App() {
     setNote('');
     setError('');
     setReceipt(null);
+    setSca(null);
+    setAuthorization(null);
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
   }
   function editPayment() {
     setStep('details');
     setError('');
+    setSca(null);
+    setAuthorization(null);
     paymentKey.current = crypto.randomUUID();
   }
   function review() {
@@ -178,19 +192,42 @@ export default function App() {
       return;
     }
     setError('');
+    setAuthorization(null);
     setStep('review');
+  }
+  function beginConfirm() {
+    const amountMinor = pence(amount);
+    if (amountMinor === null || !connected) return;
+    const paymentBinding = {
+      recipientId: recipient,
+      amountMinor,
+      method,
+      idempotencyKey: paymentKey.current,
+    };
+    if (authorization && verifyScaToken(authorization.scaChallengeToken, paymentBinding)) {
+      void confirm();
+      return;
+    }
+    setAuthorization(null);
+    setSca(createScaEngine(paymentBinding));
   }
   async function confirm() {
     try {
       setError('');
+      const amountMinor = pence(amount);
+      if (amountMinor === null) {
+        setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+        return;
+      }
       const result = await mutate(
         '/payments',
         'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
+        rehearsalPaymentBody({ recipientId: recipient, amountMinor, method, note, scenario }),
         paymentKey.current,
       );
       if (result.ok) {
         setReceipt(result.transaction);
+        setAuthorization(null);
         setStep('done');
       } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
@@ -373,7 +410,8 @@ export default function App() {
                           {note || 'No reference'}
                         </p>
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      <p>Authentication stays in this app.</p>
+                      <button className="primary" onClick={beginConfirm} disabled={busy || !connected}>
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
                       <button className="secondary" disabled={busy} onClick={editPayment}>
@@ -526,6 +564,20 @@ export default function App() {
           ))}
         </nav>
         <footer>Fictional Meridian Bank · GBP simulation</footer>
+        {sca && (
+          <div className="sca-overlay">
+            <ScaSheet
+              engine={sca}
+              onChange={setSca}
+              onCancel={() => setSca(null)}
+              onVerified={(verification) => {
+                setAuthorization(verification);
+                setSca(null);
+                void confirm();
+              }}
+            />
+          </div>
+        )}
       </div>
     </div>
   );

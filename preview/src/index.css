@@ -73,6 +73,7 @@ a {
   border-radius: 24px;
   overflow: hidden;
   box-shadow: 0 18px 70px #142c3514;
+  position: relative;
 }
 .mobile-header {
   padding: 24px;
@@ -404,6 +405,53 @@ legend {
 .fine-print {
   font-size: 11px;
   margin-top: 20px !important;
+}
+.sca-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: #142c3580;
+  display: flex;
+  align-items: flex-end;
+}
+.sca-sheet {
+  width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  background: #fff;
+  border-radius: 18px 18px 0 0;
+  padding: 18px 16px 22px;
+}
+.sca-sheet h2 {
+  margin-bottom: 8px;
+}
+.sca-companion {
+  font-size: 11px;
+  margin-bottom: 12px !important;
+}
+.sca-dots {
+  letter-spacing: 8px;
+  font-size: 28px;
+  text-align: center;
+  margin: 8px 0 4px;
+}
+.sca-keypad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 12px;
+}
+.sca-keypad button {
+  min-height: 52px;
+  border: 1px solid #d7ded0;
+  border-radius: 10px;
+  background: #f7f8f4;
+  color: #142c35;
+  font-size: 18px;
+  font-weight: 600;
+}
+.sca-sheet .error-message {
+  margin-bottom: 8px;
 }
 @media (max-width: 480px) {
   .rehearsal-background {

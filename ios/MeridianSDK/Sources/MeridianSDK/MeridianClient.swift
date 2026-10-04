@@ -137,6 +137,32 @@ public actor MeridianClient {
     )
   }
 
+  /// Submit a payment that has already passed the in-app SCA challenge.
+  /// The signed token is checked here and kept off the JSON body: meridian-api
+  /// rejects unknown payment fields, and the passcode never leaves the device.
+  public func submitAuthorizedPayment(
+    authorization: ScaVerification,
+    binding: ScaPaymentBinding,
+    note: String = "",
+    scenario: Scenario = .success
+  ) async throws -> PaymentResponse {
+    guard verify(token: authorization.scaChallengeToken, binding: binding) else {
+      throw MeridianError.validationError("SCA challenge token does not match this payment")
+    }
+    return try await submitPayment(
+      recipientId: binding.recipientId,
+      amountMinor: binding.amountMinor,
+      method: binding.method,
+      note: note,
+      scenario: scenario,
+      idempotencyKey: binding.idempotencyKey
+    )
+  }
+
+  private func verify(token: String, binding: ScaPaymentBinding) -> Bool {
+    ScaSigner.rehearsal().verify(token: token, binding: binding)
+  }
+
   /// PATCH /budgets - Update budget for a category
   /// - Parameters:
   ///   - category: Budget category

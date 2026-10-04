@@ -162,6 +162,30 @@ class MeridianClient(
   }
 
   /**
+   * Submit a payment that has already passed the in-app SCA challenge.
+   * The signed token is checked here and kept off the JSON body: meridian-api
+   * rejects unknown payment fields, and the passcode never leaves the device.
+   */
+  suspend fun submitAuthorizedPayment(
+    authorization: ScaVerification,
+    binding: ScaPaymentBinding,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+  ): PaymentResponse {
+    if (!ScaSigner.rehearsal().verify(authorization.scaChallengeToken, binding)) {
+      throw MeridianError.ValidationError("SCA challenge token does not match this payment")
+    }
+    return submitPayment(
+      recipientId = binding.recipientId,
+      amountMinor = binding.amountMinor,
+      method = binding.method,
+      note = note,
+      scenario = scenario,
+      idempotencyKey = binding.idempotencyKey,
+    )
+  }
+
+  /**
    * PATCH /budgets - Update budget for a category
    * @param category Budget category
    * @param limitMinor Limit in GBP pence
