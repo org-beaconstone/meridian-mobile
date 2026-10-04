@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -38,6 +41,9 @@ public actor MeridianClient {
     self.session = urlSession
   }
 
+  /// Extra attempts after an uncertain transport failure. The same session and idempotency key are reused.
+  public var maxTransportRetries = 2
+
   // MARK: - Internal Request Method
 
   private func request<T: Decodable>(
@@ -64,7 +70,15 @@ public actor MeridianClient {
       request.httpBody = try encoder.encode(body)
     }
 
-    let (data, response) = try await session.data(for: request)
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await session.data(for: request)
+    } catch let error as MeridianError {
+      throw error
+    } catch {
+      throw MeridianError.networkError(error.localizedDescription)
+    }
 
     guard let httpResponse = response as? HTTPURLResponse else {
       throw MeridianError.networkError("Invalid response type")
@@ -128,13 +142,25 @@ public actor MeridianClient {
       note: note,
       scenario: scenario
     )
-
-    return try await request(
-      method: "POST",
-      path: "/payments",
-      body: payload,
-      additionalHeaders: ["Idempotency-Key": idempotencyKey]
-    )
+    let provider = providerFor(method: method)
+    var attempt = 0
+    while true {
+      try refuseProviderSwitch(from: provider, to: providerFor(method: method))
+      do {
+        return try await request(
+          method: "POST",
+          path: "/payments",
+          body: payload,
+          additionalHeaders: ["Idempotency-Key": idempotencyKey]
+        )
+      } catch let error as MeridianError {
+        if case .networkError = error, attempt < maxTransportRetries {
+          attempt += 1
+          continue
+        }
+        throw error
+      }
+    }
   }
 
   /// PATCH /budgets - Update budget for a category
