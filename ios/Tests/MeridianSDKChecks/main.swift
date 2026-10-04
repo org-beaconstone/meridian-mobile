@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import MeridianSDK
 
@@ -341,10 +342,182 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    func sampleBinding(amount: Int = 2599) -> ScaPaymentBinding {
+      ScaPaymentBinding(
+        recipientId: "northline-studio",
+        amountMinor: amount,
+        method: .card,
+        idempotencyKey: "pay-key-1"
+      )
+    }
+
+    func session() -> ScaChallengeSession {
+      ScaChallengeSession(
+        binding: sampleBinding(),
+        challengeId: "challenge-1",
+        nonce: { "nonce-1" }
+      )
+    }
+
+    func enter(_ pin: String, into session: inout ScaChallengeSession, at date: Date) -> ScaVerification? {
+      var verification: ScaVerification?
+      for scalar in pin {
+        guard let digit = Int(String(scalar)) else { continue }
+        verification = session.appendDigit(digit, at: date)
+      }
+      return verification
+    }
+
+    let moment = Date(timeIntervalSince1970: 1_700_000_000)
+
+    print("21. HMAC-SHA256 known vector...")
+    let vectorKey = SymmetricKey(data: Data("key".utf8))
+    let vectorCode = HMAC<SHA256>.authenticationCode(
+      for: Data("The quick brown fox jumps over the lazy dog".utf8),
+      using: vectorKey
+    )
+    let vectorHex = Data(vectorCode).map { String(format: "%02x", $0) }.joined()
+    if vectorHex == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8" {
+      print("  ✓ HMAC-SHA256 vector")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected HMAC \(vectorHex)")
+      failed += 1
+    }
+
+    print("22. Biometric rejection banner...")
+    var rejected = session()
+    rejected.rejectBiometrics()
+    if rejected.phase == .passcode
+      && rejected.rejectionBanner == ScaChallenge.rejectionBanner
+      && rejected.biometric == .rejected
+      && rejected.verification == nil
+    {
+      print("  ✓ Rejection opens the passcode sheet with the banner")
+      passed += 1
+    } else {
+      print("  ✗ Rejection banner mismatch")
+      failed += 1
+    }
+
+    print("23. Bypass and unavailable omit the banner...")
+    var bypassed = session()
+    bypassed.bypassBiometrics()
+    var unavailable = session()
+    unavailable.markBiometricsUnavailable()
+    if bypassed.rejectionBanner == nil && bypassed.biometric == .bypassed
+      && unavailable.rejectionBanner == nil && unavailable.biometric == .unavailable
+    {
+      print("  ✓ Bypass and unavailable stay on passcode without the rejection banner")
+      passed += 1
+    } else {
+      print("  ✗ Banner was set for bypass or unavailable")
+      failed += 1
+    }
+
+    print("24. Biometric success token...")
+    var biometric = session()
+    let biometricVerification = biometric.succeedBiometrics(at: moment)
+    let biometricPayload = biometricVerification.flatMap {
+      ScaSigner.rehearsal().authenticatedPayload($0.scaChallengeToken)
+    }
+    if biometricVerification?.factors == [.inherence, .possession]
+      && biometricVerification?.biometric == .succeeded
+      && biometricPayload?.contains("inherence+possession") == true
+      && biometricPayload?.contains(ScaChallenge.rehearsalPin) == false
+      && ScaSigner.rehearsal().verify(
+        token: biometricVerification?.scaChallengeToken ?? "",
+        binding: sampleBinding()
+      )
+    {
+      print("  ✓ Biometric success signs inherence and possession")
+      passed += 1
+    } else {
+      print("  ✗ Biometric token mismatch")
+      failed += 1
+    }
+
+    print("25. Masked passcode and rate limit...")
+    var masking = session()
+    masking.rejectBiometrics()
+    _ = masking.appendDigit(1, at: moment)
+    _ = masking.appendDigit(2, at: moment)
+    let masked = masking.maskedPasscode()
+    _ = masking.appendDigit(77, at: moment)
+    let ignored = masking.enteredCount == 2
+    masking.deleteDigit(at: moment)
+    let deleted = masking.enteredCount == 1 && masking.maskedPasscode() == "•○○○○○"
+    var passcode = session()
+    passcode.rejectBiometrics()
+    for _ in 0..<4 {
+      _ = enter("000000", into: &passcode, at: moment)
+    }
+    let stillWrong = passcode.verification == nil && passcode.secondsLocked(at: moment) == 0
+    _ = enter("000000", into: &passcode, at: moment)
+    let locked = passcode.secondsLocked(at: moment) == 30
+      && passcode.passcodeMessage == ScaChallenge.tooManyAttempts
+    _ = enter(ScaChallenge.rehearsalPin, into: &passcode, at: moment.addingTimeInterval(29))
+    let blocked = passcode.verification == nil
+    let verified = enter(
+      ScaChallenge.rehearsalPin,
+      into: &passcode,
+      at: moment.addingTimeInterval(30)
+    )
+    let payload = verified.flatMap { ScaSigner.rehearsal().authenticatedPayload($0.scaChallengeToken) }
+    let token = verified?.scaChallengeToken ?? ""
+    let tampered: String = {
+      guard let separator = token.firstIndex(of: "."), token.index(after: separator) < token.endIndex else {
+        return "x"
+      }
+      let signatureStart = token.index(after: separator)
+      let replacement: Character = token[signatureStart] == "A" ? "B" : "A"
+      return String(token[..<signatureStart]) + String(replacement) + String(token[token.index(after: signatureStart)...])
+    }()
+    if masked == "••○○○○" && stillWrong && locked && blocked
+      && verified?.factors == [.knowledge, .possession]
+      && verified?.biometric == .rejected
+      && token.contains(ScaChallenge.rehearsalPin) == false
+      && payload?.contains("knowledge+possession") == true
+      && payload?.contains(ScaChallenge.rehearsalPin) == false
+      && ScaSigner.rehearsal().verify(token: token, binding: sampleBinding())
+      && !ScaSigner.rehearsal().verify(token: token, binding: sampleBinding(amount: 2600))
+      && !ScaSigner.rehearsal().verify(token: tampered, binding: sampleBinding())
+      && !String(describing: passcode).contains(ScaChallenge.rehearsalPin)
+    {
+      print("  ✓ Passcode is masked, rate-limited, and packaged into scaChallengeToken")
+      passed += 1
+    } else {
+      print("  ✗ Passcode challenge mismatch")
+      failed += 1
+    }
+
+    print("26. Payment JSON stays on the API contract...")
+    let encoded = try? JSONEncoder().encode(
+      PaymentRequest(
+        recipientId: "northline-studio",
+        amountMinor: 2599,
+        method: .card,
+        note: "Coffee",
+        scenario: .success
+      )
+    )
+    let json = encoded.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    if json.contains("\"amountMinor\":2599")
+      && !json.contains("scaChallengeToken")
+      && !json.contains(ScaChallenge.rehearsalPin)
+    {
+      print("  ✓ Payment body omits the challenge token and passcode")
+      passed += 1
+    } else {
+      print("  ✗ Payment JSON contained SCA material")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
