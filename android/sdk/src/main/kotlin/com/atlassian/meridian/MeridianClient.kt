@@ -2,8 +2,17 @@ package com.atlassian.meridian
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -16,9 +25,13 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val retryPolicy: RetryPolicy = RetryPolicy(),
+  private val sleeper: suspend (Long) -> Unit = { delay(it) },
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
+  private val healthSnapshots = MutableStateFlow(SessionHealthSnapshot())
+  @Volatile private var healthJob: Job? = null
 
   init {
     require(sessionId.isNotEmpty()) { "Session ID is required" }
@@ -71,6 +84,9 @@ class MeridianClient(
       }
 
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
+      if (retryPolicy.retries(statusCode)) {
+        throw MeridianError.HttpError(statusCode, responseBody.ifEmpty { "Gateway error" })
+      }
 
       // Check HTTP status and handle errors
       when {
@@ -102,6 +118,10 @@ class MeridianClient(
           )
         }
       }
+    } catch (error: MeridianError) {
+      throw error
+    } catch (error: IOException) {
+      throw MeridianError.NetworkError(error.message ?: "Connection failed", error)
     } finally {
       connection.disconnect()
     }
@@ -114,6 +134,53 @@ class MeridianClient(
    */
   suspend fun getHealth(): HealthResponse =
     request("GET", "/health", responseType = HealthResponse::class.java)
+
+  /**
+   * GET /session/health — corridor and rail status for this rehearsal session.
+   * Full path is `{baseURL}/session/health`, which is `/api/v1/session/health` for the shared API.
+   */
+  suspend fun getSessionHealth(): SessionHealth =
+    request("GET", "/session/health", responseType = SessionHealth::class.java)
+
+  fun sessionHealth(): StateFlow<SessionHealthSnapshot> = healthSnapshots
+
+  /**
+   * Polls /session/health until [stopSessionHealthPolling] or the scope is cancelled.
+   * A missing endpoint is recorded as unreachable and is not treated as a corridor outage.
+   */
+  fun startSessionHealthPolling(scope: CoroutineScope, intervalMillis: Long = 5_000): Job {
+    healthJob?.cancel()
+    val job = scope.launch {
+      while (isActive) {
+        healthSnapshots.value = loadSessionHealth()
+        delay(intervalMillis)
+      }
+    }
+    healthJob = job
+    return job
+  }
+
+  fun stopSessionHealthPolling() {
+    healthJob?.cancel()
+    healthJob = null
+  }
+
+  suspend fun loadSessionHealth(): SessionHealthSnapshot {
+    return try {
+      SessionHealthSnapshot(health = getSessionHealth(), reachable = true, detail = null)
+    } catch (error: CancellationException) {
+      throw error
+    } catch (error: MeridianError.HttpError) {
+      val detail = if (error.statusCode == 404) {
+        "Session health is not available"
+      } else {
+        error.message
+      }
+      SessionHealthSnapshot(health = null, reachable = false, detail = detail)
+    } catch (error: Exception) {
+      SessionHealthSnapshot(health = null, reachable = false, detail = error.message)
+    }
+  }
 
   /**
    * GET /catalog - Fetch recipients and providers
@@ -151,13 +218,32 @@ class MeridianClient(
       note = note,
       scenario = scenario.name,
     )
-
-    return request(
-      "POST",
-      "/payments",
-      payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
-      PaymentResponse::class.java,
+    val headers = mapOf("Idempotency-Key" to idempotencyKey)
+    var lastStatus = 0
+    var lastMessage = ""
+    var attempt = 1
+    while (attempt <= retryPolicy.maxAttempts) {
+      try {
+        return request(
+          "POST",
+          "/payments",
+          payload,
+          headers,
+          PaymentResponse::class.java,
+        )
+      } catch (error: MeridianError.HttpError) {
+        if (!retryPolicy.retries(error.statusCode)) throw error
+        lastStatus = error.statusCode
+        lastMessage = error.message ?: ""
+        if (attempt == retryPolicy.maxAttempts) break
+        sleeper(retryPolicy.delayMillis(beforeAttempt = attempt + 1))
+        attempt += 1
+      }
+    }
+    throw MeridianError.RetriesExhausted(
+      statusCode = lastStatus,
+      attempts = retryPolicy.maxAttempts,
+      msg = "Gateway HTTP $lastStatus after ${retryPolicy.maxAttempts} attempts. $lastMessage".trim(),
     )
   }
 

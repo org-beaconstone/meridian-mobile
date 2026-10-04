@@ -341,13 +341,287 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: gateway backoff retries only 502 and 504
+    print("21. retry policy backoff...")
+    let policy = RetryPolicy(jitter: { _ in 0 })
+    let delays = [
+      policy.delayMillis(beforeAttempt: 2),
+      policy.delayMillis(beforeAttempt: 3),
+      policy.delayMillis(beforeAttempt: 4),
+      policy.delayMillis(beforeAttempt: 8),
+    ]
+    if policy.maxAttempts == 3 && delays == [200, 400, 800, 1600]
+      && policy.retriesHTTPStatus(502) && policy.retriesHTTPStatus(504)
+      && !policy.retriesHTTPStatus(503) && !policy.retriesHTTPStatus(500) && !policy.retriesHTTPStatus(409) {
+      print("  ✓ 502/504 backoff is 200, 400, 800 capped at 1600")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected retry schedule \(delays)")
+      failed += 1
+    }
+
+    // CHECK 22: degraded Adyen card prompts Worldpay bank, and ignores other provider ids
+    print("22. corridor fallback stays on the rehearsed rails...")
+    let health = SessionHealth(
+      status: "DEGRADED",
+      simulation: true,
+      corridors: [
+        CorridorHealth(id: "EU", status: "outage", currency: "EUR", rails: [RailHealth(method: "card", provider: "adyen", status: "outage")]),
+        CorridorHealth(
+          id: "GB",
+          status: "degraded",
+          currency: "GBP",
+          rails: [
+            RailHealth(method: "card", provider: "adyen", status: "degraded"),
+            RailHealth(method: "bank", provider: "unlisted", status: "healthy"),
+            RailHealth(method: "bank", provider: "worldpay", status: "healthy"),
+          ]
+        ),
+      ]
+    )
+    if case let .switchRail(prompt) = corridorNotice(for: health, selected: .card),
+      prompt.corridorId == "GB", prompt.alternateMethod == .bank, baselineProvider(for: prompt.alternateMethod) == .worldpay,
+      corridorNotice(for: health, selected: .bank) == nil {
+      print("  ✓ degraded card prompts bank payment")
+      passed += 1
+    } else {
+      print("  ✗ Corridor notice did not stay on Adyen card / Worldpay bank")
+      failed += 1
+    }
+
+    // CHECK 23: no healthy rehearsed rail means no provider switch
+    print("23. corridor outage without a healthy rehearsed rail...")
+    let outage = SessionHealth(
+      status: "DOWN",
+      corridors: [
+        CorridorHealth(
+          id: "GB",
+          status: "outage",
+          currency: "GBP",
+          rails: [
+            RailHealth(method: "card", provider: "adyen", status: "outage"),
+            RailHealth(method: "bank", provider: "worldpay", status: "degraded"),
+            RailHealth(method: "card", provider: "unlisted", status: "healthy"),
+          ]
+        )
+      ]
+    )
+    if case let .unavailable(_, message) = corridorNotice(for: outage, selected: .card), !message.contains("unlisted") {
+      print("  ✓ outage banner does not name an unlisted provider")
+      passed += 1
+    } else {
+      print("  ✗ Outage should not offer an unlisted provider")
+      failed += 1
+    }
+
+    // CHECK 24: session health JSON
+    print("24. session health JSON...")
+    let healthJSON = """
+    {"status":"DEGRADED","simulation":true,"region":"uk","corridors":[{"id":"GB","currency":"GBP","status":"degraded","rails":[{"method":"bank","provider":"worldpay","status":"outage","latencyMs":10}]}]}
+    """
+    if let decoded = try? JSONDecoder().decode(SessionHealth.self, from: Data(healthJSON.utf8)),
+      decoded.simulation == true,
+      case .unavailable = corridorNotice(for: decoded, selected: .bank) {
+      print("  ✓ session health decoded")
+      passed += 1
+    } else {
+      print("  ✗ Session health decoding failed")
+      failed += 1
+    }
+
+    let transport = DispatchSemaphore(value: 0)
+    let delayLog = DelayLog()
+    let tally = CheckTally()
+    let worker = Task {
+      defer { transport.signal() }
+      let config = URLSessionConfiguration.ephemeral
+      config.protocolClasses = [ScriptedTransport.self]
+      let session = URLSession(configuration: config)
+      ScriptedTransport.reset(responses: [502, 504, 200])
+      do {
+        let client = try MeridianClient(
+          baseURL: "http://127.0.0.1:9/api/v1",
+          sessionId: "swift-room",
+          urlSession: session,
+          retryPolicy: RetryPolicy(jitter: { _ in 0 }),
+          sleeper: { millis in delayLog.values.append(millis) }
+        )
+        let paid = try await client.submitPayment(
+          recipientId: "northline-studio",
+          amountMinor: 2500,
+          method: .card,
+          note: "Studio materials",
+          idempotencyKey: "swift-key"
+        )
+        let sameKey = ScriptedTransport.keys == ["swift-key", "swift-key", "swift-key"]
+        let sameBody = Set(ScriptedTransport.bodies).count == 1 && (ScriptedTransport.bodies.first?.contains("\"method\":\"card\"") ?? false)
+        let sameSession = ScriptedTransport.sessions == ["swift-room", "swift-room", "swift-room"]
+        if paid.ok && paid.paymentId == "pay-swift" && sameKey && sameBody && sameSession && delayLog.values == [200, 400] {
+          print("25. gateway retry kept the payment key...")
+          print("  ✓ 502 then 504 retried with the same key and card body")
+          tally.pass()
+        } else {
+          print("25. gateway retry kept the payment key...")
+          print("  ✗ ok=\(paid.ok) keys=\(ScriptedTransport.keys) delays=\(delayLog.values) bodies=\(ScriptedTransport.bodies)")
+          tally.fail()
+        }
+
+        ScriptedTransport.reset(responses: [502, 502, 502])
+        delayLog.values.removeAll()
+        do {
+          _ = try await client.submitPayment(
+            recipientId: "northline-studio",
+            amountMinor: 100,
+            method: .bank,
+            note: "rent",
+            idempotencyKey: "swift-exhaust"
+          )
+          print("26. exhausted gateway retries...")
+          print("  ✗ Expected retries to exhaust")
+          tally.fail()
+        } catch let error as MeridianError {
+          if case let .retriesExhausted(status, attempts, _) = error,
+            status == 502, attempts == 3, ScriptedTransport.keys == ["swift-exhaust", "swift-exhaust", "swift-exhaust"] {
+            print("26. exhausted gateway retries...")
+            print("  ✓ three 502s kept swift-exhaust")
+            tally.pass()
+          } else {
+            print("26. exhausted gateway retries...")
+            print("  ✗ Unexpected error \(error) keys=\(ScriptedTransport.keys)")
+            tally.fail()
+          }
+        }
+
+        ScriptedTransport.reset(responses: [200])
+        let updates = await client.pollSessionHealth(every: .milliseconds(20))
+        var polls = 0
+        for await snapshot in updates {
+          polls += 1
+          if polls >= 2 {
+            let healthPaths = ScriptedTransport.paths.filter { $0.contains("/session/health") }
+            if snapshot.reachable, case let .switchRail(prompt) = snapshot.health.flatMap({ corridorNotice(for: $0, selected: .card) }),
+              prompt.alternateMethod == .bank, healthPaths.count >= 2 {
+              print("27. session health polling...")
+              print("  ✓ polled /session/health and prompted the bank rail")
+              tally.pass()
+            } else {
+              print("27. session health polling...")
+              print("  ✗ paths=\(ScriptedTransport.paths) reachable=\(snapshot.reachable)")
+              tally.fail()
+            }
+            await client.stopSessionHealthPolling()
+            break
+          }
+        }
+      } catch {
+        print("25-27. transport checks...")
+        print("  ✗ \(error)")
+        tally.fail(3)
+      }
+    }
+    if transport.wait(timeout: .now() + 8) != .success {
+      worker.cancel()
+      print("25-27. transport checks...")
+      print("  ✗ Timed out")
+      if tally.passed + tally.failed == 0 { failed += 3 }
+    }
+    passed += tally.passed
+    failed += tally.failed
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
+  }
+}
+
+private final class DelayLog: @unchecked Sendable {
+  var values: [Int] = []
+}
+
+private final class CheckTally: @unchecked Sendable {
+  var passed = 0
+  var failed = 0
+  func pass() { passed += 1 }
+  func fail(_ count: Int = 1) { failed += count }
+}
+
+private final class ScriptedTransport: URLProtocol, @unchecked Sendable {
+  static let gate = NSLock()
+  static var responses: [Int] = []
+  static var keys: [String] = []
+  static var bodies: [String] = []
+  static var sessions: [String] = []
+  static var paths: [String] = []
+
+  static func reset(responses: [Int]) {
+    gate.lock()
+    self.responses = responses
+    keys = []
+    bodies = []
+    sessions = []
+    paths = []
+    gate.unlock()
+  }
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+  override func startLoading() {
+    let path = request.url?.path ?? ""
+    let key = request.value(forHTTPHeaderField: "Idempotency-Key") ?? ""
+    let session = request.value(forHTTPHeaderField: "X-Rehearsal-Session") ?? ""
+    let body = Self.readBody(request)
+    Self.gate.lock()
+    Self.paths.append(path)
+    if !key.isEmpty { Self.keys.append(key) }
+    if !body.isEmpty { Self.bodies.append(body) }
+    Self.sessions.append(session)
+    let status: Int
+    if path.contains("/session/health") {
+      status = 200
+    } else if Self.responses.isEmpty {
+      status = 502
+    } else {
+      status = Self.responses.removeFirst()
+    }
+    Self.gate.unlock()
+
+    let payload: String
+    if path.contains("/session/health") {
+      payload = #"{"status":"DEGRADED","simulation":true,"corridors":[{"id":"GB","currency":"GBP","status":"degraded","rails":[{"method":"card","provider":"adyen","status":"outage"},{"method":"bank","provider":"worldpay","status":"healthy"}]}]}"#
+    } else if status == 200 {
+      payload = #"{"ok":true,"paymentId":"pay-swift"}"#
+    } else {
+      payload = ""
+    }
+    let data = Data(payload.utf8)
+    let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    if !data.isEmpty { client?.urlProtocol(self, didLoad: data) }
+    client?.urlProtocolDidFinishLoading(self)
+  }
+
+  override func stopLoading() {}
+
+  private static func readBody(_ request: URLRequest) -> String {
+    if let body = request.httpBody, let text = String(data: body, encoding: .utf8) { return text }
+    guard let stream = request.httpBodyStream else { return "" }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 1024)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+      let count = stream.read(buffer, maxLength: 1024)
+      if count <= 0 { break }
+      data.append(buffer, count: count)
+    }
+    return String(data: data, encoding: .utf8) ?? ""
   }
 }

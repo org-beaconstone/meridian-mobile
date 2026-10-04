@@ -357,6 +357,30 @@ legend {
   border-radius: 7px;
   margin-bottom: 20px;
 }
+.resilience-banner {
+  padding: 14px;
+  border-radius: 7px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.resilience-banner.rail {
+  border: 1px solid #ead7a4;
+  background: #fff7e6;
+  color: #6b4e12;
+}
+.banner-action {
+  display: inline-block;
+  margin-top: 8px;
+  min-height: 36px;
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: #142c35;
+  color: white;
+  border: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
 .notice-message {
   background: #e7f2dd;
   padding: 12px;

@@ -2,9 +2,11 @@ package com.atlassian.meridian
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
@@ -372,6 +374,284 @@ class MeridianSDKTest {
       assertEquals(1, seenKeys.size)
     } finally {
       server.stop(0)
+    }
+  }
+
+  @Test
+  fun testBackoffScheduleRetriesOnlyGatewayTimeouts() {
+    val policy = RetryPolicy(jitter = { 0 })
+    assertEquals(3, policy.maxAttempts)
+    assertEquals(200L, policy.delayMillis(beforeAttempt = 2))
+    assertEquals(400L, policy.delayMillis(beforeAttempt = 3))
+    assertEquals(800L, policy.delayMillis(beforeAttempt = 4))
+    assertEquals(1600L, policy.delayMillis(beforeAttempt = 5))
+    assertEquals(1600L, policy.delayMillis(beforeAttempt = 8))
+    assertTrue(policy.retries(502))
+    assertTrue(policy.retries(504))
+    assertFalse(policy.retries(500))
+    assertFalse(policy.retries(503))
+    assertFalse(policy.retries(409))
+    assertFalse(policy.retries(400))
+  }
+
+  @Test
+  fun testDegradedCardPromptsWorldpayBankOnly() {
+    val health = SessionHealth(
+      status = "DEGRADED",
+      simulation = true,
+      corridors = listOf(
+        CorridorHealth(
+          id = "EU",
+          currency = "EUR",
+          status = "outage",
+          rails = listOf(RailHealth("card", "adyen", "outage")),
+        ),
+        CorridorHealth(
+          id = "GB",
+          currency = "GBP",
+          status = "degraded",
+          rails = listOf(
+            RailHealth("card", "adyen", "degraded"),
+            RailHealth("bank", "unlisted", "healthy"),
+            RailHealth("bank", "worldpay", "healthy"),
+          ),
+        ),
+      ),
+    )
+    val notice = corridorNotice(health, PaymentMethod.card)
+    assertTrue(notice is CorridorNotice.SwitchRail)
+    val prompt = (notice as CorridorNotice.SwitchRail).prompt
+    assertEquals("GB", prompt.corridorId)
+    assertEquals(PaymentMethod.card, prompt.selectedMethod)
+    assertEquals(PaymentMethod.bank, prompt.alternateMethod)
+    assertEquals("worldpay", baselineProvider(prompt.alternateMethod))
+    assertNull(corridorNotice(health, PaymentMethod.bank))
+  }
+
+  @Test
+  fun testOutageWithoutHealthyBaselineRailDoesNotInventAProvider() {
+    val health = SessionHealth(
+      status = "DOWN",
+      corridors = listOf(
+        CorridorHealth(
+          id = "GB",
+          currency = "GBP",
+          status = "outage",
+          rails = listOf(
+            RailHealth("card", "adyen", "outage"),
+            RailHealth("bank", "worldpay", "degraded"),
+            RailHealth("card", "unlisted", "healthy"),
+          ),
+        ),
+      ),
+    )
+    val notice = corridorNotice(health, PaymentMethod.card)
+    assertTrue(notice is CorridorNotice.Unavailable)
+    assertFalse((notice as CorridorNotice.Unavailable).message.contains("unlisted"))
+  }
+
+  @Test
+  fun testSessionHealthJsonIgnoresUnknownFields() {
+    val json = """
+      {
+        "status": "DEGRADED",
+        "simulation": true,
+        "region": "uk",
+        "corridors": [
+          {
+            "id": "GB",
+            "currency": "GBP",
+            "status": "degraded",
+            "rails": [
+              {"method": "card", "provider": "adyen", "status": "outage", "latencyMs": 900}
+            ]
+          }
+        ]
+      }
+    """.trimIndent()
+    val health = mapper.readValue(json, SessionHealth::class.java)
+    assertEquals("DEGRADED", health.status)
+    assertEquals(true, health.simulation)
+    assertEquals("outage", health.corridors[0].rails[0].status)
+    assertTrue(corridorNotice(health, PaymentMethod.card) is CorridorNotice.Unavailable)
+  }
+
+  @Test
+  fun testGatewayRetryKeepsIdempotencyKeyAndPaymentBody() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val baseUrl = "http://127.0.0.1:${server.address.port}/api/v1"
+    val keys = mutableListOf<String>()
+    val bodies = mutableListOf<String>()
+    val sessions = mutableListOf<String>()
+    val delays = mutableListOf<Long>()
+    server.createContext("/api/v1/payments") { exchange ->
+      sessions.add(exchange.requestHeaders.getFirst("X-Rehearsal-Session"))
+      keys.add(exchange.requestHeaders.getFirst("Idempotency-Key"))
+      bodies.add(String(exchange.requestBody.readBytes(), Charsets.UTF_8))
+      val status = when (keys.size) {
+        1 -> 502
+        2 -> 504
+        else -> 200
+      }
+      val responseBody = if (status == 200) """{"ok":true,"paymentId":"pay-keep"}""" else ""
+      val bytes = responseBody.toByteArray()
+      exchange.sendResponseHeaders(status, bytes.size.toLong())
+      if (bytes.isNotEmpty()) exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient(
+        baseURL = baseUrl,
+        sessionId = "room-keep",
+        retryPolicy = RetryPolicy(jitter = { 0 }),
+        sleeper = { delays.add(it) },
+      )
+      val response = runBlocking {
+        client.submitPayment(
+          recipientId = "northline-studio",
+          amountMinor = 2500,
+          method = PaymentMethod.card,
+          note = "Studio materials",
+          idempotencyKey = "pay-key-keep",
+        )
+      }
+      assertTrue(response.ok)
+      assertEquals("pay-keep", response.paymentId)
+      assertEquals(listOf("pay-key-keep", "pay-key-keep", "pay-key-keep"), keys)
+      assertEquals(listOf("room-keep", "room-keep", "room-keep"), sessions)
+      assertEquals(1, bodies.toSet().size)
+      assertTrue(bodies[0].contains("\"method\":\"card\""))
+      assertTrue(bodies[0].contains("\"amountMinor\":2500"))
+      assertFalse(bodies[0].contains("worldpay"))
+      assertEquals(listOf(200L, 400L), delays)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testGatewayRetriesExhaustWithoutChangingTheKey() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val baseUrl = "http://127.0.0.1:${server.address.port}/api/v1"
+    val hits = AtomicInteger()
+    val keys = mutableListOf<String>()
+    server.createContext("/api/v1/payments") { exchange ->
+      hits.incrementAndGet()
+      keys.add(exchange.requestHeaders.getFirst("Idempotency-Key"))
+      exchange.requestBody.readBytes()
+      exchange.sendResponseHeaders(502, -1)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient(
+        baseURL = baseUrl,
+        sessionId = "room-exhaust",
+        retryPolicy = RetryPolicy(jitter = { 0 }),
+        sleeper = { },
+      )
+      val error = assertThrows(MeridianError.RetriesExhausted::class.java) {
+        runBlocking {
+          client.submitPayment(
+            recipientId = "northline-studio",
+            amountMinor = 100,
+            method = PaymentMethod.bank,
+            idempotencyKey = "same-bank-key",
+          )
+        }
+      }
+      assertEquals(502, error.statusCode)
+      assertEquals(3, error.attempts)
+      assertEquals(3, hits.get())
+      assertEquals(listOf("same-bank-key", "same-bank-key", "same-bank-key"), keys)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testBusiness503IsNotRetried() {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val baseUrl = "http://127.0.0.1:${server.address.port}/api/v1"
+    val hits = AtomicInteger()
+    server.createContext("/api/v1/payments") { exchange ->
+      hits.incrementAndGet()
+      exchange.requestBody.readBytes()
+      val body = """{"ok":false,"error":"Provider unavailable","code":"PROVIDER_UNAVAILABLE"}"""
+      val bytes = body.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(503, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient(baseUrl, "room-503", sleeper = { throw AssertionError("503 must not sleep") })
+      val response = runBlocking {
+        client.submitPayment(
+          recipientId = "northline-studio",
+          amountMinor = 100,
+          method = PaymentMethod.card,
+          idempotencyKey = "once",
+        )
+      }
+      assertFalse(response.ok)
+      assertEquals("PROVIDER_UNAVAILABLE", response.code)
+      assertEquals(1, hits.get())
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testSessionHealthPollingAndMissingEndpoint() = runBlocking {
+    val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    val baseUrl = "http://127.0.0.1:${server.address.port}/api/v1"
+    val hits = AtomicInteger()
+    server.createContext("/api/v1/session/health") { exchange ->
+      hits.incrementAndGet()
+      assertEquals("GET", exchange.requestMethod)
+      assertEquals("health-room", exchange.requestHeaders.getFirst("X-Rehearsal-Session"))
+      val body = """
+        {"status":"DEGRADED","simulation":true,"corridors":[{"id":"GB","currency":"GBP","status":"degraded","rails":[{"method":"card","provider":"adyen","status":"outage"},{"method":"bank","provider":"worldpay","status":"healthy"}]}]}
+      """.trimIndent()
+      val bytes = body.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient(baseUrl, "health-room")
+      val job = client.startSessionHealthPolling(this, 30)
+      val deadline = System.currentTimeMillis() + 3_000
+      while (hits.get() < 2 && System.currentTimeMillis() < deadline) delay(15)
+      client.stopSessionHealthPolling()
+      job.cancel()
+      assertTrue("expected repeated /session/health polls, saw ${hits.get()}", hits.get() >= 2)
+      val notice = corridorNotice(client.sessionHealth().value.health!!, PaymentMethod.card)
+      assertTrue(notice is CorridorNotice.SwitchRail)
+      assertEquals(PaymentMethod.bank, (notice as CorridorNotice.SwitchRail).prompt.alternateMethod)
+    } finally {
+      server.stop(0)
+    }
+
+    val missing = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+    missing.createContext("/api/v1/session/health") { exchange ->
+      exchange.sendResponseHeaders(404, -1)
+      exchange.close()
+    }
+    missing.start()
+    try {
+      val client = MeridianClient("http://127.0.0.1:${missing.address.port}/api/v1", "health-room")
+      val snapshot = client.loadSessionHealth()
+      assertFalse(snapshot.reachable)
+      assertNull(snapshot.health)
+      assertEquals("Session health is not available", snapshot.detail)
+    } finally {
+      missing.stop(0)
     }
   }
 }

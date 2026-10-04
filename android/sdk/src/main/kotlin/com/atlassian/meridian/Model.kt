@@ -147,6 +147,7 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class InvalidURL(msg: String = "Invalid URL") : MeridianError(msg)
   class DecodingError(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
   class HttpError(val statusCode: Int, msg: String) : MeridianError("HTTP $statusCode: $msg")
+  class RetriesExhausted(val statusCode: Int, val attempts: Int, msg: String) : MeridianError(msg)
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
   class ValidationError(msg: String) : MeridianError(msg)
