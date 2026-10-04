@@ -19,6 +19,7 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @State private var rolloutBreached = false
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -30,6 +31,7 @@ import MeridianSDK
           Button("Connect") { Task { await connect() } }.disabled(busy)
         }.textFieldStyle(.roundedBorder)
         Text(message).font(.callout).foregroundStyle(.secondary)
+        rolloutCard(breached: rolloutBreached)
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
@@ -59,6 +61,37 @@ import MeridianSDK
       }.padding(24).frame(maxWidth: 550)
     }.task {
       while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
+    }
+  }
+  private func rolloutCard(breached: Bool) -> some View {
+    let healthy = healthyRolloutTelemetry()
+    let promoted = evaluateRollout(
+      RolloutSnapshot(phase: .dogfood, dayIndex: 0, dwellDays: 0, stagingRollbackVerified: true, pilotRollbackVerified: true),
+      telemetry: healthy
+    )
+    let decision = breached
+      ? evaluateRollout(
+        RolloutSnapshot(phase: promoted.phase, dayIndex: 0, dwellDays: 0, stagingRollbackVerified: true, pilotRollbackVerified: true),
+        telemetry: RolloutTelemetry(requests: 200, errors: 0, openAlerts: 1, expectedSettlementPence: 250_000, actualSettlementPence: 250_000)
+      )
+      : promoted
+    let staging = verifyEmergencyRollback(ring: .staging)
+    let pilot = verifyEmergencyRollback(ring: .pilot)
+    let plan = internalDogfoodPlan()
+    let bucket = cohortBucket(room)
+    let corridors = europeanPilotCorridors().map(\.displayName).joined(separator: ", ")
+    return VStack(alignment: .leading, spacing: 8) {
+      Text("Internal rollout").font(.title2)
+      Text("European pilot corridors settle in GBP pence. Card stays Adyen and bank stays Worldpay.").font(.caption)
+      Text(corridors).font(.caption)
+      ForEach(plan.tracks, id: \.track) { track in
+        Text("\(track.platform) · \(track.track) · manifest only").font(.caption)
+      }
+      Text("Staging rollback \(staging.passed ? "verified" : "failed") · Pilot rollback \(pilot.passed ? "verified" : "failed")").font(.caption)
+      Text("Day 1 of \(rolloutWindowDays) · \(decision.canaryPercent)% · \(decision.reason.rawValue)")
+      Text("Room bucket \(bucket) · canary \(trafficEligible(channel: .canary, bucket: bucket, phase: decision.phase) ? "in cohort" : "outside cohort") · dogfood eligible").font(.caption)
+      Text("Settlement variance \(money(decision.settlementVariancePence))").font(.caption)
+      Button(breached ? "Restore canary view" : "Rehearse emergency rollback") { rolloutBreached.toggle() }
     }
   }
   private func connect() async {

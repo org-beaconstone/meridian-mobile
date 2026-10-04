@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  var rolloutBreached by remember { mutableStateOf(false) }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
@@ -58,6 +59,7 @@ class MainActivity : ComponentActivity() {
       else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
+    RolloutCard(room, rolloutBreached) { rolloutBreached = !rolloutBreached }
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
@@ -88,4 +90,46 @@ class MainActivity : ComponentActivity() {
       current.budgets.forEach {budget->Text("${budget.category} · ${money(budget.limit)}")}
     }
   }
+}
+
+@Composable
+private fun RolloutCard(room: String, breached: Boolean, onToggle: () -> Unit) {
+  val healthy = healthyRolloutTelemetry()
+  val promoted = evaluateRollout(
+    RolloutSnapshot(RolloutPhase.DOGFOOD, 0, 0, true, true),
+    healthy,
+  )
+  val decision = if (breached) {
+    evaluateRollout(
+      RolloutSnapshot(promoted.phase, 0, 0, true, true),
+      healthy.copy(openAlerts = 1),
+    )
+  } else {
+    promoted
+  }
+  val staging = verifyEmergencyRollback(RolloutRing.STAGING)
+  val pilot = verifyEmergencyRollback(RolloutRing.PILOT)
+  val plan = internalDogfoodPlan()
+  val bucket = cohortBucket(room)
+  val corridors = europeanPilotCorridors().joinToString(", ") { it.displayName }
+  Text("Internal rollout", style = MaterialTheme.typography.h6)
+  Text(
+    "European pilot corridors settle in GBP pence. Card stays Adyen and bank stays Worldpay.",
+    style = MaterialTheme.typography.caption,
+  )
+  Text(corridors, style = MaterialTheme.typography.caption)
+  plan.tracks.forEach { track ->
+    Text("${track.platform} · ${track.track} · manifest only", style = MaterialTheme.typography.caption)
+  }
+  Text(
+    "Staging rollback ${if (staging.passed) "verified" else "failed"} · Pilot rollback ${if (pilot.passed) "verified" else "failed"}",
+    style = MaterialTheme.typography.caption,
+  )
+  Text("Day 1 of $rolloutWindowDays · ${decision.canaryPercent}% · ${decision.reason.name}")
+  Text(
+    "Room bucket $bucket · canary ${if (trafficEligible(ReleaseChannel.CANARY, bucket, decision.phase)) "in cohort" else "outside cohort"} · dogfood eligible",
+    style = MaterialTheme.typography.caption,
+  )
+  Text("Settlement variance ${money(decision.settlementVariancePence)}", style = MaterialTheme.typography.caption)
+  Button(onClick = onToggle) { Text(if (breached) "Restore canary view" else "Rehearse emergency rollback") }
 }
