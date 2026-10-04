@@ -87,6 +87,19 @@ data class HealthResponse(
   val simulation: Boolean,
 ) : Serializable
 
+data class SessionHealthResponse(
+  val status: String,
+  val session: String? = null,
+) : Serializable
+
+/** GBP integer pence quote. The rehearsal does not settle another currency. */
+data class FxQuoteResponse(
+  val base: String,
+  val quote: String,
+  val amountMinor: Int,
+  val quoteAmountMinor: Int,
+) : Serializable
+
 data class CatalogResponse(
   val demoDate: String,
   val recipients: List<Recipient>,
