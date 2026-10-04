@@ -7,6 +7,7 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 
 /**
  * Meridian API client for Kotlin/JVM and Android
@@ -16,7 +17,10 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val scaHandler: ScaChallengeHandler? = null,
+  private val clock: () -> Instant = { Instant.now() },
 ) {
+  private data class Transport<T>(val statusCode: Int, val body: T)
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
 
@@ -35,7 +39,15 @@ class MeridianClient(
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
+  ): T = requestTransport(method, path, body, additionalHeaders, responseType).body
+
+  private suspend fun <T> requestTransport(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+    responseType: Class<T>,
+  ): Transport<T> = withContext(Dispatchers.IO) {
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
@@ -77,7 +89,7 @@ class MeridianClient(
         statusCode >= 200 && statusCode < 300 -> {
           // Success
           try {
-            mapper.readValue(responseBody, responseType)
+            Transport(statusCode, mapper.readValue(responseBody, responseType))
           } catch (e: Exception) {
             throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
           }
@@ -86,7 +98,7 @@ class MeridianClient(
         statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
           // These are expected error statuses, parse the response
           try {
-            mapper.readValue(responseBody, responseType)
+            Transport(statusCode, mapper.readValue(responseBody, responseType))
           } catch (e: Exception) {
             throw MeridianError.HttpError(
               statusCode,
@@ -152,13 +164,42 @@ class MeridianClient(
       scenario = scenario.name,
     )
 
-    return request(
+    val headers = mapOf("Idempotency-Key" to idempotencyKey)
+    val first = requestTransport(
       "POST",
       "/payments",
       payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
+      headers,
       PaymentResponse::class.java,
     )
+    when (val assessment = assessSca(first.statusCode, first.body)) {
+      is ScaAssessment.NotRequired -> return first.body
+      is ScaAssessment.Malformed -> throw MeridianError.ScaMalformed(assessment.message)
+      is ScaAssessment.Ready -> {
+        if (assessment.challenge.isExpired(clock())) {
+          throw MeridianError.ScaReinitiate(Sca.EXPIRED)
+        }
+        val handler = scaHandler ?: throw MeridianError.ScaStepUpRequired(Sca.EUROPEAN_PAYMENT)
+        val accepted = handler.confirmEuropeanPayment(Sca.EUROPEAN_PAYMENT)
+        if (!accepted) throw MeridianError.ScaCancelled(Sca.CANCELLED)
+        if (assessment.challenge.isExpired(clock())) {
+          throw MeridianError.ScaReinitiate(Sca.EXPIRED)
+        }
+        val proof = scaVerificationToken(assessment.challenge.token)
+        val second = requestTransport(
+          "POST",
+          "/payments",
+          payload,
+          headers + (Sca.HEADER to proof),
+          PaymentResponse::class.java,
+        )
+        when (assessSca(second.statusCode, second.body)) {
+          is ScaAssessment.NotRequired -> return second.body
+          is ScaAssessment.Malformed, is ScaAssessment.Ready ->
+            throw MeridianError.ScaReinitiate(Sca.REJECTED)
+        }
+      }
+    }
   }
 
   /**

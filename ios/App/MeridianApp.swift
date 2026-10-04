@@ -19,6 +19,7 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @StateObject private var scaDialog = ScaDialogModel()
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -57,14 +58,24 @@ import MeridianSDK
           ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
         }
       }.padding(24).frame(maxWidth: 550)
-    }.task {
+    }
+    .alert("Strong customer authentication", isPresented: Binding(
+      get: { scaDialog.prompt != nil },
+      set: { if !$0 { scaDialog.finish(false) } }
+    )) {
+      Button("Confirm") { scaDialog.finish(true) }
+      Button("Cancel", role: .cancel) { scaDialog.finish(false) }
+    } message: {
+      Text("\(scaDialog.detail ?? "")\n\n\(scaDialog.prompt ?? ScaCopy.europeanPayment)")
+    }
+    .task {
       while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
     }
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
     generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
+    do { client=try MeridianClient(baseURL:endpoint,sessionId:room,scaHandler:DialogScaHandler(model:scaDialog)); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
@@ -79,6 +90,14 @@ import MeridianSDK
       let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
       if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
       else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
+    } catch let error as MeridianError {
+      if case let .scaReinitiate(text) = error {
+        review=false
+        key=UUID().uuidString
+        message=text
+      } else {
+        message=error.localizedDescription
+      }
     } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
   }
 }

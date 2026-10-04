@@ -2,9 +2,12 @@ package com.atlassian.meridian
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
+import java.net.InetSocketAddress
+import java.time.Instant
 
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
@@ -370,6 +373,213 @@ class MeridianSDKTest {
 
       // Verify only one idempotency key was used
       assertEquals(1, seenKeys.size)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testScaVerificationTokenAndBudget() {
+    assertEquals(300L, Sca.LATENCY_BUDGET_MS)
+    val started = System.nanoTime()
+    val token = scaVerificationToken("cht_european_1")
+    assertEquals("sca_v1_7e0e3ab4c6566286", token)
+    assertTrue((System.nanoTime() - started) / 1_000_000 < 300)
+    assertEquals(token, scaVerificationToken("cht_european_1"))
+  }
+
+  @Test
+  fun testScaExpiryBoundary() {
+    val body = PaymentResponse(
+      ok = false,
+      code = Sca.CODE,
+      challengeToken = "cht_european_1",
+      challengeExpiresAt = "2026-10-04T09:30:00Z",
+    )
+    val ready = assessSca(202, body)
+    assertTrue(ready is ScaAssessment.Ready)
+    val challenge = (ready as ScaAssessment.Ready).challenge
+    assertFalse(challenge.isExpired(Instant.parse("2026-10-04T09:29:59Z")))
+    assertTrue(challenge.isExpired(Instant.parse("2026-10-04T09:30:00Z")))
+    assertTrue(assessSca(202, PaymentResponse(ok = false, code = "PAYMENT_PENDING")) is ScaAssessment.NotRequired)
+    assertTrue(
+      assessSca(200, body) is ScaAssessment.NotRequired
+    )
+    assertTrue(assessSca(202, PaymentResponse(ok = false, code = Sca.CODE)) is ScaAssessment.Malformed)
+  }
+
+  @Test
+  fun testScaResubmitsOriginalIdempotencyKey() {
+    val prompts = mutableListOf<String>()
+    val script = scaScript(
+      listOf(
+        202 to scaPayload("cht_european_1", "2099-01-01T00:00:00.000Z"),
+        200 to """{"ok":true,"paymentId":"tx-sca"}""",
+      )
+    )
+    withScaServer(script) { base ->
+      val client = MeridianClient(base, "sca-room", ScaChallengeHandler {
+        prompts.add(it)
+        true
+      })
+      val paid = runBlocking {
+        client.submitPayment("northline-studio", 2599, PaymentMethod.card, "European rehearsal", idempotencyKey = "idem-sca-1")
+      }
+      assertTrue(paid.ok)
+      assertEquals(listOf(Sca.EUROPEAN_PAYMENT), prompts)
+      assertEquals(2, script.calls.size)
+      val proof = scaVerificationToken("cht_european_1")
+      script.calls.forEach { call ->
+        assertEquals("sca-room", call["session"])
+        assertEquals("idem-sca-1", call["key"])
+      }
+      assertEquals("", script.calls[0]["verification"])
+      assertEquals(proof, script.calls[1]["verification"])
+      assertEquals(script.calls[0]["body"], script.calls[1]["body"])
+      assertFalse(script.calls[1]["body"]!!.contains("challengeVerification"))
+    }
+  }
+
+  @Test
+  fun testScaExpiredDoesNotPromptOrResubmit() {
+    val prompts = mutableListOf<String>()
+    val script = scaScript(listOf(202 to scaPayload("cht_european_1", "2020-01-01T00:00:00Z")))
+    withScaServer(script) { base ->
+      val client = MeridianClient(base, "sca-room", ScaChallengeHandler {
+        prompts.add(it)
+        true
+      })
+      val error = assertThrows(MeridianError.ScaReinitiate::class.java) {
+        runBlocking {
+          client.submitPayment("northline-studio", 2599, PaymentMethod.card, idempotencyKey = "idem-sca-1")
+        }
+      }
+      assertEquals(Sca.EXPIRED, error.message)
+      assertTrue(prompts.isEmpty())
+      assertEquals(1, script.calls.size)
+    }
+  }
+
+  @Test
+  fun testScaCancelKeepsSingleRequest() {
+    val script = scaScript(listOf(202 to scaPayload("cht_european_1", "2099-01-01T00:00:00Z")))
+    withScaServer(script) { base ->
+      val client = MeridianClient(base, "sca-room", ScaChallengeHandler { false })
+      val error = assertThrows(MeridianError.ScaCancelled::class.java) {
+        runBlocking {
+          client.submitPayment("northline-studio", 100, PaymentMethod.bank, idempotencyKey = "idem-sca-1")
+        }
+      }
+      assertEquals(Sca.CANCELLED, error.message)
+      assertEquals(1, script.calls.size)
+      assertEquals("", script.calls[0]["verification"])
+    }
+  }
+
+  @Test
+  fun testScaExpiresDuringBiometric() {
+    val times = ArrayDeque(
+      listOf(Instant.parse("2026-10-04T09:00:00Z"), Instant.parse("2026-10-04T09:30:00Z"))
+    )
+    var prompts = 0
+    val script = scaScript(listOf(202 to scaPayload("cht_european_1", "2026-10-04T09:30:00Z")))
+    withScaServer(script) { base ->
+      val client = MeridianClient(
+        base,
+        "sca-room",
+        ScaChallengeHandler {
+          prompts += 1
+          true
+        },
+        clock = { times.removeFirst() },
+      )
+      val error = assertThrows(MeridianError.ScaReinitiate::class.java) {
+        runBlocking {
+          client.submitPayment("northline-studio", 100, PaymentMethod.card, idempotencyKey = "idem-sca-1")
+        }
+      }
+      assertEquals(Sca.EXPIRED, error.message)
+      assertEquals(1, prompts)
+      assertEquals(1, script.calls.size)
+    }
+  }
+
+  @Test
+  fun testScaMalformedDoesNotPrompt() {
+    var prompts = 0
+    val script = scaScript(listOf(202 to """{"ok":false,"code":"SCA_STEP_UP_REQUIRED","error":"missing token"}"""))
+    withScaServer(script) { base ->
+      val client = MeridianClient(base, "sca-room", ScaChallengeHandler {
+        prompts += 1
+        true
+      })
+      assertThrows(MeridianError.ScaMalformed::class.java) {
+        runBlocking {
+          client.submitPayment("northline-studio", 100, PaymentMethod.card, idempotencyKey = "idem-sca-1")
+        }
+      }
+      assertEquals(0, prompts)
+      assertEquals(1, script.calls.size)
+    }
+  }
+
+  @Test
+  fun testRepeatedScaChallengeAsksToRestart() {
+    var prompts = 0
+    val script = scaScript(
+      listOf(
+        202 to scaPayload("cht_european_1", "2099-01-01T00:00:00Z"),
+        202 to scaPayload("cht_european_1", "2099-01-01T00:00:00Z"),
+      )
+    )
+    withScaServer(script) { base ->
+      val client = MeridianClient(base, "sca-room", ScaChallengeHandler {
+        prompts += 1
+        true
+      })
+      val error = assertThrows(MeridianError.ScaReinitiate::class.java) {
+        runBlocking {
+          client.submitPayment("northline-studio", 100, PaymentMethod.card, idempotencyKey = "idem-sca-1")
+        }
+      }
+      assertEquals(Sca.REJECTED, error.message)
+      assertEquals(1, prompts)
+      assertEquals(2, script.calls.size)
+      assertEquals(scaVerificationToken("cht_european_1"), script.calls[1]["verification"])
+    }
+  }
+
+  private class ScaScript(val responses: ArrayDeque<Pair<Int, String>>) {
+    val calls = mutableListOf<Map<String, String>>()
+  }
+
+  private fun scaPayload(token: String, expiry: String) =
+    """{"ok":false,"code":"SCA_STEP_UP_REQUIRED","error":"Strong customer authentication required","challengeToken":"$token","challengeExpiresAt":"$expiry"}"""
+
+  private fun scaScript(responses: List<Pair<Int, String>>) = ScaScript(ArrayDeque(responses))
+
+  private fun withScaServer(script: ScaScript, block: (String) -> Unit) {
+    val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    server.createContext("/api/v1/payments") { exchange ->
+      val body = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
+      script.calls.add(
+        mapOf(
+          "session" to (exchange.requestHeaders.getFirst("X-Rehearsal-Session") ?: ""),
+          "key" to (exchange.requestHeaders.getFirst("Idempotency-Key") ?: ""),
+          "verification" to (exchange.requestHeaders.getFirst(Sca.HEADER) ?: ""),
+          "body" to body,
+        )
+      )
+      val (status, payload) = script.responses.removeFirst()
+      val bytes = payload.toByteArray()
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(status, bytes.size.toLong())
+      exchange.responseBody.write(bytes)
+      exchange.close()
+    }
+    server.start()
+    try {
+      block("http://127.0.0.1:${server.address.port}/api/v1")
     } finally {
       server.stop(0)
     }

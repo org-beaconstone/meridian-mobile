@@ -25,6 +25,14 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  SCA_CANCELLED_MESSAGE,
+  SCA_EXPIRED_MESSAGE,
+  SCA_HEADER,
+  SCA_REJECTED_MESSAGE,
+  assessSca,
+  verificationToken,
+} from './domain/sca';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -33,7 +41,14 @@ class RequestError extends Error {
     super(message);
   }
 }
-async function request(room: string, path: string, method = 'GET', body?: unknown, key?: string) {
+async function request(
+  room: string,
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  key?: string,
+  extraHeaders?: Record<string, string>,
+) {
   let response: Response;
   try {
     response = await fetch('/api/v1' + path, {
@@ -42,6 +57,7 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
         'Content-Type': 'application/json',
         'X-Rehearsal-Session': room,
         ...(key ? { 'Idempotency-Key': key } : {}),
+        ...extraHeaders,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(15000),
@@ -55,7 +71,7 @@ async function request(room: string, path: string, method = 'GET', body?: unknow
   const data = await response.json();
   if (!response.ok)
     throw new RequestError(data.error || `HTTP ${response.status}`, data.code || 'HTTP_ERROR');
-  return data;
+  return { status: response.status, data };
 }
 function bankState(value: unknown): State {
   const v = value as State;
@@ -93,7 +109,10 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef(crypto.randomUUID()),
+    scaResolve = useRef<((accepted: boolean) => void) | null>(null);
+  const [scaPrompt, setScaPrompt] = useState<string | null>(null);
+  const [scaDetail, setScaDetail] = useState('');
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -115,8 +134,8 @@ export default function App() {
             version === revision.current &&
             !mutating.current
           ) {
-            setState(bankState(raw));
-            setRecipients(catalog.recipients);
+            setState(bankState(raw.data));
+            setRecipients(catalog.data.recipients);
             setConnected(true);
           }
         }
@@ -145,8 +164,8 @@ export default function App() {
     try {
       const result = await request(room, path, httpMethod, body, key);
       if (generation !== epoch.current) throw new Error('Room changed');
-      if (result.state) setState(bankState(result.state));
-      return result;
+      if (result.data.state) setState(bankState(result.data.state));
+      return result.data;
     } finally {
       revision.current++;
       mutating.current = false;
@@ -180,21 +199,88 @@ export default function App() {
     setError('');
     setStep('review');
   }
+  function closeSca(accepted: boolean) {
+    setScaPrompt(null);
+    scaResolve.current?.(accepted);
+    scaResolve.current = null;
+  }
+  function askSca(prompt: string, detail: string) {
+    setScaDetail(detail);
+    setScaPrompt(prompt);
+    return new Promise<boolean>((resolve) => {
+      scaResolve.current = resolve;
+    });
+  }
+  function reinitiate(text: string) {
+    paymentKey.current = crypto.randomUUID();
+    setStep('details');
+    setError(text);
+  }
   async function confirm() {
+    if (mutating.current || !connected) {
+      setError('Wait for API connection before submitting.');
+      return;
+    }
+    const minor = pence(amount);
+    if (minor === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    const generation = epoch.current;
+    const key = paymentKey.current;
+    const body = { recipientId: recipient, amountMinor: minor, method, note, scenario };
+    mutating.current = true;
+    setBusy(true);
+    revision.current++;
+    setError('');
     try {
-      setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
-      if (result.ok) {
-        setReceipt(result.transaction);
+      let result = await request(room, '/payments', 'POST', body, key);
+      if (generation !== epoch.current) throw new Error('Room changed');
+      const assessment = assessSca(result.status, result.data);
+      if (assessment.kind === 'malformed') {
+        setError(assessment.message);
+        return;
+      }
+      if (assessment.kind === 'expired') {
+        reinitiate(SCA_EXPIRED_MESSAGE);
+        return;
+      }
+      if (assessment.kind === 'ready') {
+        const accepted = await askSca(
+          assessment.challenge.prompt,
+          'Browser companion rehearsal. This is not Face ID, Touch ID, or Android BiometricPrompt. No provider is contacted.',
+        );
+        if (generation !== epoch.current) throw new Error('Room changed');
+        if (!accepted) {
+          setError(SCA_CANCELLED_MESSAGE);
+          return;
+        }
+        if (Date.now() >= assessment.challenge.expiresAtMs) {
+          reinitiate(SCA_EXPIRED_MESSAGE);
+          return;
+        }
+        result = await request(room, '/payments', 'POST', body, key, {
+          [SCA_HEADER]: verificationToken(assessment.challenge.token),
+        });
+        if (generation !== epoch.current) throw new Error('Room changed');
+        const again = assessSca(result.status, result.data);
+        if (again.kind !== 'not-required') {
+          reinitiate(SCA_REJECTED_MESSAGE);
+          return;
+        }
+      }
+      if (result.data.state) setState(bankState(result.data.state));
+      if (result.data.ok) {
+        setReceipt(result.data.transaction);
         setStep('done');
-      } else setError(result.error || 'Payment pending confirmation. Do not create a new payment.');
+      } else
+        setError(result.data.error || 'Payment pending confirmation. Do not create a new payment.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Payment failed');
+    } finally {
+      revision.current++;
+      mutating.current = false;
+      setBusy(false);
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
@@ -527,6 +613,37 @@ export default function App() {
         </nav>
         <footer>Fictional Meridian Bank · GBP simulation</footer>
       </div>
+      {scaPrompt && (
+        <div className="sca-backdrop">
+          <div
+            className="sca-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sca-title"
+            data-testid="sca-dialog"
+          >
+            <p className="preview-label">{scaDetail}</p>
+            <h2 id="sca-title">Strong customer authentication</h2>
+            <p data-testid="sca-prompt">{scaPrompt}</p>
+            <button
+              className="primary"
+              type="button"
+              data-testid="sca-confirm"
+              onClick={() => closeSca(true)}
+            >
+              Confirm
+            </button>
+            <button
+              className="secondary"
+              type="button"
+              data-testid="sca-cancel"
+              onClick={() => closeSca(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

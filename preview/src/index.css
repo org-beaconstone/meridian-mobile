@@ -405,6 +405,31 @@ legend {
   font-size: 11px;
   margin-top: 20px !important;
 }
+.sca-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 44, 53, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 20;
+}
+.sca-dialog {
+  width: min(360px, 100%);
+  background: #f8f9f6;
+  border-radius: 16px;
+  padding: 20px;
+  display: grid;
+  gap: 12px;
+}
+.sca-dialog h2 {
+  margin: 0;
+}
+.sca-dialog .primary,
+.sca-dialog .secondary {
+  width: 100%;
+}
 @media (max-width: 480px) {
   .rehearsal-background {
     padding: 0;

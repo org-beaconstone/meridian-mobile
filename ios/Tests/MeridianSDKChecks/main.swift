@@ -1,9 +1,112 @@
 import Foundation
 @testable import MeridianSDK
 
+final class ScriptedHTTP: URLProtocol, @unchecked Sendable {
+  struct Call {
+    let session: String?
+    let idempotency: String?
+    let verification: String?
+    let body: String
+  }
+
+  static let lock = NSLock()
+  static var calls: [Call] = []
+  static var script: [(Int, String)] = []
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    let body = Self.readBody(request)
+    Self.lock.lock()
+    Self.calls.append(
+      Call(
+        session: request.value(forHTTPHeaderField: "X-Rehearsal-Session"),
+        idempotency: request.value(forHTTPHeaderField: "Idempotency-Key"),
+        verification: request.value(forHTTPHeaderField: ScaVerification.headerName),
+        body: body
+      )
+    )
+    let next = Self.script.isEmpty ? (500, #"{"ok":false,"error":"empty script","code":"EMPTY"}"#) : Self.script.removeFirst()
+    Self.lock.unlock()
+    let response = HTTPURLResponse(
+      url: request.url!,
+      statusCode: next.0,
+      httpVersion: "HTTP/1.1",
+      headerFields: ["Content-Type": "application/json"]
+    )!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: Data(next.1.utf8))
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+
+  private static func readBody(_ request: URLRequest) -> String {
+    if let data = request.httpBody {
+      return String(data: data, encoding: .utf8) ?? ""
+    }
+    guard let stream = request.httpBodyStream else { return "" }
+    stream.open()
+    defer { stream.close() }
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+    defer { buffer.deallocate() }
+    var data = Data()
+    while stream.hasBytesAvailable {
+      let count = stream.read(buffer, maxLength: 4096)
+      if count <= 0 { break }
+      data.append(buffer, count: count)
+    }
+    return String(data: data, encoding: .utf8) ?? ""
+  }
+
+  static func reset(script next: [(Int, String)]) {
+    lock.lock()
+    calls = []
+    script = next
+    lock.unlock()
+  }
+}
+
+final class PromptLog: @unchecked Sendable {
+  var prompts: [String] = []
+  var accept = true
+}
+
+struct LoggingHandler: ScaChallengeHandler {
+  let log: PromptLog
+  func confirmEuropeanPayment(prompt: String) async -> Bool {
+    log.prompts.append(prompt)
+    return log.accept
+  }
+}
+
+final class ScriptedClock: @unchecked Sendable {
+  var times: [Date]
+  init(_ times: [Date]) { self.times = times }
+  func now() -> Date {
+    if times.count > 1 { return times.removeFirst() }
+    return times[0]
+  }
+}
+
+func scaSession() -> URLSession {
+  let config = URLSessionConfiguration.ephemeral
+  config.protocolClasses = [ScriptedHTTP.self]
+  return URLSession(configuration: config)
+}
+
+func isoDate(_ value: String) -> Date {
+  let formatter = ISO8601DateFormatter()
+  formatter.formatOptions = [.withInternetDateTime]
+  return formatter.date(from: value)!
+}
+
+func scaBody(token: String, expiry: String) -> String {
+  #"{"ok":false,"code":"SCA_STEP_UP_REQUIRED","error":"Strong customer authentication required","challengeToken":"\#(token)","challengeExpiresAt":"\#(expiry)"}"#
+}
+
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,10 +444,297 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let future = "2099-01-01T00:00:00.000Z"
+    let tokenName = "cht_european_1"
+
+    // CHECK 21: local verification token and latency budget
+    print("21. SCA verification token...")
+    do {
+      let proof = try ScaVerification.token(for: tokenName)
+      if ScaVerification.latencyBudgetMs == 300 && proof == "sca_v1_7e0e3ab4c6566286" {
+        print("  ✓ local proof \(proof) within 300 ms")
+        passed += 1
+      } else {
+        print("  ✗ Unexpected proof \(proof)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 22: expiry boundary
+    print("22. SCA expiry boundary...")
+    let boundary = PaymentResponse(
+      ok: false,
+      state: nil,
+      transaction: nil,
+      error: "Strong customer authentication required",
+      code: ScaCopy.code,
+      paymentId: nil,
+      challengeToken: tokenName,
+      challengeExpiresAt: "2026-10-04T09:30:00Z"
+    )
+    let open = assessSca(statusCode: 202, body: boundary)
+    let closedChallenge = ScaChallenge(token: tokenName, expiresAt: isoDate("2026-10-04T09:30:00Z"))
+    if case let .ready(challenge) = open,
+      challenge == closedChallenge,
+      !challenge.isExpired(at: isoDate("2026-10-04T09:29:59Z")),
+      challenge.isExpired(at: isoDate("2026-10-04T09:30:00Z")) {
+      print("  ✓ challenge is open before expiry and closed at the instant")
+      passed += 1
+    } else {
+      print("  ✗ expiry boundary mismatch")
+      failed += 1
+    }
+
+    func pay(_ client: MeridianClient) async throws -> PaymentResponse {
+      try await client.submitPayment(
+        recipientId: "northline-studio",
+        amountMinor: 2599,
+        method: .card,
+        note: "European rehearsal",
+        idempotencyKey: "idem-sca-1"
+      )
+    }
+
+    // CHECK 23: successful biometric resubmits the original key and proof
+    print("23. SCA resubmits original idempotency key...")
+    let prompts = PromptLog()
+    ScriptedHTTP.reset(script: [
+      (202, scaBody(token: tokenName, expiry: future)),
+      (200, #"{"ok":true,"paymentId":"tx-sca","error":null,"code":null}"#),
+    ])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      let paid = try await pay(client)
+      let calls = ScriptedHTTP.calls
+      let proof = try ScaVerification.token(for: tokenName)
+      if paid.ok,
+        prompts.prompts == [ScaCopy.europeanPayment],
+        calls.count == 2,
+        calls[0].session == "sca-room",
+        calls[1].session == "sca-room",
+        calls[0].idempotency == "idem-sca-1",
+        calls[1].idempotency == "idem-sca-1",
+        calls[0].verification == nil,
+        calls[1].verification == proof,
+        calls[0].body == calls[1].body,
+        !calls[1].body.contains("challengeVerification") {
+        print("  ✓ same session, key, and body; verification header on retry")
+        passed += 1
+      } else {
+        print("  ✗ resubmit mismatch \(calls)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 24: expired challenge does not prompt or resubmit
+    print("24. expired SCA challenge...")
+    prompts.prompts = []
+    ScriptedHTTP.reset(script: [(202, scaBody(token: tokenName, expiry: "2020-01-01T00:00:00Z"))])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      _ = try await pay(client)
+      print("  ✗ expired challenge should ask for a new payment")
+      failed += 1
+    } catch MeridianError.scaReinitiate(let message) {
+      if message == ScaCopy.expired && prompts.prompts.isEmpty && ScriptedHTTP.calls.count == 1 {
+        print("  ✓ expired window asks the user to start again")
+        passed += 1
+      } else {
+        print("  ✗ expiry handling mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: cancelled biometric does not resubmit
+    print("25. cancelled biometric...")
+    prompts.prompts = []
+    prompts.accept = false
+    ScriptedHTTP.reset(script: [(202, scaBody(token: tokenName, expiry: future))])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      _ = try await pay(client)
+      print("  ✗ cancel should keep the payment unsent")
+      failed += 1
+    } catch MeridianError.scaCancelled {
+      if ScriptedHTTP.calls.count == 1 && prompts.prompts.count == 1 {
+        print("  ✓ cancel keeps the original payment key for retry")
+        passed += 1
+      } else {
+        print("  ✗ cancel still resubmitted")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 26: window expires while the dialog is open
+    print("26. SCA window expires during biometric...")
+    prompts.accept = true
+    prompts.prompts = []
+    ScriptedHTTP.reset(script: [(202, scaBody(token: tokenName, expiry: "2026-10-04T09:30:00Z"))])
+    let clock = ScriptedClock([isoDate("2026-10-04T09:00:00Z"), isoDate("2026-10-04T09:30:00Z")])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts),
+        now: { clock.now() }
+      )
+      _ = try await pay(client)
+      print("  ✗ late expiry should not resubmit")
+      failed += 1
+    } catch MeridianError.scaReinitiate(let message) {
+      if message == ScaCopy.expired && prompts.prompts.count == 1 && ScriptedHTTP.calls.count == 1 {
+        print("  ✓ expiry after biometric asks the user to start again")
+        passed += 1
+      } else {
+        print("  ✗ late expiry mismatch prompts=\(prompts.prompts.count) calls=\(ScriptedHTTP.calls.count)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 27: malformed challenge
+    print("27. malformed SCA challenge...")
+    prompts.prompts = []
+    ScriptedHTTP.reset(script: [(202, #"{"ok":false,"code":"SCA_STEP_UP_REQUIRED","error":"missing token"}"#)])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      _ = try await pay(client)
+      print("  ✗ malformed challenge should fail")
+      failed += 1
+    } catch MeridianError.scaMalformed {
+      if prompts.prompts.isEmpty && ScriptedHTTP.calls.count == 1 {
+        print("  ✓ malformed challenge does not prompt")
+        passed += 1
+      } else {
+        print("  ✗ malformed challenge prompted")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 28: pending is not an SCA challenge
+    print("28. pending is not SCA...")
+    prompts.prompts = []
+    ScriptedHTTP.reset(script: [(202, #"{"ok":false,"code":"PAYMENT_PENDING","error":"Payment pending confirmation","paymentId":"pay-1"}"#)])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      let pending = try await pay(client)
+      if !pending.ok && pending.code == "PAYMENT_PENDING" && prompts.prompts.isEmpty && ScriptedHTTP.calls.count == 1 {
+        print("  ✓ pending response stays on the original key")
+        passed += 1
+      } else {
+        print("  ✗ pending was treated as SCA")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 29: a second challenge asks the user to start again
+    print("29. repeated SCA challenge...")
+    prompts.prompts = []
+    ScriptedHTTP.reset(script: [
+      (202, scaBody(token: tokenName, expiry: future)),
+      (202, scaBody(token: tokenName, expiry: future)),
+    ])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      _ = try await pay(client)
+      print("  ✗ repeated challenge should stop")
+      failed += 1
+    } catch MeridianError.scaReinitiate(let message) {
+      if message == ScaCopy.rejected && prompts.prompts.count == 1 && ScriptedHTTP.calls.count == 2 {
+        print("  ✓ unaccepted challenge asks the user to start again")
+        passed += 1
+      } else {
+        print("  ✗ repeated challenge mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 30: HTTP errors still surface
+    print("30. HTTP error during payment...")
+    prompts.prompts = []
+    ScriptedHTTP.reset(script: [(500, #"{"ok":false,"error":"boom","code":"HTTP_500"}"#)])
+    do {
+      let client = try MeridianClient(
+        baseURL: "http://127.0.0.1:8080/api/v1",
+        sessionId: "sca-room",
+        urlSession: scaSession(),
+        scaHandler: LoggingHandler(log: prompts)
+      )
+      _ = try await pay(client)
+      print("  ✗ HTTP 500 should throw")
+      failed += 1
+    } catch MeridianError.httpError(let status, _) {
+      if status == 500 && prompts.prompts.isEmpty {
+        print("  ✓ HTTP 500 is reported and does not prompt")
+        passed += 1
+      } else {
+        print("  ✗ unexpected HTTP handling")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
