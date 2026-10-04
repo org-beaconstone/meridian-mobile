@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -119,14 +122,16 @@ public actor MeridianClient {
     method: PaymentMethod,
     note: String = "",
     scenario: Scenario = .success,
-    idempotencyKey: String
+    idempotencyKey: String,
+    quoteId: String? = nil
   ) async throws -> PaymentResponse {
     let payload = PaymentRequest(
       recipientId: recipientId,
       amountMinor: amountMinor,
       method: method,
       note: note,
-      scenario: scenario
+      scenario: scenario,
+      quoteId: quoteId
     )
 
     return try await request(
@@ -151,6 +156,20 @@ public actor MeridianClient {
       path: "/budgets",
       body: payload
     )
+  }
+
+  /// POST /fx/quote — lock a cross-currency rate. The review sheet counts down at most 60 seconds.
+  public func requestFxQuote(
+    sourceCurrency: String,
+    targetCurrency: String,
+    amountMinor: Int
+  ) async throws -> FxQuote {
+    let payload = FxQuoteRequest(
+      sourceCurrency: sourceCurrency,
+      targetCurrency: targetCurrency,
+      amountMinor: amountMinor
+    )
+    return try await request(method: "POST", path: "/fx/quote", body: payload)
   }
 
   /// POST /reset - Reset session state

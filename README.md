@@ -40,6 +40,10 @@ gradle :app:assembleDebug
 
 Android emulator base URL: `http://10.0.2.2:8080/api/v1`. iOS simulator/macOS: `http://127.0.0.1:8080/api/v1`. Configure the same room as the web client. Release Android manifest disallows cleartext; debug enables it for local rehearsal.
 
+## Foreign exchange rate lock
+
+Cross-currency review (GBP account to EUR recipient) sends `POST /api/v1/fx/quote` with `sourceCurrency`, `targetCurrency` and the integer GBP `amountMinor`. The review sheet shows the locked rate and a live countdown of at most 60 seconds. When that lock expires, confirmation stays disabled until the customer refreshes the rate in place; amount, recipient, reference, method and the payment idempotency key are left as entered. A successful quote’s `quoteId` is sent on the following `POST /api/v1/payments`. Same-currency GBP payments omit `quoteId`. If the quote call fails, the sheet shows retry guidance and does not invent a rate. The published Java contract does not yet document `/fx/quote`.
+
 ## Deliberate baseline
 
 Payment methods are hardcoded to Adyen/card and Worldpay/bank in native UI. This preserves the documented mobile configuration gap rather than quietly implementing the future provider change. No real provider calls, account credentials, SCA, or production authentication exist here. A room ID is a synthetic-data partition, not a security boundary.

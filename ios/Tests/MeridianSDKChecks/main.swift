@@ -1,5 +1,98 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
+
+final class FxQuoteURLProtocol: URLProtocol {
+  static var handler: ((URLRequest) -> (Int, Data))?
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    guard let handler = Self.handler else {
+      client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+      return
+    }
+    let (status, data) = handler(request)
+    let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: data)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+}
+
+private func runFxQuoteHttpCheck() -> Bool {
+  final class Box: @unchecked Sendable {
+    var quoteBody: [String: Any] = [:]
+    var paymentBody: [String: Any] = [:]
+    var quoteSession = ""
+    var paymentQuoteId = ""
+    var paymentKey = ""
+  }
+  let box = Box()
+  let config = URLSessionConfiguration.ephemeral
+  config.protocolClasses = [FxQuoteURLProtocol.self]
+  let session = URLSession(configuration: config)
+  FxQuoteURLProtocol.handler = { request in
+    let path = request.url?.path ?? ""
+    let rawBody: Data = {
+      if let body = request.httpBody { return body }
+      guard let stream = request.httpBodyStream else { return Data() }
+      stream.open()
+      defer { stream.close() }
+      var data = Data()
+      let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 1024)
+      defer { buffer.deallocate() }
+      while stream.hasBytesAvailable {
+        let count = stream.read(buffer, maxLength: 1024)
+        if count <= 0 { break }
+        data.append(buffer, count: count)
+      }
+      return data
+    }()
+    let body = (try? JSONSerialization.jsonObject(with: rawBody) as? [String: Any]) ?? [:]
+    if path.hasSuffix("/fx/quote") {
+      box.quoteBody = body
+      box.quoteSession = request.value(forHTTPHeaderField: "X-Rehearsal-Session") ?? ""
+      let payload = #"{"quoteId":"quote-1","rate":"1.17","sourceCurrency":"GBP","targetCurrency":"EUR","sourceAmountMinor":1250,"targetAmountMinor":1463,"expiresInSeconds":60}"#
+      return (200, Data(payload.utf8))
+    }
+    box.paymentBody = body
+    box.paymentQuoteId = body["quoteId"] as? String ?? ""
+    box.paymentKey = request.value(forHTTPHeaderField: "Idempotency-Key") ?? ""
+    return (200, Data(#"{"ok":true}"#.utf8))
+  }
+  let semaphore = DispatchSemaphore(value: 0)
+  var succeeded = false
+  Task {
+    do {
+      let client = try MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "fx-room", urlSession: session)
+      let quote = try await client.requestFxQuote(sourceCurrency: "GBP", targetCurrency: "EUR", amountMinor: 1250)
+      let paid = try await client.submitPayment(
+        recipientId: "northline-studio",
+        amountMinor: 1250,
+        method: .card,
+        note: "Invoice",
+        idempotencyKey: "key-kept",
+        quoteId: quote.quoteId
+      )
+      succeeded = paid.ok
+        && box.quoteSession == "fx-room"
+        && box.quoteBody["sourceCurrency"] as? String == "GBP"
+        && box.quoteBody["targetCurrency"] as? String == "EUR"
+        && box.quoteBody["amountMinor"] as? Int == 1250
+        && box.paymentQuoteId == "quote-1"
+        && box.paymentKey == "key-kept"
+        && box.paymentBody["method"] as? String == "card"
+    } catch {
+      succeeded = false
+    }
+    semaphore.signal()
+  }
+  semaphore.wait()
+  return succeeded
+}
 
 @main
 struct MeridianSDKChecks {
@@ -341,10 +434,90 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: FX quote decodes a numeric rate and id alias
+    print("21. FX quote decoding...")
+    let quoteJson = """
+    {"id":"q-9","rate":1.1714,"amountMinor":500,"targetAmountMinor":586,"expiresInSeconds":60,"expiresAt":"2026-10-04T09:00:15Z","sourceCurrency":"GBP","targetCurrency":"EUR"}
+    """
+    do {
+      let decoded = try JSONDecoder().decode(FxQuote.self, from: Data(quoteJson.utf8))
+      let lockedAt = ISO8601DateFormatter().date(from: "2026-10-04T09:00:00Z")!
+      let locked = lockQuote(decoded, sourceCurrency: "GBP", targetCurrency: "EUR", amountMinor: 500, lockedAt: lockedAt)
+      let full = lockQuote(
+        FxQuote(quoteId: "q-full", rate: "1.17", expiresInSeconds: 120),
+        sourceCurrency: "GBP",
+        targetCurrency: "EUR",
+        amountMinor: 500,
+        lockedAt: lockedAt
+      )
+      if decoded.quoteId == "q-9" && decoded.rate == "1.1714"
+        && locked.expiresAt.timeIntervalSince(lockedAt) == 15
+        && full.remainingSeconds(at: lockedAt) == 60
+        && full.isExpired(at: lockedAt.addingTimeInterval(60))
+        && full.remainingSeconds(at: lockedAt.addingTimeInterval(59.1)) == 1
+      {
+        print("  ✓ FX quote locks for at most 60s and honours a sooner server expiry")
+        passed += 1
+      } else {
+        print("  ✗ FX quote lock mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ FX quote decoding failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 22: stale quote blocks submission; GBP does not need one
+    print("22. Rate lock submission guard...")
+    let now = ISO8601DateFormatter().date(from: "2026-10-04T09:00:00Z")!
+    let active = lockQuote(
+      FxQuote(quoteId: "quote-1", sourceCurrency: "GBP", targetCurrency: "EUR", sourceAmountMinor: 1250, rate: "1.17"),
+      sourceCurrency: "GBP",
+      targetCurrency: "EUR",
+      amountMinor: 1250,
+      lockedAt: now
+    )
+    let missing = rateLockBlockReason(sourceCurrency: "GBP", targetCurrency: "EUR", amountMinor: 1250, quote: nil, now: now)
+    let expired = rateLockBlockReason(sourceCurrency: "GBP", targetCurrency: "EUR", amountMinor: 1250, quote: active, now: now.addingTimeInterval(60))
+    let gbp = rateLockBlockReason(sourceCurrency: "GBP", targetCurrency: "GBP", amountMinor: 1250, quote: nil, now: now)
+    if missing == FxCopy.unavailable && expired == FxCopy.expired && gbp == nil {
+      print("  ✓ Missing and expired locks block cross-currency confirmation")
+      passed += 1
+    } else {
+      print("  ✗ Submission guard mismatch")
+      failed += 1
+    }
+
+    // CHECK 23: payment JSON attaches quoteId only when present
+    print("23. Payment payload quoteId...")
+    let withQuote = PaymentRequest(recipientId: "northline-studio", amountMinor: 1250, method: .card, note: "Invoice", scenario: .success, quoteId: "quote-1")
+    let withoutQuote = PaymentRequest(recipientId: "northline-studio", amountMinor: 1250, method: .bank, note: "Invoice", scenario: .success)
+    let withObject = try? JSONSerialization.jsonObject(with: JSONEncoder().encode(withQuote)) as? [String: Any]
+    let withoutObject = try? JSONSerialization.jsonObject(with: JSONEncoder().encode(withoutQuote)) as? [String: Any]
+    if withObject?["quoteId"] as? String == "quote-1" && withoutObject?["quoteId"] == nil {
+      print("  ✓ quoteId is attached only for a locked cross-currency payment")
+      passed += 1
+    } else {
+      print("  ✗ Payment payload quoteId mismatch")
+      failed += 1
+    }
+
+    // CHECK 24: POST /fx/quote sends source and target currencies on the shared session
+    print("24. FX quote HTTP request...")
+    let httpOk = runFxQuoteHttpCheck()
+    if httpOk {
+      print("  ✓ POST /fx/quote carries currencies, amount and session, and payment keeps quoteId")
+      passed += 1
+    } else {
+      print("  ✗ FX quote HTTP request mismatch")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

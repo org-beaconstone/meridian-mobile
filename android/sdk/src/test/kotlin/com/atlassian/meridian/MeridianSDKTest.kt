@@ -5,6 +5,8 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
+import java.net.InetSocketAddress
+import com.sun.net.httpserver.HttpServer
 
 class MeridianSDKTest {
   private val mapper = ObjectMapper().registerKotlinModule()
@@ -370,6 +372,96 @@ class MeridianSDKTest {
 
       // Verify only one idempotency key was used
       assertEquals(1, seenKeys.size)
+    } finally {
+      server.stop(0)
+    }
+  }
+
+  @Test
+  fun testFxQuoteLockAndPaymentQuoteId() {
+    val node = mapper.readTree(
+      """
+      {"id":"q-9","rate":1.1714,"amountMinor":500,"expiresInSeconds":120,"expiresAt":"2026-10-04T09:00:15Z","sourceCurrency":"GBP","targetCurrency":"EUR"}
+      """.trimIndent()
+    )
+    val quote = parseFxQuote(node)
+    assertEquals("q-9", quote.quoteId)
+    assertEquals("1.1714", quote.rate)
+    val lockedAt = 1_791_104_400_000L
+    val sooner = lockQuote(quote, "GBP", "EUR", 500, lockedAt)
+    assertEquals(15_000L, sooner.expiresAtEpochMs - lockedAt)
+    val full = lockQuote(
+      quote.copy(expiresInSeconds = 120, serverExpiresAtEpochMs = null, quoteId = "q-full"),
+      "GBP",
+      "EUR",
+      500,
+      lockedAt,
+    )
+    assertEquals(60, full.remainingSeconds(lockedAt))
+    assertEquals(0, full.remainingSeconds(lockedAt + 60_000))
+    assertEquals(FxCopy.unavailable, rateLockBlockReason("GBP", "EUR", 500, null, lockedAt))
+    assertEquals(FxCopy.expired, rateLockBlockReason("GBP", "EUR", 500, full, lockedAt + 60_000))
+    assertNull(rateLockBlockReason("GBP", "GBP", 500, null, lockedAt))
+
+    val withQuote = mapper.writeValueAsString(
+      PaymentRequest("northline-studio", 500, "card", "Invoice", "success", "quote-1")
+    )
+    val withoutQuote = mapper.writeValueAsString(
+      PaymentRequest("northline-studio", 500, "bank", "Invoice", "success", null)
+    )
+    assertTrue(withQuote.contains("\"quoteId\":\"quote-1\""))
+    assertFalse(withoutQuote.contains("quoteId"))
+  }
+
+  @Test
+  fun testFxQuoteHttpRequestKeepsSessionAndQuoteId() {
+    val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    val port = server.address.port
+    var quoteBody = ""
+    var quoteSession = ""
+    var paymentBody = ""
+    var paymentKey = ""
+    server.createContext("/api/v1/fx/quote") { exchange ->
+      quoteSession = exchange.requestHeaders.getFirst("X-Rehearsal-Session") ?: ""
+      quoteBody = exchange.requestBody.bufferedReader().use { it.readText() }
+      val response = """{"quoteId":"quote-1","rate":"1.17","sourceCurrency":"GBP","targetCurrency":"EUR","sourceAmountMinor":1250,"targetAmountMinor":1463,"expiresInSeconds":60}"""
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, response.toByteArray().size.toLong())
+      exchange.responseBody.write(response.toByteArray())
+      exchange.close()
+    }
+    server.createContext("/api/v1/payments") { exchange ->
+      paymentKey = exchange.requestHeaders.getFirst("Idempotency-Key") ?: ""
+      paymentBody = exchange.requestBody.bufferedReader().use { it.readText() }
+      val response = """{"ok":true}"""
+      exchange.responseHeaders.add("Content-Type", "application/json")
+      exchange.sendResponseHeaders(200, response.toByteArray().size.toLong())
+      exchange.responseBody.write(response.toByteArray())
+      exchange.close()
+    }
+    server.start()
+    try {
+      val client = MeridianClient("http://127.0.0.1:$port/api/v1", "fx-room")
+      val quote = runBlocking { client.requestFxQuote("GBP", "EUR", 1250) }
+      val paid = runBlocking {
+        client.submitPayment(
+          recipientId = "northline-studio",
+          amountMinor = 1250,
+          method = PaymentMethod.card,
+          note = "Invoice",
+          idempotencyKey = "key-kept",
+          quoteId = quote.quoteId,
+        )
+      }
+      assertTrue(paid.ok)
+      assertEquals("fx-room", quoteSession)
+      assertTrue(quoteBody.contains("\"sourceCurrency\":\"GBP\""))
+      assertTrue(quoteBody.contains("\"targetCurrency\":\"EUR\""))
+      assertTrue(quoteBody.contains("\"amountMinor\":1250"))
+      assertEquals("quote-1", quote.quoteId)
+      assertTrue(paymentBody.contains("\"quoteId\":\"quote-1\""))
+      assertTrue(paymentBody.contains("\"method\":\"card\""))
+      assertEquals("key-kept", paymentKey)
     } finally {
       server.stop(0)
     }

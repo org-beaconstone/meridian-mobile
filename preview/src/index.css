@@ -379,6 +379,24 @@ legend {
 .mobile-review > span {
   font-size: 12px;
 }
+.rate-lock {
+  margin: 8px 0 4px;
+}
+.rate-lock p {
+  margin-bottom: 8px;
+}
+.rate-lock-rate {
+  font-weight: 600;
+  color: #142c35;
+}
+.rate-lock progress {
+  width: 100%;
+  height: 10px;
+  accent-color: #1868db;
+}
+.rate-lock progress.expired {
+  accent-color: #ae2a19;
+}
 .mobile-success {
   text-align: center;
   padding: 15px 0;

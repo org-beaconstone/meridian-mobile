@@ -210,19 +210,52 @@ public struct PaymentRequest: Codable {
   public let method: PaymentMethod
   public let note: String
   public let scenario: Scenario
+  /// Present only for a cross-currency payment that still holds a rate lock.
+  public let quoteId: String?
 
   public init(
     recipientId: String,
     amountMinor: Int,
     method: PaymentMethod,
     note: String,
-    scenario: Scenario
+    scenario: Scenario,
+    quoteId: String? = nil
   ) {
     self.recipientId = recipientId
     self.amountMinor = amountMinor
     self.method = method
     self.note = note
     self.scenario = scenario
+    self.quoteId = quoteId
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case recipientId
+    case amountMinor
+    case method
+    case note
+    case scenario
+    case quoteId
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(recipientId, forKey: .recipientId)
+    try container.encode(amountMinor, forKey: .amountMinor)
+    try container.encode(method, forKey: .method)
+    try container.encode(note, forKey: .note)
+    try container.encode(scenario, forKey: .scenario)
+    try container.encodeIfPresent(quoteId, forKey: .quoteId)
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    recipientId = try container.decode(String.self, forKey: .recipientId)
+    amountMinor = try container.decode(Int.self, forKey: .amountMinor)
+    method = try container.decode(PaymentMethod.self, forKey: .method)
+    note = try container.decode(String.self, forKey: .note)
+    scenario = try container.decode(Scenario.self, forKey: .scenario)
+    quoteId = try container.decodeIfPresent(String.self, forKey: .quoteId)
   }
 }
 

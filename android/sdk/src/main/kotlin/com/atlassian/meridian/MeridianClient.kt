@@ -1,5 +1,6 @@
 package com.atlassian.meridian
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
@@ -143,6 +144,7 @@ class MeridianClient(
     note: String = "",
     scenario: Scenario = Scenario.success,
     idempotencyKey: String,
+    quoteId: String? = null,
   ): PaymentResponse {
     val payload = PaymentRequest(
       recipientId = recipientId,
@@ -150,6 +152,7 @@ class MeridianClient(
       method = method.name,
       note = note,
       scenario = scenario.name,
+      quoteId = quoteId,
     )
 
     return request(
@@ -177,6 +180,28 @@ class MeridianClient(
       payload,
       responseType = BudgetResponse::class.java,
     )
+  }
+
+  /**
+   * POST /fx/quote — lock a cross-currency rate. The review sheet counts down at most 60 seconds.
+   */
+  suspend fun requestFxQuote(
+    sourceCurrency: String,
+    targetCurrency: String,
+    amountMinor: Int,
+  ): FxQuote {
+    val payload = FxQuoteRequest(
+      sourceCurrency = sourceCurrency,
+      targetCurrency = targetCurrency,
+      amountMinor = amountMinor,
+    )
+    val node = request(
+      "POST",
+      "/fx/quote",
+      payload,
+      responseType = JsonNode::class.java,
+    )
+    return parseFxQuote(node)
   }
 
   /**
