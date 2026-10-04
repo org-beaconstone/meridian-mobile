@@ -10,9 +10,11 @@ import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
@@ -34,8 +36,9 @@ class MainActivity : ComponentActivity() {
   var method by remember { mutableStateOf(PaymentMethod.card) }
   var review by remember { mutableStateOf(false) }
   var busy by remember { mutableStateOf(false) }
-  var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
+  var transactionId by remember { mutableStateOf<String?>(null) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
+  val context = LocalContext.current
   var revision by remember { mutableStateOf(0) }
   LaunchedEffect(client) {
     val current=client
@@ -43,7 +46,7 @@ class MainActivity : ComponentActivity() {
       val started=revision
       if(!busy) try {
         val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
+        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions; if(!review) message="Connected to shared Java API"}
       } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
       delay(2000)
     }
@@ -55,7 +58,25 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {
+        val keys=IdempotencyKeyManager(FileIdempotencyStore(FileIdempotencyStore.fileFor(File(context.filesDir, "meridian"), room)))
+        client=MeridianClient(base,room,keys)
+        state=null;catalog=null;revision++
+        val inflight=keys.activeRecords()
+        if(inflight.size==1){
+          val record=inflight[0]
+          transactionId=record.transactionId
+          val attempt=record.fingerprint?.let { PaymentAttempt.fromFingerprint(it) }
+          if(attempt!=null){
+            recipient=attempt.recipientId
+            amount=amountField(attempt.amountMinor)
+            note=attempt.note
+            method=runCatching { PaymentMethod.valueOf(attempt.method) }.getOrDefault(PaymentMethod.card)
+            review=true
+            message="A payment is still in progress. Confirm retries the same idempotency key."
+          } else {review=false;message="Connected to shared Java API"}
+        } else {transactionId=null;review=false}
+      }catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
@@ -71,16 +92,51 @@ class MainActivity : ComponentActivity() {
       // Intentional two-provider native baseline; changing it requires an app release.
       Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
       Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
-      if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
+      if(!review) Button(onClick={
+        val parsed=parseAmount(amount); val active=client
+        if(parsed.first==null)message=parsed.second?:"Invalid amount"
+        else if(active==null)message="Connect before reviewing"
+        else try {
+          val id=UUID.randomUUID().toString()
+          transactionId=id
+          active.preparePayment(id, recipient, parsed.first!!, method, note)
+          review=true
+          message="Review before confirming. No real money moves."
+        } catch(e:Exception){message=e.message?:"Unable to start payment"}
+      },enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")
-        Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
-            if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
-            else message=result.error?:"Awaiting confirmation. Retry the same payment."
-          }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
-        }}},enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
-        TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
+        Button(onClick={
+          val active=client; val minor=parseAmount(amount).first; val tx=transactionId
+          if(active!=null&&minor!=null&&tx!=null&&!busy){busy=true;revision++;scope.launch{
+            try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,transactionId=tx)
+              if(result.ok){state=result.state;review=false;amount="";note="";transactionId=null;message="Demo payment complete"}
+              else message=result.error?:"Awaiting confirmation. Retry the same payment."
+            } catch(e:MeridianError.IdempotencyKeyExpired){
+              active.cancelTransaction(e.transactionId); transactionId=null; review=false
+              message="This payment key expired after 24 hours. Review the payment again before retrying."
+            } catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}
+            finally{revision++;busy=false}
+          }}
+        },enabled=!busy){Text(if(busy)"Confirming…" else "Confirm payment")}
+        TextButton(onClick={
+          val active=client; val tx=transactionId
+          if(active!=null&&tx!=null&&!busy){busy=true;revision++;scope.launch{
+            try {val result=active.submitChallenge(tx, recipient, parseAmount(amount).first ?: return@launch, method, note)
+              if(result.ok){state=result.state;review=false;amount="";note="";transactionId=null;message="Demo payment complete"}
+              else message=result.error?:"Challenge is still pending. Retry keeps the same key."
+            } catch(e:MeridianError.IdempotencyKeyExpired){
+              active.cancelTransaction(e.transactionId); transactionId=null; review=false
+              message="This payment key expired after 24 hours. Review the payment again before retrying."
+            } catch(e:Exception){message="Outcome may be unknown: ${e.message}. Challenge retry keeps the same key."}
+            finally{revision++;busy=false}
+          }}
+        },enabled=!busy){Text("Submit challenge retry")}
+        TextButton(onClick={
+          transactionId?.let { id -> client?.cancelTransaction(id) }
+          transactionId=null
+          review=false
+        },enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
       current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
@@ -88,4 +144,10 @@ class MainActivity : ComponentActivity() {
       current.budgets.forEach {budget->Text("${budget.category} · ${money(budget.limit)}")}
     }
   }
+}
+
+private fun amountField(pence: Int): String {
+  val pounds = pence / 100
+  val remainder = kotlin.math.abs(pence % 100)
+  return "$pounds.${remainder.toString().padStart(2, '0')}"
 }

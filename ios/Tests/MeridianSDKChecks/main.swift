@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
@@ -341,13 +344,191 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let idempotency = runIdempotencyChecks()
+    passed += idempotency.passed
+    failed += idempotency.failed
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+
+  static func runIdempotencyChecks() -> (passed: Int, failed: Int) {
+    var passed = 0
+    var failed = 0
+    func check(_ name: String, _ ok: Bool) {
+      if ok {
+        print("  ✓ \(name)")
+        passed += 1
+      } else {
+        print("  ✗ \(name)")
+        failed += 1
+      }
+    }
+
+    print("21. UUID v4 shape and uniqueness...")
+    let keys = (0..<32).map { _ in IdempotencyKeyManager.secureUuidV4() }
+    check("32 distinct UUID v4 keys", Set(keys).count == 32 && keys.allSatisfy(IdempotencyKeyManager.isUuidV4))
+
+    print("22. TTL is 24 hours...")
+    check("ttl is 86400000 ms", IdempotencyKeyManager.twentyFourHoursMillis == 86_400_000)
+
+    print("23. retry and challenge reuse one key...")
+    var now: Int64 = 1_000
+    var generated = 0
+    let manager = try! IdempotencyKeyManager(
+      store: MemoryIdempotencyStore(),
+      clock: { now },
+      uuidGenerator: {
+        generated += 1
+        return String(format: "00000000-0000-4000-8000-%012d", generated)
+      }
+    )
+    let attempt = PaymentAttempt(recipientId: "rec-1", amountMinor: 100, method: "card", note: "note", scenario: "success")
+    let key = try! manager.begin(transactionId: "tx-1", fingerprint: attempt.fingerprint())
+    let retried = try! manager.keyForRetry(transactionId: "tx-1", fingerprint: attempt.fingerprint())
+    let challenged = try! manager.keyForChallenge(transactionId: "tx-1", fingerprint: attempt.fingerprint())
+    check("one generated key reused", key == retried && key == challenged && generated == 1)
+
+    print("24. settle and cancel purge the cache...")
+    try! manager.begin(transactionId: "other")
+    try! manager.settle(transactionId: "tx-1")
+    try! manager.cancel(transactionId: "other")
+    var missing = false
+    do { _ = try manager.keyForRetry(transactionId: "tx-1") } catch MeridianError.missingIdempotencyKey(_) { missing = true } catch { missing = false }
+    check("purged keys are gone", manager.storedRecords().isEmpty && missing)
+
+    print("25. 24-hour expiry blocks reuse...")
+    let held = try! manager.begin(transactionId: "aging", fingerprint: attempt.fingerprint())
+    now = 1_000 + IdempotencyKeyManager.twentyFourHoursMillis - 1
+    let stillValid = try! manager.keyForRetry(transactionId: "aging", fingerprint: attempt.fingerprint()) == held
+    now = 1_000 + IdempotencyKeyManager.twentyFourHoursMillis
+    var expired = false
+    do { _ = try manager.keyForChallenge(transactionId: "aging") } catch MeridianError.idempotencyKeyExpired(_) { expired = true } catch { expired = false }
+    check("expired key is retained but not returned", stillValid && expired && manager.activeKey(transactionId: "aging") == nil && manager.storedRecords().count == 1)
+
+    print("26. fingerprint mismatch keeps the original key...")
+    now = 50
+    let bound = try! IdempotencyKeyManager(store: MemoryIdempotencyStore(), clock: { now })
+    let original = PaymentAttempt(recipientId: "rec-1", amountMinor: 100, method: "card", note: "note", scenario: "success")
+    let boundKey = try! bound.begin(transactionId: "tx-1", fingerprint: original.fingerprint())
+    let changed = PaymentAttempt(recipientId: "rec-1", amountMinor: 200, method: "card", note: "note", scenario: "success")
+    var mismatched = false
+    do { _ = try bound.keyForRetry(transactionId: "tx-1", fingerprint: changed.fingerprint()) } catch MeridianError.validationError(_) { mismatched = true } catch { mismatched = false }
+    let unchanged = try! bound.keyForChallenge(transactionId: "tx-1", fingerprint: original.fingerprint())
+    check("mismatch does not rotate the key", mismatched && unchanged == boundKey)
+
+    print("27. fingerprint round trip...")
+    let noted = PaymentAttempt(recipientId: "northline-studio", amountMinor: 2599, method: "card", note: "line\\one\u{1f}next", scenario: "success")
+    check("note text survives the fingerprint", PaymentAttempt.fromFingerprint(noted.fingerprint()) == noted)
+
+    print("28. file store reloads the same key...")
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("meridian-idempotency-\(UUID().uuidString)", isDirectory: true)
+    try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let file = FileIdempotencyStore.fileURL(directory: directory, sessionId: "room/1")
+    let first = try! IdempotencyKeyManager(store: FileIdempotencyStore(fileURL: file), clock: { 4_000 })
+    let stored = try! first.begin(transactionId: "tx-9", fingerprint: original.fingerprint())
+    let second = try! IdempotencyKeyManager(store: FileIdempotencyStore(fileURL: file), clock: { 4_000 })
+    let reloaded = try! second.keyForRetry(transactionId: "tx-9", fingerprint: original.fingerprint())
+    try! second.settle(transactionId: "tx-9")
+    let third = try! IdempotencyKeyManager(store: FileIdempotencyStore(fileURL: file), clock: { 4_000 })
+    check("persisted key reloads and settle removes it", stored == reloaded && third.storedRecords().isEmpty)
+    try? FileManager.default.removeItem(at: directory)
+
+    print("29. managed POST /payments keeps one header across retry and challenge...")
+    let transport = runTransportCheck()
+    check("header, retry, challenge, expiry and settlement", transport)
+
+    return (passed, failed)
+  }
+
+  static func runTransportCheck() -> Bool {
+    final class PaymentCapture: URLProtocol {
+      static let gate = NSLock()
+      static var keys: [String] = []
+      static var hits = 0
+      override class func canInit(with request: URLRequest) -> Bool { true }
+      override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+      override func startLoading() {
+        let header = request.value(forHTTPHeaderField: "Idempotency-Key") ?? ""
+        PaymentCapture.gate.lock()
+        PaymentCapture.keys.append(header)
+        PaymentCapture.hits += 1
+        let hit = PaymentCapture.hits
+        PaymentCapture.gate.unlock()
+        let pending = hit < 4
+        let body = pending
+          ? #"{"ok":false,"code":"PAYMENT_PENDING","paymentId":"pay-1","error":"Awaiting confirmation"}"#
+          : #"{"ok":true,"paymentId":"pay-1","transaction":{"id":"txn-1","reference":"r","recipientId":"rec-1","name":"Northline","category":"Shopping","amount":100,"date":"2026-10-04","provider":"adyen","method":"card","status":"completed","note":""}}"#
+        let response = HTTPURLResponse(
+          url: request.url!,
+          statusCode: pending ? 202 : 200,
+          httpVersion: "HTTP/1.1",
+          headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+      }
+      override func stopLoading() {}
+    }
+
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [PaymentCapture.self]
+    let session = URLSession(configuration: config)
+    var generated = 0
+    let manager = try! IdempotencyKeyManager(
+      store: MemoryIdempotencyStore(),
+      clock: { 9_000 },
+      uuidGenerator: {
+        generated += 1
+        return String(format: "00000000-0000-4000-8000-%012d", generated)
+      }
+    )
+    let client = try! MeridianClient(
+      baseURL: "http://127.0.0.1:9/api/v1",
+      sessionId: "test-session",
+      urlSession: session,
+      idempotency: manager
+    )
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = Box(false)
+    Task {
+      defer { semaphore.signal() }
+      do {
+        let first = try await client.submitPayment(recipientId: "rec-1", amountMinor: 100, method: .card, transactionId: "local-1")
+        let retried = try await client.retryPayment(transactionId: "local-1", recipientId: "rec-1", amountMinor: 100, method: .card)
+        let challenged = try await client.submitChallenge(transactionId: "local-1", recipientId: "rec-1", amountMinor: 100, method: .card)
+        let settled = try await client.submitPayment(recipientId: "rec-1", amountMinor: 100, method: .card, transactionId: "local-1")
+        var missing = false
+        do { _ = try await client.retryPayment(transactionId: "local-1", recipientId: "rec-1", amountMinor: 100, method: .card) } catch MeridianError.missingIdempotencyKey(_) { missing = true } catch { missing = false }
+        let hitsAfterSettle = PaymentCapture.hits
+        try manager.begin(transactionId: "local-3", fingerprint: PaymentAttempt(recipientId: "rec-1", amountMinor: 100, method: "card", note: "", scenario: "success").fingerprint())
+        var mismatched = false
+        do { _ = try await client.retryPayment(transactionId: "local-3", recipientId: "rec-1", amountMinor: 250, method: .card) } catch MeridianError.validationError(_) { mismatched = true } catch { mismatched = false }
+        let expected = String(format: "00000000-0000-4000-8000-%012d", 1)
+        result.value = !first.ok && !retried.ok && !challenged.ok && settled.ok && missing && mismatched
+          && PaymentCapture.keys.prefix(4).allSatisfy { $0 == expected }
+          && manager.storedRecords().count == 1
+          && PaymentCapture.hits == hitsAfterSettle
+          && generated == 2
+      } catch {
+        print("  transport error: \(error)")
+        result.value = false
+      }
+    }
+    let finished = semaphore.wait(timeout: .now() + 10)
+    return finished == .success && result.value
+  }
+}
+
+private final class Box {
+  var value: Bool
+  init(_ value: Bool) { self.value = value }
 }

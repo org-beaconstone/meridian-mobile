@@ -14,7 +14,7 @@ import MeridianSDK
   @State private var amount = ""
   @State private var reference = ""
   @State private var method: PaymentMethod = .card
-  @State private var key = UUID().uuidString
+  @State private var transactionId: String?
   @State private var review = false
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
@@ -47,9 +47,10 @@ import MeridianSDK
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
-            Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
+            Button("Submit challenge retry") { Task { await challenge() } }.disabled(busy)
+            Button("Edit details") { Task { await editPayment() } }.disabled(busy)
           } else {
-            Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
+            Button("Review payment") { Task { await reviewPayment() } }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
           ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
@@ -63,22 +64,85 @@ import MeridianSDK
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
-    do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
+    generation += 1; state=nil; catalog=nil
+    do {
+      let directory = try idempotencyDirectory()
+      let store = FileIdempotencyStore(fileURL: FileIdempotencyStore.fileURL(directory: directory, sessionId: room))
+      let keys = try IdempotencyKeyManager(store: store)
+      client = try MeridianClient(baseURL: endpoint, sessionId: room, idempotency: keys)
+      let inflight = keys.activeRecords()
+      if inflight.count == 1, let record = inflight.first, let fingerprint = record.fingerprint, let attempt = PaymentAttempt.fromFingerprint(fingerprint) {
+        transactionId = record.transactionId
+        recipient = attempt.recipientId
+        amount = amountField(attempt.amountMinor)
+        reference = attempt.note
+        method = PaymentMethod(rawValue: attempt.method) ?? .card
+        review = true
+        message = "A payment is still in progress. Confirm retries the same idempotency key."
+      } else {
+        transactionId = nil
+        review = false
+      }
+      await refresh()
+    } catch { message=String(describing:error) }
+  }
+  private func reviewPayment() async {
+    let (value, error) = parseAmount(amount)
+    guard let value else { message = error ?? "Invalid amount"; return }
+    guard reference.count <= 200 else { message = "Reference is too long"; return }
+    guard let client else { message = "Connect before reviewing"; return }
+    let id = UUID().uuidString
+    do {
+      try await client.preparePayment(transactionId: id, recipientId: recipient, amountMinor: value, method: method, note: reference)
+      transactionId = id
+      review = true
+      message = "Review before confirming. No real money moves."
+    } catch { message = String(describing: error) }
+  }
+  private func editPayment() async {
+    if let client, let transactionId { try? await client.cancelTransaction(transactionId: transactionId) }
+    transactionId = nil
+    review = false
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions; if !review {message="Connected to shared Java API"}} } catch { if started==generation {message="API unavailable: \(error)"} }
   }
   private func pay() async {
-    guard let client, !busy else {return}; busy=true; generation += 1
+    await send(challenge: false)
+  }
+  private func challenge() async {
+    await send(challenge: true)
+  }
+  private func send(challenge: Bool) async {
+    guard let client, let transactionId, !busy else {return}; busy=true; generation += 1
     defer {busy=false}
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
-      if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
+      let result: PaymentResponse
+      if challenge {
+        result = try await client.submitChallenge(transactionId: transactionId, recipientId: recipient, amountMinor: minor, method: method, note: reference)
+      } else {
+        result = try await client.submitPayment(recipientId: recipient, amountMinor: minor, method: method, note: reference, transactionId: transactionId)
+      }
+      if result.ok {state=result.state;review=false;amount="";reference="";self.transactionId=nil;message="Demo payment completed. Other clients will refresh."}
       else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
+    } catch MeridianError.idempotencyKeyExpired(let id) {
+      try? await client.cancelTransaction(transactionId: id)
+      self.transactionId = nil
+      review = false
+      message = "This payment key expired after 24 hours. Review the payment again before retrying."
     } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
+  }
+  private func idempotencyDirectory() throws -> URL {
+    let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    let directory = base.appendingPathComponent("Meridian", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+  }
+  private func amountField(_ pence: Int) -> String {
+    let remainder = abs(pence % 100)
+    return "\(pence / 100).\(String(format: "%02d", remainder))"
   }
 }

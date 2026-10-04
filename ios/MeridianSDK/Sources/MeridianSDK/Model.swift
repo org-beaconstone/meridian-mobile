@@ -246,6 +246,8 @@ public enum MeridianError: LocalizedError {
   case missingSession
   case invalidAmount(String)
   case validationError(String)
+  case idempotencyKeyExpired(String)
+  case missingIdempotencyKey(String)
 
   public var errorDescription: String? {
     switch self {
@@ -263,6 +265,10 @@ public enum MeridianError: LocalizedError {
       return "Invalid amount: \(msg)"
     case let .validationError(msg):
       return "Validation error: \(msg)"
+    case let .idempotencyKeyExpired(transactionId):
+      return "Idempotency key for \(transactionId) expired after 24 hours"
+    case let .missingIdempotencyKey(transactionId):
+      return "No idempotency key is stored for \(transactionId)"
     }
   }
 }
