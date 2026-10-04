@@ -11,3 +11,5 @@ jobs:
         working-directory: ios
       - run: swift run MeridianSDKChecks
         working-directory: ios
+      - run: swift run MeridianPropertyChecks
+        working-directory: ios

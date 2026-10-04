@@ -1,0 +1,194 @@
+{
+  "state": {
+    "version": 1,
+    "balance": 1248050,
+    "transactions": [
+      {
+        "id": "txn-001",
+        "reference": "REF-20260905-001",
+        "recipientId": "birch-bloom",
+        "name": "Birch & Bloom",
+        "category": "Food & drink",
+        "amount": 3500,
+        "date": "2026-09-05",
+        "provider": "worldpay",
+        "method": "bank",
+        "status": "completed",
+        "note": "Breakfast"
+      },
+      {
+        "id": "txn-002",
+        "reference": "REF-20260907-002",
+        "recipientId": "london-transit",
+        "name": "London Transit",
+        "category": "Transport",
+        "amount": 15000,
+        "date": "2026-09-07",
+        "provider": "adyen",
+        "method": "card",
+        "status": "completed",
+        "note": "Monthly pass"
+      },
+      {
+        "id": "txn-003",
+        "reference": "REF-20260908-003",
+        "recipientId": "octavia-energy",
+        "name": "Octavia Energy",
+        "category": "Bills",
+        "amount": 80000,
+        "date": "2026-09-08",
+        "provider": "adyen",
+        "method": "card",
+        "status": "completed",
+        "note": "Utilities"
+      },
+      {
+        "id": "txn-004",
+        "reference": "REF-20260910-004",
+        "recipientId": "northline-studio",
+        "name": "Northline Studio",
+        "category": "Shopping",
+        "amount": 35000,
+        "date": "2026-09-10",
+        "provider": "adyen",
+        "method": "card",
+        "status": "completed",
+        "note": "Design software subscription"
+      },
+      {
+        "id": "txn-005",
+        "reference": "REF-20260912-005",
+        "recipientId": "maya-chen",
+        "name": "Maya Chen",
+        "category": "Lifestyle",
+        "amount": 15000,
+        "date": "2026-09-12",
+        "provider": "worldpay",
+        "method": "bank",
+        "status": "completed",
+        "note": "Weekly classes"
+      },
+      {
+        "id": "txn-006",
+        "reference": "REF-20260914-006",
+        "recipientId": "birch-bloom",
+        "name": "Birch & Bloom",
+        "category": "Food & drink",
+        "amount": 4280,
+        "date": "2026-09-14",
+        "provider": "adyen",
+        "method": "card",
+        "status": "completed",
+        "note": "Lunch"
+      },
+      {
+        "id": "txn-007",
+        "reference": "REF-20260916-007",
+        "recipientId": "northline-studio",
+        "name": "Northline Studio",
+        "category": "Shopping",
+        "amount": 25500,
+        "date": "2026-09-16",
+        "provider": "adyen",
+        "method": "card",
+        "status": "completed",
+        "note": "Art supplies"
+      },
+      {
+        "id": "txn-008",
+        "reference": "REF-20260918-008",
+        "recipientId": "london-transit",
+        "name": "London Transit",
+        "category": "Transport",
+        "amount": 6000,
+        "date": "2026-09-18",
+        "provider": "adyen",
+        "method": "card",
+        "status": "completed",
+        "note": "Taxi fare"
+      }
+    ],
+    "budgets": [
+      {
+        "category": "Shopping",
+        "limit": 100000
+      },
+      {
+        "category": "Food & drink",
+        "limit": 50000
+      },
+      {
+        "category": "Transport",
+        "limit": 50000
+      },
+      {
+        "category": "Bills",
+        "limit": 90000
+      },
+      {
+        "category": "Lifestyle",
+        "limit": 30000
+      }
+    ]
+  },
+  "recipients": [
+    {
+      "id": "northline-studio",
+      "name": "Northline Studio",
+      "initials": "NS",
+      "detail": "Design tools & materials",
+      "category": "Shopping",
+      "color": "#FF6B6B"
+    },
+    {
+      "id": "octavia-energy",
+      "name": "Octavia Energy",
+      "initials": "OE",
+      "detail": "Electricity & gas supplier",
+      "category": "Bills",
+      "color": "#4ECDC4"
+    },
+    {
+      "id": "maya-chen",
+      "name": "Maya Chen",
+      "initials": "MC",
+      "detail": "Yoga & wellness classes",
+      "category": "Lifestyle",
+      "color": "#95E1D3"
+    },
+    {
+      "id": "birch-bloom",
+      "name": "Birch & Bloom",
+      "initials": "BB",
+      "detail": "Organic café & bistro",
+      "category": "Food & drink",
+      "color": "#FFD93D"
+    },
+    {
+      "id": "london-transit",
+      "name": "London Transit",
+      "initials": "LT",
+      "detail": "Public transport & taxis",
+      "category": "Transport",
+      "color": "#6BCB77"
+    }
+  ],
+  "providers": [
+    {
+      "id": "adyen",
+      "name": "Adyen",
+      "description": "Card payment processor",
+      "methods": [
+        "card"
+      ]
+    },
+    {
+      "id": "worldpay",
+      "name": "Worldpay",
+      "description": "Bank transfer processor",
+      "methods": [
+        "bank"
+      ]
+    }
+  ]
+}

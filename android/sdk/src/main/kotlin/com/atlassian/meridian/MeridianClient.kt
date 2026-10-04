@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -16,7 +17,11 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  private val connectTimeoutMs: Int = 15000,
+  private val readTimeoutMs: Int = 15000,
 ) {
+  /** Extra attempts after an uncertain transport failure. Session and idempotency key stay the same. */
+  var maxTransportRetries: Int = 2
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
 
@@ -41,8 +46,8 @@ class MeridianClient(
 
     val connection = url.openConnection() as HttpURLConnection
     try {
-      connection.connectTimeout = 15000
-      connection.readTimeout = 15000
+      connection.connectTimeout = connectTimeoutMs
+      connection.readTimeout = readTimeoutMs
       connection.requestMethod = method
       connection.setRequestProperty("Content-Type", "application/json")
       connection.setRequestProperty("X-Rehearsal-Session", sessionId)
@@ -64,6 +69,9 @@ class MeridianClient(
 
       // Read response
       val statusCode = connection.responseCode
+      if (statusCode < 0) {
+        throw MeridianError.NetworkError("Connection closed before a response")
+      }
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
       } else {
@@ -102,6 +110,10 @@ class MeridianClient(
           )
         }
       }
+    } catch (e: MeridianError) {
+      throw e
+    } catch (e: IOException) {
+      throw MeridianError.NetworkError(e.message ?: "Network error", e)
     } finally {
       connection.disconnect()
     }
@@ -151,14 +163,23 @@ class MeridianClient(
       note = note,
       scenario = scenario.name,
     )
-
-    return request(
-      "POST",
-      "/payments",
-      payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
-      PaymentResponse::class.java,
-    )
+    val provider = providerFor(method)
+    var attempt = 0
+    while (true) {
+      refuseProviderSwitch(provider, providerFor(method))
+      try {
+        return request(
+          "POST",
+          "/payments",
+          payload,
+          mapOf("Idempotency-Key" to idempotencyKey),
+          PaymentResponse::class.java,
+        )
+      } catch (e: MeridianError.NetworkError) {
+        if (attempt >= maxTransportRetries) throw e
+        attempt += 1
+      }
+    }
   }
 
   /**
