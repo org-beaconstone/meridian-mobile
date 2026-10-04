@@ -25,6 +25,15 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  PAYMENT_SESSION_TTL_MS,
+  refreshSessionInPlace,
+  sessionOverrideFromQuery,
+  sessionPhase,
+  type SessionPhase,
+  type SessionPresence,
+} from './domain/sessionStatus';
+import { ReauthenticationDialog, SessionStatusBanner } from './components/SessionStatusBanner';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -93,7 +102,71 @@ export default function App() {
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
-    paymentKey = useRef(crypto.randomUUID());
+    paymentKey = useRef<string>(crypto.randomUUID()),
+    sessionStarted = useRef(false);
+  const [presence, setPresence] = useState<SessionPresence>('signedOut');
+  const [expiresAt, setExpiresAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  const [override, setOverride] = useState<SessionPhase | null>(() =>
+    sessionOverrideFromQuery(new URLSearchParams(window.location.search).get('session')),
+  );
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (!connected || sessionStarted.current || override) return;
+    sessionStarted.current = true;
+    if (presence === 'signedOut') {
+      setPresence('here');
+      setExpiresAt(Date.now() + PAYMENT_SESSION_TTL_MS);
+    }
+  }, [connected, override, presence]);
+  const phase = override ?? sessionPhase(presence, expiresAt, now);
+  const sessionBlocksPayment =
+    phase.kind === 'reauthenticate' || (phase.kind === 'banner' && phase.state === 'signedOut');
+  const remainingMillis = expiresAt > now ? expiresAt - now : 4 * 60 * 1000;
+  function restoreSession() {
+    const draft = {
+      recipientId: recipient,
+      amount,
+      reference: note,
+      method,
+      reviewing: step === 'review',
+      idempotencyKey: paymentKey.current,
+    };
+    const next = refreshSessionInPlace(draft, { presence, expiresAt }, Date.now());
+    setRecipient(next.draft.recipientId);
+    setAmount(next.draft.amount);
+    setNote(next.draft.reference);
+    setMethod(next.draft.method);
+    if (step !== 'done') setStep(next.draft.reviewing ? 'review' : 'details');
+    paymentKey.current = next.draft.idempotencyKey;
+    setPresence(next.session.presence);
+    setExpiresAt(next.session.expiresAt);
+    setOverride(null);
+    setNotice('Session refreshed. Payment details are unchanged.');
+    setError('');
+  }
+  function showElsewhere() {
+    setOverride(null);
+    setPresence('elsewhere');
+    if (expiresAt <= Date.now()) setExpiresAt(Date.now() + PAYMENT_SESSION_TTL_MS);
+  }
+  function showExpiring() {
+    setOverride(null);
+    setPresence('here');
+    setExpiresAt(Date.now() + 4 * 60 * 1000);
+  }
+  function showSignedOut() {
+    setOverride(null);
+    setPresence('signedOut');
+  }
+  function expireSession() {
+    setOverride(null);
+    setPresence('here');
+    setExpiresAt(Date.now() - 1000);
+  }
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -183,6 +256,10 @@ export default function App() {
   async function confirm() {
     try {
       setError('');
+      if (sessionBlocksPayment) {
+        setError('Restore the session before confirming this payment.');
+        return;
+      }
       const result = await mutate(
         '/payments',
         'POST',
@@ -208,6 +285,7 @@ export default function App() {
         Mobile web preview · Native Swift / Kotlin sources in this repo
       </div>
       <div className="mobile-shell">
+        <div className="mobile-top">
         <header className="mobile-header">
           <a
             href="#"
@@ -220,10 +298,35 @@ export default function App() {
           </a>
           <span className="avatar">AM</span>
         </header>
+        {phase.kind === 'banner' && (
+          <SessionStatusBanner
+            state={phase.state}
+            remainingMillis={remainingMillis}
+            onRefresh={restoreSession}
+          />
+        )}
+        {phase.kind === 'reauthenticate' && <ReauthenticationDialog onContinue={restoreSession} />}
+        <details className="session-rehearsal">
+          <summary>Browser companion session controls</summary>
+          <p>Preview-only. Native session status lives in the SwiftUI and Compose screens.</p>
+          <button type="button" onClick={showElsewhere}>
+            Active on another device
+          </button>
+          <button type="button" onClick={showExpiring}>
+            Expiring soon
+          </button>
+          <button type="button" onClick={showSignedOut}>
+            Sign out
+          </button>
+          <button type="button" onClick={expireSession}>
+            Expire session
+          </button>
+        </details>
         <div className="connection-bar">
           <span className={connected ? 'status-dot' : 'status-dot offline'} />
           <strong>{connected ? 'Connected API' : 'API unavailable'}</strong>
           <span>{room}</span>
+        </div>
         </div>
         <main>
           {error && (
@@ -236,7 +339,7 @@ export default function App() {
               {notice}
             </p>
           )}
-          {!state ? (
+          {!state && page !== 'Pay' ? (
             <section className="mobile-card">
               <h1>Connecting your money.</h1>
               <p>
@@ -245,7 +348,7 @@ export default function App() {
             </section>
           ) : (
             <>
-              {page === 'Home' && (
+              {state && page === 'Home' && (
                 <>
                   <div className="mobile-title">
                     <span>FRIDAY, 18 SEPTEMBER 2026</span>
@@ -373,7 +476,11 @@ export default function App() {
                           {note || 'No reference'}
                         </p>
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      <button
+                        className="primary"
+                        onClick={confirm}
+                        disabled={busy || !connected || sessionBlocksPayment}
+                      >
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
                       <button className="secondary" disabled={busy} onClick={editPayment}>
@@ -400,14 +507,14 @@ export default function App() {
                   )}
                 </section>
               )}
-              {page === 'History' && (
+              {state && page === 'History' && (
                 <section className="mobile-card">
                   <h1>Activity</h1>
                   <p>Payments across all clients in this room.</p>
                   <History items={[...state.transactions].reverse()} />
                 </section>
               )}
-              {page === 'Settings' && (
+              {state && page === 'Settings' && (
                 <section className="mobile-card">
                   <h1>Rehearsal controls</h1>
                   <label htmlFor="mobile-room">Shared room</label>
@@ -501,6 +608,20 @@ export default function App() {
                     }}
                   >
                     Reset shared demo
+                  </button>
+                  <h2>Payment session</h2>
+                  <p>The rehearsal clock drives the status banner and keeps this form.</p>
+                  <button className="secondary" type="button" disabled={busy} onClick={showElsewhere}>
+                    Active on another device
+                  </button>
+                  <button className="secondary" type="button" disabled={busy} onClick={showExpiring}>
+                    Expiring soon
+                  </button>
+                  <button className="secondary" type="button" disabled={busy} onClick={showSignedOut}>
+                    Sign out
+                  </button>
+                  <button className="secondary" type="button" disabled={busy} onClick={expireSession}>
+                    Expire session
                   </button>
                   <p className="fine-print">
                     Room IDs isolate fictional data. They are not authentication. Never enter real
