@@ -101,6 +101,8 @@ data class PaymentResponse(
   val code: String? = null,
   @JsonProperty("paymentId")
   val paymentId: String? = null,
+  val challengeToken: String? = null,
+  val challengeExpiresAt: String? = null,
 ) : Serializable
 
 data class BudgetResponse(
@@ -150,6 +152,13 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
   class ValidationError(msg: String) : MeridianError(msg)
+  /** Step-up window expired or the gateway rejected the proof. Start a new payment. */
+  class ScaReinitiate(message: String) : MeridianError(message)
+  /** User dismissed the biometric dialog. Keep the idempotency key. */
+  class ScaCancelled(message: String) : MeridianError(message)
+  class ScaMalformed(message: String) : MeridianError(message)
+  class ScaLatencyExceeded(message: String) : MeridianError(message)
+  class ScaStepUpRequired(message: String) : MeridianError(message)
 }
 
 // MARK: - Amount Formatting

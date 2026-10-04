@@ -169,6 +169,8 @@ public struct PaymentResponse: Codable {
   public let error: String?
   public let code: String?
   public let paymentId: String?
+  public let challengeToken: String?
+  public let challengeExpiresAt: String?
 
   enum CodingKeys: String, CodingKey {
     case ok
@@ -177,6 +179,8 @@ public struct PaymentResponse: Codable {
     case error
     case code
     case paymentId
+    case challengeToken
+    case challengeExpiresAt
   }
 }
 
@@ -246,6 +250,13 @@ public enum MeridianError: LocalizedError {
   case missingSession
   case invalidAmount(String)
   case validationError(String)
+  /// Step-up window expired or the gateway rejected the proof. Start a new payment.
+  case scaReinitiate(String)
+  /// User dismissed the biometric dialog. Keep the idempotency key.
+  case scaCancelled(String)
+  case scaMalformed(String)
+  case scaLatencyExceeded(String)
+  case scaStepUpRequired(String)
 
   public var errorDescription: String? {
     switch self {
@@ -263,6 +274,12 @@ public enum MeridianError: LocalizedError {
       return "Invalid amount: \(msg)"
     case let .validationError(msg):
       return "Validation error: \(msg)"
+    case let .scaReinitiate(msg),
+      let .scaCancelled(msg),
+      let .scaMalformed(msg),
+      let .scaLatencyExceeded(msg),
+      let .scaStepUpRequired(msg):
+      return msg
     }
   }
 }
