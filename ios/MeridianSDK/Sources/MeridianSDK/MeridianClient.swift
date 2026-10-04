@@ -1,19 +1,37 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+public final class RejectRedirects: NSObject, URLSessionTaskDelegate {
+  public func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
+  }
+}
 
 public actor MeridianClient {
   private let baseURL: URL
   private let sessionId: String
   private let session: URLSession
+  private let timeout: TimeInterval
 
   /// Initialize Meridian API client
   /// - Parameters:
   ///   - baseURL: API base URL (e.g., "http://localhost:8080/api/v1")
   ///   - sessionId: Rehearsal session ID (3-64 URL-safe ASCII)
   ///   - urlSession: Optional URLSession for testing
+  ///   - timeout: Per-request timeout. Catalog failures inside this limit fall back to cache.
   public init(
     baseURL: String,
     sessionId: String,
-    urlSession: URLSession = .shared
+    urlSession: URLSession? = nil,
+    timeout: TimeInterval = 15
   ) throws {
     guard !sessionId.isEmpty else {
       throw MeridianError.missingSession
@@ -35,7 +53,19 @@ public actor MeridianClient {
 
     self.baseURL = url
     self.sessionId = sessionId
-    self.session = urlSession
+    self.timeout = timeout
+    if let urlSession {
+      self.session = urlSession
+    } else {
+      let configuration = URLSessionConfiguration.ephemeral
+      configuration.timeoutIntervalForRequest = timeout
+      configuration.timeoutIntervalForResource = timeout + 5
+      configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+      configuration.urlCache = nil
+      configuration.httpCookieStorage = nil
+      configuration.httpShouldSetCookies = false
+      self.session = URLSession(configuration: configuration, delegate: RejectRedirects(), delegateQueue: nil)
+    }
   }
 
   // MARK: - Internal Request Method
@@ -44,12 +74,15 @@ public actor MeridianClient {
     method: String,
     path: String,
     body: Encodable? = nil,
-    additionalHeaders: [String: String] = [:]
+    additionalHeaders: [String: String] = [:],
+    require2xx: Bool = false
   ) async throws -> T {
-    let url = baseURL.appendingPathComponent(path)
+    let url = baseURL.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
 
     var request = URLRequest(url: url)
     request.httpMethod = method
+    request.timeoutInterval = timeout
+    request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
 
@@ -68,6 +101,11 @@ public actor MeridianClient {
 
     guard let httpResponse = response as? HTTPURLResponse else {
       throw MeridianError.networkError("Invalid response type")
+    }
+
+    if require2xx && !(200...299).contains(httpResponse.statusCode) {
+      let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw MeridianError.httpError(statusCode: httpResponse.statusCode, message: errorMsg)
     }
 
     // Check HTTP status
@@ -95,9 +133,25 @@ public actor MeridianClient {
     return try await request(method: "GET", path: "/health")
   }
 
-  /// GET /catalog - Fetch recipients and providers
+  /// GET /catalog - Fetch recipients and the Adyen/Worldpay baseline.
   public func getCatalog() async throws -> CatalogResponse {
-    return try await request(method: "GET", path: "/catalog")
+    let raw: CatalogResponse = try await request(method: "GET", path: "/catalog", require2xx: true)
+    return projectBaselineCatalog(raw)
+  }
+
+  /// GET /catalog, then the encrypted local cache when the device is offline or the API times out or returns 5xx.
+  /// One request only: a timeout never contacts another host.
+  public func loadCatalog(cache: CatalogCache) async -> CatalogLoad {
+    do {
+      let catalog = try await getCatalog()
+      cache.save(sessionId: sessionId, catalog: catalog)
+      return CatalogLoad(catalog: catalog, origin: .network)
+    } catch {
+      if catalogFailureUsesCache(error), let saved = cache.load(sessionId: sessionId) {
+        return CatalogLoad(catalog: saved, origin: .cache)
+      }
+      return CatalogLoad(catalog: nil, origin: nil)
+    }
   }
 
   /// GET /state - Fetch current bank state

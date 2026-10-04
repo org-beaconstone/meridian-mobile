@@ -13,15 +13,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    setContent { MaterialTheme(colors=lightColors(primary=Color(0xFF142C35),secondary=Color(0xFFD5B77A))) { MeridianScreen() } }
+    setContent { MaterialTheme(colors=lightColors(primary=Color(0xFF142C35),secondary=Color(0xFFD5B77A))) { MeridianScreen(File(filesDir, "catalog-cache")) } }
   }
 }
-@Composable fun MeridianScreen() {
+@Composable fun MeridianScreen(cacheDirectory: File) {
   val scope=rememberCoroutineScope()
   var base by remember { mutableStateOf("http://10.0.2.2:8080/api/v1") }
   var room by remember { mutableStateOf("meridian-rehearsal") }
@@ -37,14 +38,28 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  val catalogCache = remember(cacheDirectory) { FileEncryptedCatalogCache(cacheDirectory) }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
       val started=revision
-      if(!busy) try {
-        val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
-      } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
+      if(!busy) {
+        var fresh: BankState? = null
+        var stateError: String? = null
+        try { fresh=current.getState() } catch(e:Exception) { stateError=e.message }
+        val loaded=current.loadCatalog(catalogCache)
+        if(current===client && started==revision && !busy) {
+          if(fresh!=null) state=fresh
+          if(loaded.catalog!=null) catalog=loaded.catalog
+          message = when {
+            stateError!=null && loaded.origin!=CatalogOrigin.network -> "API unavailable: $stateError"
+            loaded.origin==CatalogOrigin.cache -> "Catalog API unavailable. Showing the saved catalog."
+            fresh!=null && loaded.catalog!=null -> "Connected to shared Java API"
+            loaded.catalog==null -> "Catalog unavailable."
+            else -> message
+          }
+        }
+      }
       delay(2000)
     }
   }
@@ -68,9 +83,15 @@ class MainActivity : ComponentActivity() {
       }
       OutlinedTextField(amount,{amount=it},label={Text("Amount (GBP)")},enabled=!review&&!busy)
       OutlinedTextField(note,{note=it.take(200)},label={Text("Reference")},enabled=!review&&!busy)
-      // Intentional two-provider native baseline; changing it requires an app release.
-      Row {RadioButton(method==PaymentMethod.card,{method=PaymentMethod.card},enabled=!review&&!busy);Text("Debit card · Adyen",Modifier.padding(top=12.dp))}
-      Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
+      // Static checkout binding. Catalog corridors are display-only and cannot add a provider.
+      ProviderId.entries.forEach { provider ->
+        Row {RadioButton(method==provider.paymentMethod(),{method=provider.paymentMethod()},enabled=!review&&!busy);Text(provider.checkoutLabel(),Modifier.padding(top=12.dp))}
+      }
+      catalog?.providers?.filter { it.id==ProviderId.adyen.name || it.id==ProviderId.worldpay.name }?.forEach { provider ->
+        provider.corridors.forEach { corridor ->
+          Text("${provider.name} · ${if(corridor.method==PaymentMethod.bank.name) "Bank payment" else "Debit card"} · ${corridor.currency}",style=MaterialTheme.typography.caption)
+        }
+      }
       if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
         Text("Confirm £$amount to $recipient")

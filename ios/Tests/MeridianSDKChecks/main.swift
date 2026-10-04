@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeridianSDK
 
 @main
@@ -341,13 +344,293 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let catalog = runCatalogChecks()
+    passed += catalog.passed
+    failed += catalog.failed
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
+}
+
+private struct CheckTally {
+  var passed = 0
+  var failed = 0
+  mutating func pass(_ name: String) {
+    print("  ✓ \(name)")
+    passed += 1
+  }
+  mutating func fail(_ name: String) {
+    print("  ✗ \(name)")
+    failed += 1
+  }
+}
+
+private final class Once<T>: @unchecked Sendable {
+  var value: T?
+}
+
+private func awaitResult<T>(_ work: @escaping () async -> T) -> T {
+  let box = Once<T>()
+  let semaphore = DispatchSemaphore(value: 0)
+  Task.detached {
+    box.value = await work()
+    semaphore.signal()
+  }
+  semaphore.wait()
+  return box.value!
+}
+
+private final class CatalogHTTPStub: URLProtocol, @unchecked Sendable {
+  struct Scripted {
+    var status: Int = 200
+    var body: Data = Data()
+    var headers: [String: String] = ["Content-Type": "application/json"]
+    var error: Error?
+  }
+  static let lock = NSLock()
+  static var script: ((URLRequest) -> Scripted)?
+  static var urls: [String] = []
+
+  static func reset() {
+    lock.lock()
+    script = nil
+    urls = []
+    lock.unlock()
+  }
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    CatalogHTTPStub.lock.lock()
+    CatalogHTTPStub.urls.append(request.url?.absoluteString ?? "")
+    let scripted = CatalogHTTPStub.script?(request)
+    CatalogHTTPStub.lock.unlock()
+    guard let scripted else {
+      client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+      return
+    }
+    if let error = scripted.error {
+      client?.urlProtocol(self, didFailWithError: error)
+      return
+    }
+    let response = HTTPURLResponse(
+      url: request.url ?? URL(string: "http://127.0.0.1/catalog")!,
+      statusCode: scripted.status,
+      httpVersion: "HTTP/1.1",
+      headerFields: scripted.headers
+    )!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(self, didLoad: scripted.body)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
+}
+
+private func stubSession() -> URLSession {
+  let configuration = URLSessionConfiguration.ephemeral
+  configuration.protocolClasses = [CatalogHTTPStub.self]
+  return URLSession(configuration: configuration, delegate: RejectRedirects(), delegateQueue: nil)
+}
+
+private func sampleCatalogJSON(extraProvider: Bool) -> Data {
+  let extra = extraProvider
+    ? #",{"id":"other","name":"Other","description":"Unbound","methods":["card"],"currencies":["GBP"]}"#
+    : ""
+  let json = """
+  {
+    "demoDate": "2026-09-18",
+    "recipients": [{"id":"northline-studio","name":"Northline Studio","initials":"NS","detail":"Design","category":"Shopping","color":"#fff"}],
+    "providers": [
+      {"id":"worldpay","name":"Worldpay","description":"Bank","methods":["bank_transfer"],"supportedCurrencies":["GBP"]},
+      {"id":"adyen","name":"Renamed","description":"Injected","methods":["card"],"currencies":["EUR","GBP"],"corridors":[{"id":"gb-card","method":"card","currency":"GBP","country":"gb"}]}\(extra)
+    ]
+  }
+  """
+  return Data(json.utf8)
+}
+
+private func runCatalogChecks() -> (passed: Int, failed: Int) {
+  var tally = CheckTally()
+  print("21. Static provider binding...")
+  let ids = ProviderId.allCases.map(\.rawValue)
+  if ids == ["adyen", "worldpay"]
+    && ProviderId.adyen.checkoutLabel == "Debit card · Adyen"
+    && ProviderId.worldpay.checkoutLabel == "Bank payment · Worldpay"
+    && ProviderId.adyen.paymentMethod == .card
+    && ProviderId.worldpay.paymentMethod == .bank {
+    tally.pass("ProviderId remains Adyen card and Worldpay bank")
+  } else {
+    tally.fail("ProviderId binding changed: \(ids)")
+  }
+
+  print("22. Dynamic provider decode is not the static enum...")
+  let unknown = Data(#"{"id":"other","name":"Other","description":"x","methods":["card"]}"#.utf8)
+  do {
+    _ = try JSONDecoder().decode(Provider.self, from: unknown)
+    tally.fail("Static Provider accepted an unbound id")
+  } catch {
+    tally.pass("Static Provider rejected unbound id")
+  }
+  do {
+    let dynamic = try JSONDecoder().decode(DynamicProvider.self, from: unknown)
+    if dynamic.id == "other" {
+      tally.pass("DynamicProvider decoded unbound id")
+    } else {
+      tally.fail("DynamicProvider id mismatch")
+    }
+  } catch {
+    tally.fail("DynamicProvider decode failed: \(error)")
+  }
+
+  print("23. Baseline projection...")
+  let decoded = try? JSONDecoder().decode(CatalogResponse.self, from: sampleCatalogJSON(extraProvider: true))
+  let projected = decoded.map(projectBaselineCatalog)
+  if projected?.providers.map(\.id) == ["adyen", "worldpay"]
+    && projected?.providers.first?.name == "Adyen"
+    && projected?.providers.first?.currencies == ["GBP"]
+    && projected?.providers.first?.corridors.first?.method == "card"
+    && projected?.providers.first?.corridors.first?.id == "gb-card"
+    && projected?.providers.last?.corridors.first?.method == "bank"
+    && projected?.recipients.count == 1
+    && projected?.providers.contains(where: { $0.id == "other" || $0.name == "Other" || $0.name == "Renamed" }) == false {
+    tally.pass("Projection keeps Adyen card and Worldpay bank in GBP")
+  } else {
+    tally.fail("Projection mismatch: \(String(describing: projected?.providers.map(\.id)))")
+  }
+
+  guard let seeded = projected else {
+    tally.fail("Projected catalog missing")
+    return (tally.passed, tally.failed)
+  }
+
+  print("24. Encrypted catalog cache...")
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent("meridian-catalog-\(UUID().uuidString)")
+  do {
+    let cache = try FileEncryptedCatalogCache(directory: directory, useKeychain: false)
+    cache.save(sessionId: "room-a", catalog: seeded)
+    let blob = cache.ciphertext(sessionId: "room-a") ?? Data()
+    let stored = String(data: blob, encoding: .utf8) ?? ""
+    let restored = try FileEncryptedCatalogCache(directory: directory, useKeychain: false)
+    let loaded = restored.load(sessionId: "room-a")
+    if loaded?.recipients.first?.name == "Northline Studio"
+      && loaded?.providers.map(\.id) == ["adyen", "worldpay"]
+      && restored.load(sessionId: "room-b") == nil
+      && !stored.contains("Northline")
+      && !stored.contains("adyen")
+      && !blob.isEmpty {
+      tally.pass("Encrypted cache round-trip stays opaque")
+    } else {
+      tally.fail("Encrypted cache round-trip failed")
+    }
+  } catch {
+    tally.fail("Encrypted cache setup failed: \(error)")
+  }
+
+  print("25. Catalog network projection and cache...")
+  CatalogHTTPStub.reset()
+  CatalogHTTPStub.script = { request in
+    guard request.value(forHTTPHeaderField: "X-Rehearsal-Session") == "room-1",
+          request.timeoutInterval == 15 else {
+      return CatalogHTTPStub.Scripted(status: 400)
+    }
+    return CatalogHTTPStub.Scripted(status: 200, body: sampleCatalogJSON(extraProvider: true))
+  }
+  let network = awaitResult { () -> CatalogLoad in
+    let client = try! MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "room-1", urlSession: stubSession())
+    let cache = MemoryEncryptedCatalogCache()
+    let loaded = await client.loadCatalog(cache: cache)
+    let blob = cache.ciphertext(sessionId: "room-1") ?? Data()
+    let stored = String(data: blob, encoding: .utf8) ?? ""
+    if blob.isEmpty || stored.contains("Other") || stored.contains("Northline") {
+      return CatalogLoad(catalog: nil, origin: nil)
+    }
+    return loaded
+  }
+  let urls = CatalogHTTPStub.urls
+  if network.origin == .network
+    && network.catalog?.providers.map(\.id) == ["adyen", "worldpay"]
+    && network.catalog?.providers.first?.corridors.first?.country == "GB"
+    && urls.count == 1
+    && urls.first?.hasSuffix("/api/v1/catalog") == true {
+    tally.pass("GET /catalog cached one projected response")
+  } else {
+    tally.fail("Network catalog failed: \(urls)")
+  }
+
+  print("26. HTTP 500 uses the saved catalog once...")
+  CatalogHTTPStub.reset()
+  let serverFailure = awaitResult { () -> (CatalogLoad, Int) in
+    let cache = MemoryEncryptedCatalogCache()
+    cache.save(sessionId: "room-1", catalog: seeded)
+    CatalogHTTPStub.script = { _ in CatalogHTTPStub.Scripted(status: 500, body: Data("{\"error\":\"down\"}".utf8)) }
+    let client = try! MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "room-1", urlSession: stubSession())
+    let loaded = await client.loadCatalog(cache: cache)
+    return (loaded, CatalogHTTPStub.urls.count)
+  }
+  if serverFailure.0.origin == .cache
+    && serverFailure.0.catalog?.recipients.first?.name == "Northline Studio"
+    && serverFailure.1 == 1 {
+    tally.pass("HTTP 500 fell back to cache without a second request")
+  } else {
+    tally.fail("HTTP 500 fallback failed")
+  }
+
+  print("27. Timeout uses the saved catalog once...")
+  CatalogHTTPStub.reset()
+  let timedOut = awaitResult { () -> (CatalogLoad, Int) in
+    let cache = MemoryEncryptedCatalogCache()
+    cache.save(sessionId: "room-1", catalog: seeded)
+    CatalogHTTPStub.script = { _ in CatalogHTTPStub.Scripted(error: URLError(.timedOut)) }
+    let client = try! MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "room-1", urlSession: stubSession())
+    let loaded = await client.loadCatalog(cache: cache)
+    return (loaded, CatalogHTTPStub.urls.count)
+  }
+  if timedOut.0.origin == .cache && timedOut.1 == 1 {
+    tally.pass("Timeout fell back to cache without another host")
+  } else {
+    tally.fail("Timeout fallback failed")
+  }
+
+  print("28. HTTP 400 does not use the cache...")
+  CatalogHTTPStub.reset()
+  let rejected = awaitResult { () -> CatalogLoad in
+    let cache = MemoryEncryptedCatalogCache()
+    cache.save(sessionId: "room-1", catalog: seeded)
+    CatalogHTTPStub.script = { _ in CatalogHTTPStub.Scripted(status: 400, body: Data("{\"error\":\"bad\"}".utf8)) }
+    let client = try! MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "room-1", urlSession: stubSession())
+    return await client.loadCatalog(cache: cache)
+  }
+  if rejected.catalog == nil && rejected.origin == nil {
+    tally.pass("HTTP 400 did not substitute the cache")
+  } else {
+    tally.fail("HTTP 400 unexpectedly returned a catalog")
+  }
+
+  print("29. Redirect is not followed...")
+  CatalogHTTPStub.reset()
+  let redirected = awaitResult { () -> (CatalogLoad, [String]) in
+    CatalogHTTPStub.script = { _ in
+      CatalogHTTPStub.Scripted(status: 302, headers: ["Location": "http://evil.example/collect", "Content-Type": "application/json"])
+    }
+    let client = try! MeridianClient(baseURL: "http://127.0.0.1:9/api/v1", sessionId: "room-1", urlSession: stubSession())
+    let loaded = await client.loadCatalog(cache: MemoryEncryptedCatalogCache())
+    return (loaded, CatalogHTTPStub.urls)
+  }
+  if redirected.0.catalog == nil
+    && redirected.1.count == 1
+    && redirected.1.allSatisfy({ !$0.contains("evil.example") }) {
+    tally.pass("Catalog redirect was not followed")
+  } else {
+    tally.fail("Redirect behavior failed: \(redirected.1)")
+  }
+
+  return (tally.passed, tally.failed)
 }

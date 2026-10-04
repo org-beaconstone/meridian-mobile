@@ -42,8 +42,19 @@ import MeridianSDK
           }
           TextField("Amount (GBP)", text: $amount).textFieldStyle(.roundedBorder).disabled(review || busy)
           TextField("Reference", text: $reference).textFieldStyle(.roundedBorder).disabled(review || busy)
-          // Intentionally hardcoded baseline: new providers still require a native release.
-          Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
+          // Static checkout binding. Catalog corridors are display-only and cannot add a provider.
+          Picker("Method", selection: $method) {
+            Text(ProviderId.adyen.checkoutLabel).tag(PaymentMethod.card)
+            Text(ProviderId.worldpay.checkoutLabel).tag(PaymentMethod.bank)
+          }.disabled(review || busy)
+          if let catalog {
+            ForEach(catalog.providers.filter { $0.id == ProviderId.adyen.rawValue || $0.id == ProviderId.worldpay.rawValue }) { provider in
+              ForEach(provider.corridors) { corridor in
+                Text("\(provider.name) · \(corridor.method == PaymentMethod.bank.rawValue ? "Bank payment" : "Debit card") · \(corridor.currency)")
+                  .font(.caption).foregroundStyle(.secondary)
+              }
+            }
+          }
           if review {
             Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
@@ -67,8 +78,24 @@ import MeridianSDK
     do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
-    guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    guard let client else {return}
+    let started=generation
+    let loaded=await client.loadCatalog(cache: MeridianDeviceCache.catalog)
+    var nextState: BankState?
+    var stateError: String?
+    do { nextState=try await client.getState() } catch { stateError=error.localizedDescription }
+    guard started==generation, !busy else { return }
+    if let nextState { state=nextState }
+    if let definitions=loaded.catalog { catalog=definitions }
+    if let stateError, loaded.origin != .network {
+      message="API unavailable: \(stateError)"
+    } else if loaded.origin == .cache {
+      message="Catalog API unavailable. Showing the saved catalog."
+    } else if nextState != nil && loaded.catalog != nil {
+      message="Connected to shared Java API"
+    } else if loaded.catalog == nil {
+      message="Catalog unavailable."
+    }
   }
   private func pay() async {
     guard let client, !busy else {return}; busy=true; generation += 1
