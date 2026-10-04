@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets
 class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
+  val idempotency: IdempotencyKeyManager = IdempotencyKeyManager(),
 ) {
   private val mapper = ObjectMapper().registerKotlinModule()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
@@ -36,6 +37,12 @@ class MeridianClient(
     additionalHeaders: Map<String, String> = emptyMap(),
     responseType: Class<T>,
   ): T = withContext(Dispatchers.IO) {
+    if (method.equals("POST", ignoreCase = true) && path == PAYMENTS_PATH) {
+      val idempotencyKey = additionalHeaders[IdempotencyKeyManager.HEADER]
+      if (idempotencyKey.isNullOrBlank()) {
+        throw MeridianError.ValidationError("Idempotency-Key header is required for payment requests")
+      }
+    }
     val fullUrl = "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
@@ -128,13 +135,25 @@ class MeridianClient(
     request("GET", "/state", responseType = BankState::class.java)
 
   /**
-   * POST /payments - Submit a payment
-   * @param recipientId Recipient ID
-   * @param amountMinor Amount in GBP pence (integer)
-   * @param method Payment method (card or bank)
-   * @param note Optional note (max 200 chars)
-   * @param scenario Simulation scenario
-   * @param idempotencyKey Unique key for idempotency
+   * Start a payment attempt and persist its UUID v4 idempotency key.
+   * Review screens call this before the first network request.
+   */
+  fun preparePayment(
+    transactionId: String,
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+  ): String = idempotency.begin(
+    transactionId,
+    attempt(recipientId, amountMinor, method, note, scenario).fingerprint(),
+  )
+
+  /**
+   * POST /payments - Submit a payment.
+   * Pass [transactionId] to generate and retain a UUID v4 key for the attempt.
+   * An explicit [idempotencyKey] is still sent as the header for callers that already hold one.
    */
   suspend fun submitPayment(
     recipientId: String,
@@ -142,8 +161,78 @@ class MeridianClient(
     method: PaymentMethod,
     note: String = "",
     scenario: Scenario = Scenario.success,
-    idempotencyKey: String,
+    idempotencyKey: String? = null,
+    transactionId: String? = null,
+  ): PaymentResponse = postPayment(
+    recipientId = recipientId,
+    amountMinor = amountMinor,
+    method = method,
+    note = note,
+    scenario = scenario,
+    idempotencyKey = idempotencyKey,
+    transactionId = transactionId,
+    mode = KeyMode.INITIAL_OR_RETRY,
+  )
+
+  /**
+   * Network retry of an in-flight payment. Reuses the stored key and never mints a replacement.
+   */
+  suspend fun retryPayment(
+    transactionId: String,
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+  ): PaymentResponse = postPayment(
+    recipientId = recipientId,
+    amountMinor = amountMinor,
+    method = method,
+    note = note,
+    scenario = scenario,
+    idempotencyKey = null,
+    transactionId = transactionId,
+    mode = KeyMode.RETRY,
+  )
+
+  /**
+   * Two-factor challenge submission for an in-flight payment.
+   * Uses the same Idempotency-Key and the same payment body as the original attempt.
+   */
+  suspend fun submitChallenge(
+    transactionId: String,
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+  ): PaymentResponse = postPayment(
+    recipientId = recipientId,
+    amountMinor = amountMinor,
+    method = method,
+    note = note,
+    scenario = scenario,
+    idempotencyKey = null,
+    transactionId = transactionId,
+    mode = KeyMode.CHALLENGE,
+  )
+
+  fun cancelTransaction(transactionId: String) {
+    idempotency.cancel(transactionId)
+  }
+
+  private suspend fun postPayment(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String,
+    scenario: Scenario,
+    idempotencyKey: String?,
+    transactionId: String?,
+    mode: KeyMode,
   ): PaymentResponse {
+    val fingerprint = attempt(recipientId, amountMinor, method, note, scenario).fingerprint()
+    val key = resolveKey(transactionId, idempotencyKey, fingerprint, mode)
     val payload = PaymentRequest(
       recipientId = recipientId,
       amountMinor = amountMinor,
@@ -151,14 +240,75 @@ class MeridianClient(
       note = note,
       scenario = scenario.name,
     )
-
-    return request(
+    val response = request(
       "POST",
-      "/payments",
+      PAYMENTS_PATH,
       payload,
-      mapOf("Idempotency-Key" to idempotencyKey),
+      mapOf(IdempotencyKeyManager.HEADER to key),
       PaymentResponse::class.java,
     )
+    if (transactionId != null && isTerminalSuccess(response)) {
+      idempotency.settle(transactionId)
+    }
+    return response
+  }
+
+  private fun resolveKey(
+    transactionId: String?,
+    idempotencyKey: String?,
+    fingerprint: String,
+    mode: KeyMode,
+  ): String {
+    val managed = !transactionId.isNullOrBlank()
+    val explicit = !idempotencyKey.isNullOrBlank()
+    if (managed && explicit) {
+      throw MeridianError.ValidationError(
+        "Pass either a managed transaction id or an explicit idempotency key",
+      )
+    }
+    if (!managed) {
+      if (!explicit) {
+        throw MeridianError.ValidationError("An idempotency key or transaction id is required")
+      }
+      return idempotencyKey!!
+    }
+    val id = transactionId!!
+    return when (mode) {
+      KeyMode.RETRY -> idempotency.keyForRetry(id, fingerprint)
+      KeyMode.CHALLENGE -> idempotency.keyForChallenge(id, fingerprint)
+      KeyMode.INITIAL_OR_RETRY -> try {
+        idempotency.keyForRetry(id, fingerprint)
+      } catch (missing: MeridianError.MissingIdempotencyKey) {
+        idempotency.begin(id, fingerprint)
+      }
+    }
+  }
+
+  private fun isTerminalSuccess(response: PaymentResponse): Boolean {
+    if (!response.ok) return false
+    if (response.code == "PAYMENT_PENDING") return false
+    if (response.transaction?.status == TransactionStatus.pending.name) return false
+    return true
+  }
+
+  private fun attempt(
+    recipientId: String,
+    amountMinor: Int,
+    method: PaymentMethod,
+    note: String,
+    scenario: Scenario,
+  ) = PaymentAttempt(
+    recipientId = recipientId,
+    amountMinor = amountMinor,
+    method = method.name,
+    note = note,
+    scenario = scenario.name,
+  )
+
+  private enum class KeyMode { INITIAL_OR_RETRY, RETRY, CHALLENGE }
+
+  private companion object {
+    const val PAYMENTS_PATH = "/payments"
   }
 
   /**

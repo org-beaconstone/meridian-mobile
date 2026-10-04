@@ -149,7 +149,13 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
   class HttpError(val statusCode: Int, msg: String) : MeridianError("HTTP $statusCode: $msg")
   class MissingSession(msg: String = "Session ID is required") : MeridianError(msg)
   class InvalidAmount(msg: String) : MeridianError(msg)
-  class ValidationError(msg: String) : MeridianError(msg)
+  class ValidationError(msg: String, cause: Throwable? = null) : MeridianError(msg, cause)
+  class IdempotencyKeyExpired(val transactionId: String) : MeridianError(
+    "Idempotency key for $transactionId expired after 24 hours",
+  )
+  class MissingIdempotencyKey(val transactionId: String) : MeridianError(
+    "No idempotency key is stored for $transactionId",
+  )
 }
 
 // MARK: - Amount Formatting
