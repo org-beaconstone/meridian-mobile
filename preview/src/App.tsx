@@ -20,11 +20,12 @@ type State = {
   budgets: { category: Category; limit: number }[];
 };
 type Recipient = { id: string; name: string; category: Category; initials: string; detail: string };
-const providers = [
-  { id: 'adyen', name: 'Adyen', method: 'card' as const },
-  { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
-];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  paymentMethodBlockMessage,
+  paymentMethodSheetModel,
+  type CatalogProvider,
+} from './domain/paymentMethods';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -84,6 +85,9 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
+  const [catalogProviders, setCatalogProviders] = useState<CatalogProvider[] | null>(null);
+  const [catalogFailed, setCatalogFailed] = useState(false);
+  const [methodSheetOpen, setMethodSheetOpen] = useState(false);
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -99,29 +103,57 @@ export default function App() {
     let closed = false;
     let timer: ReturnType<typeof setTimeout>;
     setState(null);
+    setCatalogProviders(null);
+    setCatalogFailed(false);
+    setMethodSheetOpen(false);
     setConnected(false);
     setError('');
     async function poll() {
       const version = revision.current;
       try {
         if (!mutating.current) {
-          const [raw, catalog] = await Promise.all([
-            request(room, '/state'),
-            request(room, '/catalog'),
-          ]);
+          let stateOk = false;
+          try {
+            const raw = await request(room, '/state');
+            if (
+              !closed &&
+              generation === epoch.current &&
+              version === revision.current &&
+              !mutating.current
+            ) {
+              setState(bankState(raw));
+              setConnected(true);
+              stateOk = true;
+            }
+          } catch (e) {
+            if (!closed && generation === epoch.current) {
+              setConnected(false);
+              setError(e instanceof Error ? e.message : 'API unavailable');
+            }
+          }
           if (
             !closed &&
             generation === epoch.current &&
             version === revision.current &&
             !mutating.current
           ) {
-            setState(bankState(raw));
-            setRecipients(catalog.recipients);
-            setConnected(true);
+            const catalog = await request(room, '/catalog');
+            if (
+              !closed &&
+              generation === epoch.current &&
+              version === revision.current &&
+              !mutating.current
+            ) {
+              setRecipients(catalog.recipients);
+              setCatalogProviders(Array.isArray(catalog.providers) ? catalog.providers : []);
+              setCatalogFailed(false);
+              if (stateOk) setConnected(true);
+            }
           }
         }
       } catch (e) {
         if (!closed && generation === epoch.current) {
+          setCatalogFailed(true);
           setConnected(false);
           setError(e instanceof Error ? e.message : 'API unavailable');
         }
@@ -135,6 +167,22 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [room]);
+  const sheetRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!methodSheetOpen) return;
+    sheetRef.current?.focus();
+    function onKey(event: KeyboardEvent) {
+      if (event.key === 'Escape') setMethodSheetOpen(false);
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [methodSheetOpen]);
+  const methodSheet =
+    catalogFailed && catalogProviders === null
+      ? { loading: false, options: [], placeholderCount: 0 }
+      : paymentMethodSheetModel(catalogProviders);
+  const selectedTitle =
+    methodSheet.options.find((item) => item.method === method)?.title ?? 'Payment method';
   async function mutate(path: string, httpMethod: string, body?: unknown, key?: string) {
     if (mutating.current || !connected)
       throw new Error('Wait for API connection before submitting.');
@@ -177,10 +225,20 @@ export default function App() {
       setError('Insufficient balance');
       return;
     }
+    const blocked = paymentMethodBlockMessage(method, methodSheet);
+    if (blocked) {
+      setError(blocked);
+      return;
+    }
     setError('');
     setStep('review');
   }
   async function confirm() {
+    const blocked = paymentMethodBlockMessage(method, methodSheet);
+    if (blocked) {
+      setError(blocked);
+      return;
+    }
     try {
       setError('');
       const result = await mutate(
@@ -336,28 +394,15 @@ export default function App() {
                         onChange={(e) => setNote(e.target.value)}
                         placeholder="What’s it for?"
                       />
-                      <fieldset>
-                        <legend>Payment method</legend>
-                        {providers.map((provider) => (
-                          <label
-                            className={
-                              'mobile-method ' + (method === provider.method ? 'selected' : '')
-                            }
-                            key={provider.id}
-                          >
-                            <input
-                              type="radio"
-                              name="method"
-                              checked={method === provider.method}
-                              onChange={() => setMethod(provider.method)}
-                            />
-                            <span>
-                              {provider.method === 'card' ? 'Debit card' : 'Bank payment'}
-                              <small>{provider.name} simulation</small>
-                            </span>
-                          </label>
-                        ))}
-                      </fieldset>
+                      <button
+                        type="button"
+                        className="method-opener"
+                        data-testid="payment-method-open"
+                        onClick={() => setMethodSheetOpen(true)}
+                      >
+                        <span>Payment method</span>
+                        <strong>{selectedTitle}</strong>
+                      </button>
                       <button className="primary" disabled={!connected || busy} type="submit">
                         Review payment
                       </button>
@@ -369,7 +414,7 @@ export default function App() {
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
-                          {providers.find((p) => p.method === method)?.name} ·{' '}
+                          {selectedTitle} ·{' '}
                           {note || 'No reference'}
                         </p>
                       </div>
@@ -526,6 +571,80 @@ export default function App() {
           ))}
         </nav>
         <footer>Fictional Meridian Bank · GBP simulation</footer>
+        {methodSheetOpen && page === 'Pay' && step === 'details' && (
+          <div className="method-sheet-backdrop" onClick={() => setMethodSheetOpen(false)}>
+            <div
+              className="method-sheet"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Payment method"
+              data-testid="payment-method-sheet"
+              ref={sheetRef}
+              tabIndex={-1}
+              onClick={(event) => event.stopPropagation()}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setMethodSheetOpen(false);
+              }}
+            >
+              <div className="method-sheet-handle" aria-hidden="true" />
+              <div className="method-sheet-heading">
+                <div>
+                  <h2>Payment method</h2>
+                  <p>GBP · United Kingdom</p>
+                </div>
+                <button type="button" onClick={() => setMethodSheetOpen(false)}>
+                  Done
+                </button>
+              </div>
+              {methodSheet.loading ? (
+                <div
+                  className="method-skeleton"
+                  data-testid="method-skeleton"
+                  aria-busy="true"
+                  aria-label="Loading payment methods"
+                >
+                  {Array.from({ length: methodSheet.placeholderCount }, (_, index) => (
+                    <div className="skeleton-row" key={index} />
+                  ))}
+                </div>
+              ) : methodSheet.options.length === 0 ? (
+                <p className="method-empty">No payment method is available for this corridor.</p>
+              ) : (
+                <div role="radiogroup" aria-label="Payment method">
+                  {methodSheet.options.map((option) => (
+                    <label
+                      key={option.id}
+                      className={
+                        'method-option' +
+                        (method === option.method && option.selectable ? ' selected' : '') +
+                        (option.selectable ? '' : ' disabled')
+                      }
+                      data-testid={'method-option-' + option.id}
+                    >
+                      <input
+                        type="radio"
+                        name="payment-method"
+                        checked={method === option.method}
+                        disabled={!option.selectable}
+                        aria-label={option.accessibilityLabel}
+                        aria-describedby={option.helperText ? option.id + '-help' : undefined}
+                        onChange={() => {
+                          if (!option.selectable) return;
+                          setMethod(option.method);
+                          setMethodSheetOpen(false);
+                        }}
+                      />
+                      <span>
+                        {option.title}
+                        {option.helperText && <small id={option.id + '-help'}>{option.helperText}</small>}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

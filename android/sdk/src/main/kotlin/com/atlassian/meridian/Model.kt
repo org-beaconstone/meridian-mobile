@@ -77,6 +77,7 @@ data class Provider(
   val name: String,
   val description: String,
   val methods: List<String>,
+  val availability: String? = null,
 ) : Serializable
 
 // MARK: - API Response Types

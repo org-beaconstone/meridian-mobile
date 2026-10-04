@@ -15,6 +15,12 @@ public enum PaymentMethod: String, Codable, Hashable {
   case bank
 }
 
+public enum MethodAvailability: String, Codable, Hashable {
+  case available
+  case degraded
+  case unavailable
+}
+
 public enum ProviderId: String, Codable, Hashable {
   case adyen
   case worldpay
@@ -134,17 +140,46 @@ public struct Provider: Codable, Hashable {
   public let name: String
   public let description: String
   public let methods: [PaymentMethod]
+  public let availability: MethodAvailability
 
   public init(
     id: ProviderId,
     name: String,
     description: String,
-    methods: [PaymentMethod]
+    methods: [PaymentMethod],
+    availability: MethodAvailability = .available
   ) {
     self.id = id
     self.name = name
     self.description = description
     self.methods = methods
+    self.availability = availability
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id, name, description, methods, availability
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(ProviderId.self, forKey: .id)
+    name = try container.decode(String.self, forKey: .name)
+    description = try container.decode(String.self, forKey: .description)
+    methods = try container.decode([PaymentMethod].self, forKey: .methods)
+    if let raw = try container.decodeIfPresent(String.self, forKey: .availability) {
+      availability = MethodAvailability(rawValue: raw.lowercased()) ?? .unavailable
+    } else {
+      availability = .available
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(name, forKey: .name)
+    try container.encode(description, forKey: .description)
+    try container.encode(methods, forKey: .methods)
+    try container.encode(availability, forKey: .availability)
   }
 }
 
@@ -160,6 +195,58 @@ public struct CatalogResponse: Codable {
   public let demoDate: String
   public let recipients: [Recipient]
   public let providers: [Provider]
+
+  public init(demoDate: String, recipients: [Recipient], providers: [Provider]) {
+    self.demoDate = demoDate
+    self.recipients = recipients
+    self.providers = providers
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case demoDate, recipients, providers
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    demoDate = try container.decode(String.self, forKey: .demoDate)
+    recipients = try container.decode([Recipient].self, forKey: .recipients)
+    let loose = try container.decode([LooseProvider].self, forKey: .providers)
+    providers = loose.compactMap { $0.knownProvider() }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(demoDate, forKey: .demoDate)
+    try container.encode(recipients, forKey: .recipients)
+    try container.encode(providers, forKey: .providers)
+  }
+}
+
+private struct LooseProvider: Decodable {
+  let id: String
+  let name: String
+  let description: String
+  let methods: [String]
+  let availability: String?
+
+  func knownProvider() -> Provider? {
+    guard let providerId = ProviderId(rawValue: id) else { return nil }
+    let knownMethods = methods.compactMap(PaymentMethod.init(rawValue:))
+    guard !knownMethods.isEmpty else { return nil }
+    let resolved: MethodAvailability
+    if let raw = availability?.lowercased() {
+      resolved = MethodAvailability(rawValue: raw) ?? .unavailable
+    } else {
+      resolved = .available
+    }
+    return Provider(
+      id: providerId,
+      name: name,
+      description: description,
+      methods: knownMethods,
+      availability: resolved
+    )
+  }
 }
 
 public struct PaymentResponse: Codable {

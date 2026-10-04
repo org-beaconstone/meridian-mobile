@@ -341,10 +341,123 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    // Summary
+    // CHECK 21: catalog sheet follows provider order for the GBP corridor
+    print("21. GBP catalog sheet...")
+    let sheetProviders = [
+      Provider(id: .worldpay, name: "Worldpay", description: "Bank transfer processor", methods: [.bank]),
+      Provider(id: .adyen, name: "Adyen", description: "Card payment processor", methods: [.card]),
+      Provider(id: .adyen, name: "Adyen", description: "Card payment processor", methods: [.card]),
+    ]
+    let sheet = paymentMethodSheetModel(providers: sheetProviders)
+    if sheet.options.count == 2
+      && sheet.options[0].title == "Worldpay"
+      && sheet.options[0].method == .bank
+      && sheet.options[0].selectable
+      && sheet.options[0].accessibilityLabel == "Select Worldpay, radio button, 1 of 2"
+      && sheet.options[1].title == "Adyen Card"
+      && sheet.options[1].accessibilityLabel == "Select Adyen Card, radio button, 2 of 2"
+      && submittablePaymentMethod(selected: .bank, model: sheet) == .bank {
+      print("  ✓ Catalog order, labels and contracted methods")
+      passed += 1
+    } else {
+      print("  ✗ GBP sheet mismatch")
+      failed += 1
+    }
+
+    // CHECK 22: unavailable and degraded stay disabled and are not replaced
+    print("22. Unavailable method stays selected...")
+    let disabledProviders = [
+      Provider(id: .adyen, name: "Adyen", description: "Card", methods: [.card], availability: .unavailable),
+      Provider(id: .worldpay, name: "Worldpay", description: "Bank", methods: [.bank], availability: .degraded),
+    ]
+    let disabledSheet = paymentMethodSheetModel(providers: disabledProviders)
+    let cardBlocked = submittablePaymentMethod(selected: .card, model: disabledSheet)
+    if disabledSheet.options.count == 2
+      && !disabledSheet.options[0].selectable
+      && disabledSheet.options[0].helperText == paymentMethodUnavailableText
+      && !disabledSheet.options[1].selectable
+      && cardBlocked == nil
+      && paymentMethodBlockMessage(selected: .card, model: disabledSheet) == paymentMethodUnavailableText {
+      print("  ✓ Disabled methods keep helper text and are not swapped")
+      passed += 1
+    } else {
+      print("  ✗ Disabled sheet mismatch")
+      failed += 1
+    }
+
+    // CHECK 23: another corridor disables the contracted methods
+    print("23. Non-GBP corridor...")
+    let foreign = paymentMethodSheetModel(
+      providers: [Provider(id: .adyen, name: "Adyen", description: "Card", methods: [.card])],
+      corridor: CorridorContext(region: "FR", currency: "EUR")
+    )
+    if foreign.options.count == 1 && !foreign.options[0].selectable && foreign.options[0].helperText == paymentMethodUnavailableText {
+      print("  ✓ Non-GBP corridor disables the method")
+      passed += 1
+    } else {
+      print("  ✗ Corridor filter mismatch")
+      failed += 1
+    }
+
+    // CHECK 24: loading placeholders and unknown catalog entries
+    print("24. Loading and unknown catalog entries...")
+    let loadingSheet = paymentMethodSheetModel(providers: nil)
+    let catalogJson = """
+    {
+      "demoDate": "2026-09-18",
+      "recipients": [],
+      "providers": [
+        {"id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card", "other"]},
+        {"id": "unlisted", "name": "Unlisted", "description": "Ignored", "methods": ["card"]},
+        {"id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"], "availability": "unavailable"}
+      ]
+    }
+    """
+    do {
+      let decoded = try JSONDecoder().decode(CatalogResponse.self, from: Data(catalogJson.utf8))
+      let decodedSheet = paymentMethodSheetModel(providers: decoded.providers)
+      if loadingSheet.loading && loadingSheet.placeholderCount == 2 && loadingSheet.options.isEmpty
+        && decoded.providers.count == 2
+        && decoded.providers[0].methods == [.card]
+        && decodedSheet.options.count == 2
+        && decodedSheet.options[0].selectable
+        && decodedSheet.options[0].title == "Adyen Card"
+        && !decodedSheet.options[1].selectable
+        && decodedSheet.options[1].helperText == paymentMethodUnavailableText {
+        print("  ✓ Skeleton model and unknown catalog entries omitted")
+        passed += 1
+      } else {
+        print("  ✗ Catalog filtering mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Catalog decode failed: \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: missing availability defaults to available
+    print("25. Missing availability defaults to available...")
+    let plainCatalog = """
+    {"demoDate":"2026-09-18","recipients":[],"providers":[{"id":"adyen","name":"Adyen","description":"Card payment processor","methods":["card"]}]}
+    """
+    do {
+      let decoded = try JSONDecoder().decode(CatalogResponse.self, from: Data(plainCatalog.utf8))
+      if decoded.providers.first?.availability == .available {
+        print("  ✓ Missing availability is available")
+        passed += 1
+      } else {
+        print("  ✗ Default availability mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Decode failed: \(error)")
+      failed += 1
+    }
+
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

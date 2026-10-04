@@ -66,6 +66,7 @@ a {
   margin-bottom: 15px;
 }
 .mobile-shell {
+  position: relative;
   max-width: 440px;
   margin: auto;
   background: #f8f9f6;
@@ -404,6 +405,106 @@ legend {
 .fine-print {
   font-size: 11px;
   margin-top: 20px !important;
+}
+.method-opener {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 48px;
+  margin-top: 20px;
+  padding: 8px 12px;
+  border: 1px solid #dce3d6;
+  border-radius: 8px;
+  background: #fff;
+  text-align: left;
+}
+.method-opener span {
+  display: block;
+  font-size: 11px;
+  color: #57675e;
+}
+.method-opener strong {
+  display: block;
+  margin-top: 2px;
+  font-size: 14px;
+}
+.method-sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(20, 44, 53, 0.45);
+}
+.method-sheet {
+  width: 100%;
+  padding: 12px 16px 24px;
+  background: #fff;
+  border-radius: 16px 16px 0 0;
+}
+.method-sheet-handle {
+  width: 36px;
+  height: 4px;
+  margin: 0 auto 8px;
+  border-radius: 2px;
+  background: #d5ddd4;
+}
+.method-sheet-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 48px;
+}
+.method-sheet-heading h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.method-sheet-heading p {
+  margin-top: 4px;
+}
+.method-sheet-heading button {
+  min-width: 48px;
+  min-height: 48px;
+  border: 0;
+  border-radius: 8px;
+  background: #f5f7f1;
+}
+.method-option input {
+  width: 48px;
+  min-width: 48px;
+  height: 48px;
+  margin: 0;
+  accent-color: #1868db;
+}
+.method-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  margin-top: 8px;
+}
+.method-option.selected span {
+  font-weight: 600;
+}
+.method-option.disabled {
+  color: #6b756c;
+}
+.method-option small,
+.method-empty {
+  display: block;
+  margin-top: 4px;
+  color: #54635c;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.skeleton-row {
+  height: 48px;
+  margin-top: 8px;
+  border-radius: 8px;
+  background: #e4e8e1;
 }
 @media (max-width: 480px) {
   .rehearsal-background {
