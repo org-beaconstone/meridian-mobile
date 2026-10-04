@@ -25,6 +25,19 @@ const providers = [
   { id: 'worldpay', name: 'Worldpay', method: 'bank' as const },
 ];
 import { money, parsePence as pence } from './domain/currency';
+import {
+  ACCOUNT_CURRENCY,
+  FX_COPY,
+  buildPaymentPayload,
+  fxQuoteRequestBody,
+  lockQuote,
+  parseFxQuote,
+  preserveDraftOnRateRefresh,
+  rateLockBlockReason,
+  remainingSeconds,
+  type FxQuoteLock,
+} from './domain/fxQuote';
+import { RateLockReview } from './RateLockReview';
 class RequestError extends Error {
   constructor(
     message: string,
@@ -84,6 +97,11 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [method, setMethod] = useState<Method>('card');
+  const [targetCurrency, setTargetCurrency] = useState(ACCOUNT_CURRENCY);
+  const [quote, setQuote] = useState<FxQuoteLock | null>(null);
+  const [quoteError, setQuoteError] = useState('');
+  const [quoteBusy, setQuoteBusy] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   const [step, setStep] = useState<'details' | 'review' | 'done'>('details');
   const [scenario, setScenario] = useState('success');
   const [busy, setBusy] = useState(false);
@@ -94,6 +112,11 @@ export default function App() {
     revision = useRef(0),
     mutating = useRef(false),
     paymentKey = useRef(crypto.randomUUID());
+  useEffect(() => {
+    if (!quote) return;
+    const timer = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(timer);
+  }, [quote]);
   useEffect(() => {
     const generation = ++epoch.current;
     let closed = false;
@@ -158,6 +181,9 @@ export default function App() {
     setAmount('');
     setNote('');
     setError('');
+    setQuote(null);
+    setQuoteError('');
+    setTargetCurrency(ACCOUNT_CURRENCY);
     setReceipt(null);
     paymentKey.current = crypto.randomUUID();
     setPage('Pay');
@@ -165,9 +191,49 @@ export default function App() {
   function editPayment() {
     setStep('details');
     setError('');
+    setQuote(null);
+    setQuoteError('');
     paymentKey.current = crypto.randomUUID();
   }
-  function review() {
+  async function loadQuote(amountMinor: number, preserveExisting: boolean) {
+    const draft = preserveDraftOnRateRefresh({
+      recipientId: recipient,
+      amount,
+      note,
+      method,
+      targetCurrency,
+      idempotencyKey: paymentKey.current,
+    });
+    if (
+      draft.idempotencyKey !== paymentKey.current ||
+      draft.amount !== amount ||
+      draft.note !== note ||
+      draft.recipientId !== recipient ||
+      draft.method !== method ||
+      draft.targetCurrency !== targetCurrency
+    ) {
+      throw new Error('Rate refresh must keep the payment draft');
+    }
+    setQuoteBusy(true);
+    try {
+      const raw = await request(
+        room,
+        '/fx/quote',
+        'POST',
+        fxQuoteRequestBody(ACCOUNT_CURRENCY, draft.targetCurrency, amountMinor),
+      );
+      const locked = lockQuote(parseFxQuote(raw), ACCOUNT_CURRENCY, draft.targetCurrency, amountMinor, Date.now());
+      setQuote(locked);
+      setQuoteError('');
+      setNow(Date.now());
+    } catch {
+      if (!preserveExisting) setQuote(null);
+      setQuoteError(FX_COPY.unavailable);
+    } finally {
+      setQuoteBusy(false);
+    }
+  }
+  async function review() {
     const value = pence(amount);
     if (value === null) {
       setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
@@ -178,17 +244,35 @@ export default function App() {
       return;
     }
     setError('');
+    setQuote(null);
+    setQuoteError('');
     setStep('review');
+    if (targetCurrency !== ACCOUNT_CURRENCY) await loadQuote(value, false);
   }
   async function confirm() {
+    const amountMinor = pence(amount);
+    if (amountMinor === null) {
+      setError('Enter an amount from £0.01 to £10,000 with no more than two decimals.');
+      return;
+    }
+    const decision = buildPaymentPayload({
+      recipientId: recipient,
+      amountMinor,
+      method,
+      note,
+      scenario,
+      sourceCurrency: ACCOUNT_CURRENCY,
+      targetCurrency,
+      quote,
+      nowEpochMs: Date.now(),
+    });
+    if (!decision.ok) {
+      setError(decision.error);
+      return;
+    }
     try {
       setError('');
-      const result = await mutate(
-        '/payments',
-        'POST',
-        { recipientId: recipient, amountMinor: pence(amount), method, note, scenario },
-        paymentKey.current,
-      );
+      const result = await mutate('/payments', 'POST', decision.body, paymentKey.current);
       if (result.ok) {
         setReceipt(result.transaction);
         setStep('done');
@@ -198,6 +282,16 @@ export default function App() {
     }
   }
   const selected = recipients.find((item) => item.id === recipient);
+  const quoteSeconds = quote ? remainingSeconds(quote, now) : 0;
+  const quoteBlocked =
+    targetCurrency !== ACCOUNT_CURRENCY &&
+    rateLockBlockReason({
+      sourceCurrency: ACCOUNT_CURRENCY,
+      targetCurrency,
+      amountMinor: pence(amount) ?? 0,
+      quote,
+      nowEpochMs: now,
+    }) !== null;
   const spent =
     state?.transactions
       .filter((t) => t.status === 'completed' && t.date.startsWith('2026-09'))
@@ -336,6 +430,15 @@ export default function App() {
                         onChange={(e) => setNote(e.target.value)}
                         placeholder="What’s it for?"
                       />
+                      <label htmlFor="mobile-currency">Recipient currency</label>
+                      <select
+                        id="mobile-currency"
+                        value={targetCurrency}
+                        onChange={(e) => setTargetCurrency(e.target.value)}
+                      >
+                        <option value="GBP">GBP · no conversion</option>
+                        <option value="EUR">EUR · convert from GBP</option>
+                      </select>
                       <fieldset>
                         <legend>Payment method</legend>
                         {providers.map((provider) => (
@@ -364,22 +467,39 @@ export default function App() {
                     </form>
                   )}
                   {step === 'review' && (
-                    <>
+                    <div data-testid="payment-review" data-idempotency-key={paymentKey.current}>
                       <div className="mobile-review">
                         <span>To {selected?.name}</span>
                         <strong>{money(pence(amount) || 0)}</strong>
                         <p>
                           {providers.find((p) => p.method === method)?.name} ·{' '}
                           {note || 'No reference'}
+                          {targetCurrency !== ACCOUNT_CURRENCY ? ` · ${targetCurrency}` : ''}
                         </p>
                       </div>
-                      <button className="primary" onClick={confirm} disabled={busy || !connected}>
+                      {targetCurrency !== ACCOUNT_CURRENCY && (
+                        <RateLockReview
+                          lock={quote}
+                          seconds={quoteSeconds}
+                          loading={quoteBusy}
+                          error={quoteError}
+                          onRetry={() => {
+                            const value = pence(amount);
+                            if (value !== null) void loadQuote(value, true);
+                          }}
+                        />
+                      )}
+                      <button
+                        className="primary"
+                        onClick={confirm}
+                        disabled={busy || quoteBusy || !connected || quoteBlocked}
+                      >
                         {busy ? 'Confirming…' : 'Confirm payment'}
                       </button>
-                      <button className="secondary" disabled={busy} onClick={editPayment}>
+                      <button className="secondary" disabled={busy || quoteBusy} onClick={editPayment}>
                         Back to details
                       </button>
-                    </>
+                    </div>
                   )}
                   {step === 'done' && receipt && (
                     <div className="mobile-success">
