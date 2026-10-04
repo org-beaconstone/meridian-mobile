@@ -36,7 +36,7 @@ class MeridianSDKTest {
   fun testParseAmountZero() {
     val (pence, error) = parseAmount("0")
     assertNull(pence)
-    assertEquals("Amount must be greater than zero", error)
+    assertEquals("Amount must be at least £0.01", error)
   }
 
   @Test
@@ -64,7 +64,7 @@ class MeridianSDKTest {
   fun testParseAmountTooLarge() {
     val (pence, error) = parseAmount("10001")
     assertNull(pence)
-    assertEquals("Amount cannot exceed £10,000", error)
+    assertEquals("Amount cannot exceed £10,000.00", error)
   }
 
   @Test

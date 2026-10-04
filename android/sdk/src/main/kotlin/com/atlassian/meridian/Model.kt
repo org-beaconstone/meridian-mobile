@@ -160,56 +160,53 @@ fun money(pence: Int): String {
 }
 
 /**
- * Parse amount string to integer pence
- * @param input Amount string (e.g., "10.50", "10", "10.5")
+ * Parse an amount string to integer GBP pence.
+ * Accepts a leading £ and en_GB thousands separators. Bounds are £0.01 to £10,000.00.
+ * @param input Amount string (e.g., "10.50", "£10", "1,000.5")
  * @return Pair of (pence: Int?, error: String?)
  */
 fun parseAmount(input: String): Pair<Int?, String?> {
-  val trimmed = input.trim()
+  var trimmed = input.trim()
+  if (trimmed.startsWith("£")) {
+    trimmed = trimmed.removePrefix("£").trim()
+  }
 
-  // Empty or whitespace only
   if (trimmed.isEmpty()) {
     return Pair(null, "Amount is required")
   }
 
-  // Check for sign, exponent, or invalid characters
   if (trimmed.contains("-") || trimmed.contains("+") || trimmed.lowercase().contains("e")) {
     return Pair(null, "Amount cannot contain sign or exponent notation")
   }
 
-  // Must be numeric with optional decimal point
-  val pattern = "^\\d+(\\.\\d*)?$".toRegex()
-  if (!pattern.matches(trimmed)) {
+  val normalized = if (trimmed.contains(",")) {
+    when {
+      Regex("""^\d{1,3}(,\d{3})+(\.\d*)?$""").matches(trimmed) -> trimmed.replace(",", "")
+      Regex("""^\d+,\d{1,2}$""").matches(trimmed) ->
+        return Pair(null, "Use a decimal point for pence, for example 10.50")
+      else -> return Pair(null, "Amount must be a valid number")
+    }
+  } else {
+    trimmed
+  }
+
+  if (!Regex("""^\d+(\.\d*)?$""").matches(normalized)) {
     return Pair(null, "Amount must be a valid number")
   }
 
-  // Check decimal places and parse
-  val parts = trimmed.split(".", limit = 2)
+  val parts = normalized.split(".", limit = 2)
   if (parts.size == 2 && parts[1].length > 2) {
     return Pair(null, "Amount must have at most 2 decimal places")
   }
 
   val poundsStr = parts[0]
-  val penceStr = if (parts.size == 2) {
-    parts[1].padEnd(2, '0')
-  } else {
-    "00"
-  }
-
+  val penceStr = if (parts.size == 2) parts[1].padEnd(2, '0') else "00"
   val pounds = poundsStr.toIntOrNull() ?: return Pair(null, "Amount is not a valid integer")
   val pence = penceStr.toIntOrNull() ?: return Pair(null, "Amount is not a valid integer")
 
-  if (pounds > 10000) return Pair(null, "Amount cannot exceed £10,000")
+  if (pounds > 10_000) return Pair(null, "Amount cannot exceed £10,000.00")
   val totalPence = pounds * 100 + pence
-
-  // Validate range: 1 to 1,000,000 pence (£10,000)
-  if (totalPence <= 0) {
-    return Pair(null, "Amount must be greater than zero")
-  }
-
-  if (totalPence > 1_000_000) {
-    return Pair(null, "Amount cannot exceed £10,000")
-  }
-
+  if (totalPence <= 0) return Pair(null, "Amount must be at least £0.01")
+  if (totalPence > 1_000_000) return Pair(null, "Amount cannot exceed £10,000.00")
   return Pair(totalPence, null)
 }
