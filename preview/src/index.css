@@ -267,6 +267,74 @@ main {
   background: #eaf0e5;
   font-weight: 600;
 }
+.mobile-top {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: #fff;
+}
+.session-banner-live {
+  margin: 0;
+}
+.session-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 0;
+  border-inline-start: 4px solid currentColor;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.session-glyph {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+.session-rehearsal {
+  background: #f8f9f6;
+  color: #142c35;
+  padding: 0 16px 8px;
+  font-size: 11px;
+}
+.session-rehearsal summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+.session-rehearsal p {
+  margin: 0 0 8px;
+}
+.session-rehearsal button {
+  margin: 0 8px 8px 0;
+  min-height: 44px;
+  border: 1px solid #8b9588;
+  border-radius: 6px;
+  background: #fff;
+  color: #142c35;
+  padding: 8px 10px;
+}
+.reauth-modal {
+  border: 0;
+  border-radius: 12px;
+  padding: 22px;
+  max-width: 360px;
+  color: #142c35;
+}
+.reauth-modal::backdrop {
+  background: rgba(20, 44, 53, 0.45);
+}
+.reauth-modal h2 {
+  margin-bottom: 10px;
+}
+.reauth-modal p {
+  margin-bottom: 8px;
+}
 footer {
   padding: 12px;
   text-align: center;

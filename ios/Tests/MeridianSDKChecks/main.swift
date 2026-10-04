@@ -341,10 +341,116 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    let epoch = Date(timeIntervalSince1970: 1_700_000_000)
+
+    // CHECK 21: exactly five minutes stays active
+    print("21. five minutes remaining stays active...")
+    let activeUntil = epoch.addingTimeInterval(sessionWarningWindow)
+    if case .banner(.active) = sessionPhase(presence: .here, expiresAt: activeUntil, now: epoch),
+      !sessionRequiresReauthentication(presence: .here, expiresAt: activeUntil, now: epoch) {
+      print("  ✓ exactly 5 minutes is active and does not block")
+      passed += 1
+    } else {
+      print("  ✗ exactly 5 minutes should stay active")
+      failed += 1
+    }
+
+    // CHECK 22: under five minutes is the amber warning copy
+    print("22. under five minutes warns without blocking...")
+    let expiringAt = epoch.addingTimeInterval(sessionWarningWindow - 1)
+    let expiringCopy = sessionBannerCopy(.expiringSoon, remaining: 4 * 60)
+    let expiringPalette = sessionBannerPalette(.expiringSoon)
+    if case .banner(.expiringSoon) = sessionPhase(presence: .here, expiresAt: expiringAt, now: epoch),
+      !sessionRequiresReauthentication(presence: .here, expiresAt: expiringAt, now: epoch),
+      expiringCopy.message == sessionExpiringMessage,
+      expiringCopy.accessibilityLabel == "Session expiring soon. Tap to extend. 4 minutes remaining.",
+      expiringCopy.indicator == "warning",
+      expiringPalette.backgroundToken == "color.background.warning",
+      expiringPalette.foregroundToken == "color.text.warning" {
+      print("  ✓ expiring banner is non-blocking amber warning copy")
+      passed += 1
+    } else {
+      print("  ✗ expiring state mismatch")
+      failed += 1
+    }
+
+    // CHECK 23: full expiry is the only blocking re-auth
+    print("23. full expiry requires re-authentication...")
+    let signedOut = sessionPhase(presence: .signedOut, expiresAt: epoch.addingTimeInterval(-60), now: epoch)
+    if sessionRequiresReauthentication(presence: .here, expiresAt: epoch, now: epoch),
+      sessionRequiresReauthentication(presence: .elsewhere, expiresAt: epoch, now: epoch),
+      !sessionRequiresReauthentication(presence: .signedOut, expiresAt: epoch.addingTimeInterval(-60), now: epoch),
+      signedOut == .banner(.signedOut) {
+      print("  ✓ modal only after complete expiry")
+      passed += 1
+    } else {
+      print("  ✗ re-authentication gate mismatch")
+      failed += 1
+    }
+
+    // CHECK 24: active elsewhere and signed-out indicators
+    print("24. elsewhere and signed-out banners...")
+    let elsewhere = sessionPhase(presence: .elsewhere, expiresAt: epoch.addingTimeInterval(10 * 60), now: epoch)
+    let elsewhereExpiring = sessionPhase(presence: .elsewhere, expiresAt: epoch.addingTimeInterval(60), now: epoch)
+    if elsewhere == .banner(.activeElsewhere),
+      elsewhereExpiring == .banner(.expiringSoon),
+      sessionBannerCopy(.active).indicator == "check",
+      sessionBannerCopy(.activeElsewhere).message == "Session active on another device.",
+      sessionBannerCopy(.signedOut).message == "Signed out.",
+      sessionBannerCopy(.signedOut).indicator == "signed-out" {
+      print("  ✓ active, elsewhere, and signed-out copy")
+      passed += 1
+    } else {
+      print("  ✗ session banner copy mismatch")
+      failed += 1
+    }
+
+    // CHECK 25: refresh keeps the payment draft
+    print("25. in-place refresh keeps the payment draft...")
+    let draft = PaymentFormDraft(
+      recipientId: "northline-studio",
+      amount: "18.25",
+      reference: "Studio rent",
+      method: .bank,
+      reviewing: true,
+      idempotencyKey: "pay-key-171"
+    )
+    let refreshed = refreshSessionInPlace(
+      draft: draft,
+      session: PaymentSessionClock(presence: .elsewhere, expiresAt: epoch.addingTimeInterval(30)),
+      now: epoch
+    )
+    if refreshed.draft == draft,
+      refreshed.session.presence == .here,
+      refreshed.session.expiresAt == epoch.addingTimeInterval(paymentSessionTtl),
+      sessionPhase(presence: refreshed.session.presence, expiresAt: refreshed.session.expiresAt, now: epoch) == .banner(.active) {
+      print("  ✓ refresh keeps amount, reference, method, review, and idempotency key")
+      passed += 1
+    } else {
+      print("  ✗ refresh changed the payment draft")
+      failed += 1
+    }
+
+    // CHECK 26: banner text contrast is at least 4.5:1
+    print("26. banner contrast meets WCAG 2.1 AA...")
+    let warningRatio = contrastRatio(foregroundHex: "#9E4C00", backgroundHex: "#FFF5DB")
+    let palettesPass = SessionBannerState.allCases.allSatisfy { state in
+      let palette = sessionBannerPalette(state)
+      return contrastRatio(foregroundHex: palette.foregroundHex, backgroundHex: palette.backgroundHex) >= 4.5
+    }
+    if warningRatio >= 4.5 && warningRatio < 6 && palettesPass {
+      print("  ✓ each banner foreground/background pair is at least 4.5:1")
+      passed += 1
+    } else {
+      print("  ✗ contrast below 4.5:1 or formula drifted (\(warningRatio))")
+      failed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
