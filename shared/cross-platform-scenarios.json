@@ -1,0 +1,268 @@
+{
+  "suiteVersion": 1,
+  "description": "Shared Swift and Kotlin scenarios for money formatting, cache expiry, idempotency persistence, process death, return-link rejection, malformed catalogs, and accessibility readiness.",
+  "cases": [
+    { "id": "format-pence", "type": "format", "currency": "GBP", "minor": 1, "exponent": 2, "display": "£0.01" },
+    { "id": "format-pounds", "type": "format", "currency": "GBP", "minor": 1050, "exponent": 2, "display": "£10.50" },
+    { "id": "format-one-pound", "type": "format", "currency": "GBP", "minor": 100, "exponent": 2, "display": "£1.00" },
+    { "id": "format-cap", "type": "format", "currency": "GBP", "minor": 1000000, "exponent": 2, "display": "£10000.00" },
+    { "id": "format-balance", "type": "format", "currency": "GBP", "minor": 1248050, "exponent": 2, "display": "£12480.50" },
+    { "id": "format-eur", "type": "format", "currency": "EUR", "minor": 2599, "exponent": 2, "display": "€25.99" },
+    { "id": "format-jpy", "type": "format", "currency": "JPY", "minor": 1000, "exponent": 0, "display": "¥1000" },
+    { "id": "format-usd", "type": "format", "currency": "USD", "minor": 50, "exponent": 2, "display": "$0.50" },
+    { "id": "parse-integer", "type": "parse-amount", "input": "10", "pence": 1000 },
+    { "id": "parse-decimal", "type": "parse-amount", "input": "10.50", "pence": 1050 },
+    { "id": "parse-single-decimal", "type": "parse-amount", "input": "10.5", "pence": 1050 },
+    { "id": "parse-leading-zeros", "type": "parse-amount", "input": "0004.20", "pence": 420 },
+    { "id": "parse-max", "type": "parse-amount", "input": "10000", "pence": 1000000 },
+    { "id": "parse-zero", "type": "parse-amount", "input": "0", "error": "Amount must be greater than zero" },
+    { "id": "parse-negative", "type": "parse-amount", "input": "-10.50", "error": "Amount cannot contain sign or exponent notation" },
+    { "id": "parse-exponent", "type": "parse-amount", "input": "1e3", "error": "Amount cannot contain sign or exponent notation" },
+    { "id": "parse-too-many-decimals", "type": "parse-amount", "input": "10.501", "error": "Amount must have at most 2 decimal places" },
+    { "id": "parse-too-large", "type": "parse-amount", "input": "10001", "error": "Amount cannot exceed £10,000" },
+    { "id": "parse-empty", "type": "parse-amount", "input": "", "error": "Amount is required" },
+    { "id": "parse-whitespace", "type": "parse-amount", "input": "   ", "error": "Amount is required" },
+    {
+      "id": "cache-expiry-and-session",
+      "type": "cache",
+      "ttl": 30000,
+      "catalog": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B", "price": 2599 }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "steps": [
+        { "op": "store", "session": "room-a", "at": 1000 },
+        { "op": "read", "session": "room-a", "at": 30999, "expect": "hit" },
+        { "op": "read", "session": "room-a", "at": 31000, "expect": "expired" },
+        { "op": "read", "session": "room-b", "at": 20000, "expect": "miss" },
+        { "op": "read", "session": "room-a", "at": 20000, "expect": "hit" },
+        { "op": "store", "session": "room-b", "at": 40000 },
+        { "op": "read", "session": "room-b", "at": 40001, "expect": "hit" },
+        { "op": "read", "session": "room-a", "at": 40001, "expect": "miss" }
+      ]
+    },
+    {
+      "id": "process-death-retains-key",
+      "type": "idempotency",
+      "steps": [
+        { "op": "begin", "session": "room-a", "key": "idem-fixed-1", "recipientId": "northline-studio", "currency": "GBP", "minor": 2599, "exponent": 2, "method": "card", "note": "Design tools", "expect": "accepted" },
+        { "op": "expect", "status": "draft", "key": "idem-fixed-1" },
+        { "op": "markUncertain" },
+        { "op": "kill" },
+        { "op": "expect", "status": "uncertain", "key": "idem-fixed-1" },
+        { "op": "retry", "note": "Design tools", "expect": "accepted", "key": "idem-fixed-1" },
+        { "op": "retry", "note": "Changed", "expect": "rejected", "code": "IDEMPOTENCY_MISMATCH" },
+        { "op": "expect", "status": "uncertain", "key": "idem-fixed-1" },
+        { "op": "begin", "session": "room-a", "key": "idem-new", "recipientId": "northline-studio", "currency": "GBP", "minor": 2599, "exponent": 2, "method": "card", "note": "Design tools", "expect": "rejected", "code": "IDEMPOTENCY_RETAINED" },
+        { "op": "expectSnapshot", "snapshot": "{\"version\":1,\"empty\":false,\"sessionId\":\"room-a\",\"key\":\"idem-fixed-1\",\"status\":\"uncertain\",\"recipientId\":\"northline-studio\",\"currency\":\"GBP\",\"minor\":2599,\"exponent\":2,\"method\":\"card\",\"note\":\"Design tools\"}" }
+      ]
+    },
+    {
+      "id": "restore-baked-snapshot",
+      "type": "idempotency",
+      "steps": [
+        { "op": "restore", "snapshot": "{\"version\":1,\"empty\":false,\"sessionId\":\"room-a\",\"key\":\"idem-fixed-1\",\"status\":\"uncertain\",\"recipientId\":\"northline-studio\",\"currency\":\"GBP\",\"minor\":2599,\"exponent\":2,\"method\":\"card\",\"note\":\"Design tools\"}" },
+        { "op": "expect", "status": "uncertain", "key": "idem-fixed-1" },
+        { "op": "retry", "note": "Design tools", "recipientId": "northline-studio", "minor": 2599, "method": "card", "currency": "GBP", "expect": "accepted", "key": "idem-fixed-1" },
+        { "op": "retry", "note": "Design tools", "method": "bank", "expect": "rejected", "code": "IDEMPOTENCY_MISMATCH" }
+      ]
+    },
+    {
+      "id": "draft-discard-then-new-key",
+      "type": "idempotency",
+      "steps": [
+        { "op": "begin", "session": "room-a", "key": "draft-1", "recipientId": "northline-studio", "currency": "GBP", "minor": 100, "exponent": 2, "method": "card", "note": "", "expect": "accepted" },
+        { "op": "discardDraft", "expect": "accepted" },
+        { "op": "expect", "status": "empty", "key": null },
+        { "op": "begin", "session": "room-a", "key": "draft-2", "recipientId": "northline-studio", "currency": "GBP", "minor": 100, "exponent": 2, "method": "card", "note": "", "expect": "accepted" },
+        { "op": "expect", "status": "draft", "key": "draft-2" }
+      ]
+    },
+    {
+      "id": "completed-allows-next-payment",
+      "type": "idempotency",
+      "steps": [
+        { "op": "begin", "session": "room-a", "key": "done-1", "recipientId": "maya-chen", "currency": "GBP", "minor": 15000, "exponent": 2, "method": "bank", "note": "Class", "expect": "accepted" },
+        { "op": "markUncertain" },
+        { "op": "discardDraft", "expect": "rejected", "code": "IDEMPOTENCY_RETAINED" },
+        { "op": "markCompleted" },
+        { "op": "begin", "session": "room-a", "key": "done-2", "recipientId": "maya-chen", "currency": "GBP", "minor": 15000, "exponent": 2, "method": "bank", "note": "Class", "expect": "accepted" },
+        { "op": "expect", "status": "draft", "key": "done-2" }
+      ]
+    },
+    {
+      "id": "reject-replayed-return",
+      "type": "deep-link",
+      "steps": [
+        { "op": "select", "session": "room-a" },
+        { "op": "arm", "session": "room-a", "paymentId": "pay-1", "nonce": "nonce-1", "exp": 5000, "key": "idem-fixed-1", "expect": "accepted" },
+        { "op": "open", "paymentId": "pay-1", "nonce": "nonce-1", "now": 4999, "expect": "accepted", "key": "idem-fixed-1" },
+        { "op": "open", "paymentId": "pay-1", "nonce": "nonce-1", "now": 4999, "expect": "rejected", "code": "REPLAY" },
+        { "op": "openUrl", "url": "meridian://payments/return?paymentId=pay-1&nonce=nonce-1&exp=5000&session=room-a", "now": 1000, "expect": "rejected", "code": "REPLAY" },
+        { "op": "expectSelected", "session": "room-a" }
+      ]
+    },
+    {
+      "id": "reject-expired-return",
+      "type": "deep-link",
+      "steps": [
+        { "op": "select", "session": "room-a" },
+        { "op": "arm", "session": "room-a", "paymentId": "pay-2", "nonce": "nonce-2", "exp": 5000, "key": "idem-fixed-2", "expect": "accepted" },
+        { "op": "open", "paymentId": "pay-2", "nonce": "nonce-2", "now": 5000, "expect": "rejected", "code": "EXPIRED" },
+        { "op": "openUrl", "url": "meridian://payments/return?paymentId=pay-2&nonce=nonce-2&exp=5000&session=room-a", "now": 9000, "expect": "rejected", "code": "EXPIRED" },
+        { "op": "expectSelected", "session": "room-a" }
+      ]
+    },
+    {
+      "id": "return-keeps-selected-session",
+      "type": "deep-link",
+      "steps": [
+        { "op": "select", "session": "room-a" },
+        { "op": "arm", "session": "room-b", "paymentId": "pay-3", "nonce": "nonce-3", "exp": 8000, "key": "idem-fixed-3", "expect": "rejected", "code": "SESSION_MISMATCH" },
+        { "op": "arm", "session": "room-a", "paymentId": "pay-3", "nonce": "nonce-3", "exp": 8000, "key": "idem-fixed-3", "expect": "accepted" },
+        { "op": "select", "session": "room-b" },
+        { "op": "open", "paymentId": "pay-3", "nonce": "nonce-3", "now": 1000, "expect": "rejected", "code": "SESSION_MISMATCH" },
+        { "op": "openUrl", "url": "https://evil.example/return?paymentId=pay-3&nonce=nonce-3&exp=8000&session=room-b", "now": 1000, "expect": "rejected", "code": "MALFORMED_LINK" },
+        { "op": "openUrl", "url": "meridian://payments/return?paymentId=pay-3&nonce=nonce-3&session=room-b", "now": 1000, "expect": "rejected", "code": "MALFORMED_LINK" },
+        { "op": "expectSelected", "session": "room-b" },
+        { "op": "select", "session": "room-a" },
+        { "op": "open", "paymentId": "pay-3", "nonce": "nonce-3", "now": 1000, "expect": "accepted", "key": "idem-fixed-3" }
+      ]
+    },
+    {
+      "id": "catalog-missing-name",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "  ", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B" }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": { "ok": false, "code": "MALFORMED_CATALOG" }
+    },
+    {
+      "id": "catalog-bad-category",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Crypto", "color": "#FF6B6B" }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": { "ok": false, "code": "MALFORMED_CATALOG" }
+    },
+    {
+      "id": "catalog-unknown-provider",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B" }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "other", "name": "Other", "description": "Not in the baseline", "methods": ["card"] }
+        ]
+      },
+      "expect": { "ok": false, "code": "UNKNOWN_PROVIDER" }
+    },
+    {
+      "id": "catalog-wrong-methods",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["bank"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": { "ok": false, "code": "MALFORMED_CATALOG" }
+    },
+    {
+      "id": "catalog-impossible-date",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-02-31",
+        "recipients": [],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": { "ok": false, "code": "MALFORMED_CATALOG" }
+    },
+    {
+      "id": "catalog-negative-price",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B", "price": -1 }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": { "ok": false, "code": "INVALID_AMOUNT" }
+    },
+    {
+      "id": "assistive-labels",
+      "type": "accessibility",
+      "minTouchTargetPt": 44,
+      "minTouchTargetDp": 48,
+      "elements": [
+        { "id": "balance", "voiceOverLabel": "Everyday account balance", "talkBackDescription": "Everyday account balance", "traits": ["updatesFrequently"], "textDirection": "ltr", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "amount-input", "voiceOverLabel": "Amount in pounds", "talkBackDescription": "Amount in pounds", "traits": ["textField"], "textDirection": "ltr", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "review-payment", "voiceOverLabel": "Review payment", "talkBackDescription": "Review payment", "traits": ["button"], "textDirection": "locale", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "confirm-payment", "voiceOverLabel": "Confirm payment", "talkBackDescription": "Confirm payment", "traits": ["button"], "textDirection": "locale", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "method-card", "voiceOverLabel": "Debit card · Adyen", "talkBackDescription": "Debit card · Adyen", "traits": ["button"], "textDirection": "locale", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "method-bank", "voiceOverLabel": "Bank payment · Worldpay", "talkBackDescription": "Bank payment · Worldpay", "traits": ["button"], "textDirection": "locale", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "connect", "voiceOverLabel": "Connect", "talkBackDescription": "Connect", "traits": ["button"], "textDirection": "locale", "scalesWithFont": true, "mirrorsInRtl": false },
+        { "id": "back-navigation", "voiceOverLabel": "Back", "talkBackDescription": "Back", "traits": ["button"], "textDirection": "locale", "scalesWithFont": true, "mirrorsInRtl": true }
+      ]
+    },
+    { "id": "font-ios-1", "type": "font-scale", "platform": "ios", "fontScale": 1.0, "minHeight": 44, "text": "Review payment", "containerWidth": 320, "baseSize": 16, "lines": 1 },
+    { "id": "font-ios-1-3", "type": "font-scale", "platform": "ios", "fontScale": 1.3, "minHeight": 50, "text": "Everyday account balance", "containerWidth": 320, "baseSize": 16, "lines": 1 },
+    { "id": "font-ios-2", "type": "font-scale", "platform": "ios", "fontScale": 2.0, "minHeight": 64, "text": "Everyday account balance", "containerWidth": 320, "baseSize": 16, "lines": 2 },
+    { "id": "font-ios-2-narrow", "type": "font-scale", "platform": "ios", "fontScale": 2.0, "minHeight": 64, "text": "Everyday account balance", "containerWidth": 200, "baseSize": 16, "lines": 3 },
+    { "id": "font-android-1", "type": "font-scale", "platform": "android", "fontScale": 1.0, "minHeight": 48, "text": "Review payment", "containerWidth": 320, "baseSize": 16, "lines": 1 },
+    { "id": "font-android-1-3", "type": "font-scale", "platform": "android", "fontScale": 1.3, "minHeight": 50, "text": "Everyday account balance", "containerWidth": 320, "baseSize": 16, "lines": 1 },
+    { "id": "font-android-2", "type": "font-scale", "platform": "android", "fontScale": 2.0, "minHeight": 64, "text": "Everyday account balance", "containerWidth": 320, "baseSize": 16, "lines": 2 },
+    {
+      "id": "rtl-layout-readiness",
+      "type": "rtl",
+      "direction": "rtl",
+      "startEdge": "right",
+      "endEdge": "left",
+      "amountDirection": "ltr",
+      "mirrored": ["back-navigation"],
+      "notMirrored": ["balance", "amount-input"]
+    },
+    {
+      "id": "ltr-layout",
+      "type": "rtl",
+      "direction": "ltr",
+      "startEdge": "left",
+      "endEdge": "right",
+      "amountDirection": "ltr",
+      "mirrored": [],
+      "notMirrored": ["balance", "amount-input", "back-navigation"]
+    }
+  ]
+}

@@ -3,6 +3,12 @@
   <application android:allowBackup="false" android:usesCleartextTraffic="false" android:label="Meridian Money" android:theme="@android:style/Theme.Material.Light.NoActionBar">
     <activity android:name=".MainActivity" android:exported="true">
       <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="meridian" android:host="payments" android:path="/return"/>
+      </intent-filter>
     </activity>
   </application>
 </manifest>
