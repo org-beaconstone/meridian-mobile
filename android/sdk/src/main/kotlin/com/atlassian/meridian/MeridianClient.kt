@@ -1,7 +1,5 @@
 package com.atlassian.meridian
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
@@ -17,7 +15,7 @@ class MeridianClient(
   private val baseURL: String,
   private val sessionId: String,
 ) {
-  private val mapper = ObjectMapper().registerKotlinModule()
+  private val mapper = newMeridianMapper()
   private val baseUrlNormalized = baseURL.removeSuffix("/")
 
   init {
@@ -160,6 +158,25 @@ class MeridianClient(
       PaymentResponse::class.java,
     )
   }
+
+  /**
+   * POST /payments using a Money value. Only GBP exponent 2 is sent, as integer pence.
+   */
+  suspend fun submitPayment(
+    recipientId: String,
+    amount: Money,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = Scenario.success,
+    idempotencyKey: String,
+  ): PaymentResponse = submitPayment(
+    recipientId = recipientId,
+    amountMinor = amount.requireLegacyGbpPence(),
+    method = method,
+    note = note,
+    scenario = scenario,
+    idempotencyKey = idempotencyKey,
+  )
 
   /**
    * PATCH /budgets - Update budget for a category

@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
     Text(message)
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
+        Column(Modifier.padding(22.dp)){Text("Everyday account");Text(current.balance.formatted(),style=MaterialTheme.typography.h3);Text("Room: $room")}
       }
       Text("Make a payment",style=MaterialTheme.typography.h6)
       catalog?.recipients?.forEach { person ->
@@ -73,9 +73,10 @@ class MainActivity : ComponentActivity() {
       Row {RadioButton(method==PaymentMethod.bank,{method=PaymentMethod.bank},enabled=!review&&!busy);Text("Bank payment · Worldpay",Modifier.padding(top=12.dp))}
       if(!review) Button(onClick={val parsed=parseAmount(amount);if(parsed.first==null)message=parsed.second?:"Invalid amount" else {review=true;paymentKey=UUID.randomUUID().toString()}},enabled=!busy){Text("Review payment")}
       else {
-        Text("Confirm £$amount to $recipient")
+        val reviewed = parseAmount(amount).first
+        if (reviewed != null) Text("Confirm ${Money.gbpPence(reviewed).formatted(java.util.Locale.UK)} to $recipient")
         Button(onClick={val active=client;val minor=parseAmount(amount).first;if(active!=null&&minor!=null&&!busy){busy=true;revision++;scope.launch{
-          try {val result=active.submitPayment(recipientId=recipient,amountMinor=minor,method=method,note=note,idempotencyKey=paymentKey)
+          try {val result=active.submitPayment(recipientId=recipient,amount=Money.gbpPence(minor),method=method,note=note,idempotencyKey=paymentKey)
             if(result.ok){state=result.state;review=false;amount="";note="";paymentKey=UUID.randomUUID().toString();message="Demo payment complete"}
             else message=result.error?:"Awaiting confirmation. Retry the same payment."
           }catch(e:Exception){message="Outcome may be unknown: ${e.message}. Retry keeps the same key."}finally{revision++;busy=false}
@@ -83,9 +84,9 @@ class MainActivity : ComponentActivity() {
         TextButton(onClick={review=false;paymentKey=UUID.randomUUID().toString()},enabled=!busy){Text("Edit details")}
       }
       Text("Recent activity",style=MaterialTheme.typography.h6)
-      current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${money(transaction.amount)} · ${transaction.provider}")}
+      current.transactions.reversed().take(8).forEach {transaction->Text("${transaction.name} · ${transaction.amount.formatted()} · ${transaction.provider}")}
       Text("Budgets",style=MaterialTheme.typography.h6)
-      current.budgets.forEach {budget->Text("${budget.category} · ${money(budget.limit)}")}
+      current.budgets.forEach {budget->Text("${budget.category} · ${budget.limit.formatted()}")}
     }
   }
 }

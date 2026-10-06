@@ -33,7 +33,7 @@ import MeridianSDK
         if let state {
           VStack(alignment: .leading, spacing: 8) {
             Text("Everyday account · GBP").font(.caption)
-            Text(money(state.balance)).font(.system(size: 38, weight: .medium))
+            Text(state.balance.formatted()).font(.system(size: 38, weight: .medium))
             Text("Shared room: \(room)").font(.caption)
           }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(Color(red:0.078,green:0.173,blue:0.208)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 16))
           Text("Make a payment").font(.title2)
@@ -45,16 +45,18 @@ import MeridianSDK
           // Intentionally hardcoded baseline: new providers still require a native release.
           Picker("Method", selection: $method) { Text("Debit card · Adyen").tag(PaymentMethod.card); Text("Bank payment · Worldpay").tag(PaymentMethod.bank) }.disabled(review || busy)
           if review {
-            Text("Confirm \(amount) GBP to \(recipient)").font(.headline)
+            if let minor = parseAmount(amount).0 {
+              Text("Confirm \(Money.gbpPence(minor).formatted(locale: Locale(identifier: "en_GB"))) to \(recipient)").font(.headline)
+            }
             Button("Confirm payment") { Task { await pay() } }.buttonStyle(.borderedProminent).disabled(busy)
             Button("Edit details") { review=false; key=UUID().uuidString }.disabled(busy)
           } else {
             Button("Review payment") { let (value,error)=parseAmount(amount); guard value != nil else {message=error ?? "Invalid amount";return}; guard reference.count<=200 else {message="Reference is too long"; return}; key=UUID().uuidString; review=true; message="Review before confirming. No real money moves." }.disabled(busy)
           }
           Text("Recent activity").font(.title2)
-          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(money(transaction.amount)) } }
+          ForEach(Array(state.transactions.reversed().prefix(8)), id: \.id) { transaction in HStack { VStack(alignment:.leading){Text(transaction.name);Text(transaction.provider.rawValue).font(.caption).foregroundStyle(.secondary)};Spacer();Text(transaction.amount.formatted()) } }
           Text("September budgets").font(.title2)
-          ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(money(budget.limit))} }
+          ForEach(state.budgets, id: \.category) { budget in HStack {Text(budget.category.rawValue);Spacer();Text(budget.limit.formatted())} }
         }
       }.padding(24).frame(maxWidth: 550)
     }.task {
@@ -76,7 +78,7 @@ import MeridianSDK
     do {
       let (minor,error)=parseAmount(amount)
       guard let minor else {message=error ?? "Invalid amount";return}
-      let result=try await client.submitPayment(recipientId:recipient,amountMinor:minor,method:method,note:reference,scenario:.success,idempotencyKey:key)
+      let result=try await client.submitPayment(recipientId:recipient,amount:Money.gbpPence(minor),method:method,note:reference,scenario:.success,idempotencyKey:key)
       if result.ok {state=result.state;review=false;amount="";reference="";key=UUID().uuidString;message="Demo payment completed. Other clients will refresh."}
       else {message=result.error ?? "Payment pending. Retry the same payment, not a new one."}
     } catch {message="Outcome may be unknown: \(error). Retry preserves the payment key."}
