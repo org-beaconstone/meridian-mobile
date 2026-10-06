@@ -1,9 +1,10 @@
+import CryptoKit
 import Foundation
 @testable import MeridianSDK
 
 @main
 struct MeridianSDKChecks {
-  static func main() {
+  static func main() async {
     print("=== Meridian SDK Checks ===\n")
 
     var passed = 0
@@ -341,10 +342,387 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: SCA stub - always succeed
+    print("21. SCA AlwaysSucceedSCAHandler...")
+    let scaSucceed = AlwaysSucceedSCAHandler()
+    let scaResult21 = await scaSucceed.authenticate(challenge: .any(reason: "Confirm payment"))
+    if case .success = scaResult21 {
+      print("  ✓ AlwaysSucceedSCAHandler returned .success")
+      passed += 1
+    } else {
+      print("  ✗ Expected .success, got: \(scaResult21)")
+      failed += 1
+    }
+
+    // CHECK 22: SCA stub - always fail
+    print("22. SCA AlwaysFailSCAHandler...")
+    let scaFail = AlwaysFailSCAHandler(reason: "Test failure")
+    let scaResult22 = await scaFail.authenticate(challenge: .biometric(reason: "Confirm payment"))
+    if case let .failed(reason) = scaResult22, reason == "Test failure" {
+      print("  ✓ AlwaysFailSCAHandler returned .failed(\"Test failure\")")
+      passed += 1
+    } else {
+      print("  ✗ Expected .failed(\"Test failure\"), got: \(scaResult22)")
+      failed += 1
+    }
+
+    // CHECK 23: SCA stub - always cancel
+    print("23. SCA AlwaysCancelSCAHandler...")
+    let scaCancel = AlwaysCancelSCAHandler()
+    let scaResult23 = await scaCancel.authenticate(challenge: .pin(reason: "Enter PIN"))
+    if case .cancelled = scaResult23 {
+      print("  ✓ AlwaysCancelSCAHandler returned .cancelled")
+      passed += 1
+    } else {
+      print("  ✗ Expected .cancelled, got: \(scaResult23)")
+      failed += 1
+    }
+
+    // CHECK 24: ReturnStateToken round-trip
+    print("24. ReturnStateToken round-trip...")
+    do {
+      let keyData = Data(SHA256.hash(data: Data("test-session".utf8)))
+      let key = SymmetricKey(data: keyData)
+      let token = try ReturnStateToken.generate(paymentId: "pay-001", signingKey: key)
+      let payload = try ReturnStateToken.verify(token: token, signingKey: key)
+      if payload.paymentId == "pay-001" && !payload.nonce.isEmpty {
+        print("  ✓ Token round-trip: paymentId=\(payload.paymentId)")
+        passed += 1
+      } else {
+        print("  ✗ Payload mismatch: \(payload)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: ReturnStateToken rejects wrong key
+    print("25. ReturnStateToken rejects wrong signing key...")
+    do {
+      let keyA = SymmetricKey(data: Data(SHA256.hash(data: Data("session-A".utf8))))
+      let keyB = SymmetricKey(data: Data(SHA256.hash(data: Data("session-B".utf8))))
+      let token = try ReturnStateToken.generate(paymentId: "pay-X", signingKey: keyA)
+      do {
+        _ = try ReturnStateToken.verify(token: token, signingKey: keyB)
+        print("  ✗ Should have rejected mismatched key")
+        failed += 1
+      } catch HandoffError.invalidReturnState {
+        print("  ✓ Token correctly rejected mismatched signing key")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 26: ReturnStateToken rejects malformed token
+    print("26. ReturnStateToken rejects malformed token...")
+    do {
+      let key = SymmetricKey(data: Data(SHA256.hash(data: Data("session".utf8))))
+      do {
+        _ = try ReturnStateToken.verify(token: "nodothere", signingKey: key)
+        print("  ✗ Should have rejected token with no separator")
+        failed += 1
+      } catch HandoffError.invalidReturnState {
+        print("  ✓ Malformed token correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 27: ReturnStateValidator accepts valid token
+    print("27. ReturnStateValidator accepts valid token...")
+    do {
+      let key = SymmetricKey(data: Data(SHA256.hash(data: Data("test-session".utf8))))
+      let token = try ReturnStateToken.generate(paymentId: "pay-valid", signingKey: key)
+      let validator = ReturnStateValidator(signingKey: key, tokenTTL: 300)
+      let payload = try await validator.validate(token: token)
+      if payload.paymentId == "pay-valid" {
+        print("  ✓ Validator accepted fresh token: paymentId=\(payload.paymentId)")
+        passed += 1
+      } else {
+        print("  ✗ Payload mismatch: \(payload)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 28: ReturnStateValidator rejects expired token
+    print("28. ReturnStateValidator rejects expired token...")
+    do {
+      let key = SymmetricKey(data: Data(SHA256.hash(data: Data("test-session".utf8))))
+      let oldPayload = ReturnStatePayload(
+        paymentId: "pay-old",
+        issuedAt: Int64(Date().timeIntervalSince1970) - 601,
+        nonce: UUID().uuidString
+      )
+      let token = try ReturnStateToken.sign(payload: oldPayload, signingKey: key)
+      let validator = ReturnStateValidator(signingKey: key, tokenTTL: 300)
+      do {
+        _ = try await validator.validate(token: token)
+        print("  ✗ Should have rejected expired token")
+        failed += 1
+      } catch HandoffError.expiredReturnState {
+        print("  ✓ Expired token correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 29: ReturnStateValidator rejects replayed token
+    print("29. ReturnStateValidator rejects replayed token...")
+    do {
+      let key = SymmetricKey(data: Data(SHA256.hash(data: Data("test-session".utf8))))
+      let token = try ReturnStateToken.generate(paymentId: "pay-replay", signingKey: key)
+      let validator = ReturnStateValidator(signingKey: key, tokenTTL: 300)
+      _ = try await validator.validate(token: token)
+      do {
+        _ = try await validator.validate(token: token)
+        print("  ✗ Should have rejected replayed token")
+        failed += 1
+      } catch HandoffError.replayedReturnState {
+        print("  ✓ Replayed token correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 30: BankHandoffManager builds handoff URL
+    print("30. BankHandoffManager builds handoff URL...")
+    do {
+      let manager = BankHandoffManager(sessionId: "room-test")
+      let bankURL = URL(string: "https://secure.worldpay.com/checkout")!
+      let url = try await manager.buildHandoffURL(bankURL: bankURL, paymentId: "pay-wpy", returnScheme: "meridian")
+      if url.absoluteString.contains("returnState=") && url.absoluteString.contains("returnScheme=meridian") {
+        print("  ✓ Handoff URL built: host=\(url.host ?? "?")")
+        passed += 1
+      } else {
+        print("  ✗ URL missing expected params: \(url)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 31: BankHandoffManager rejects HTTP URL
+    print("31. BankHandoffManager rejects HTTP (non-HTTPS) URL...")
+    do {
+      let manager = BankHandoffManager(sessionId: "room-test")
+      let bankURL = URL(string: "http://secure.worldpay.com/checkout")!
+      do {
+        _ = try await manager.buildHandoffURL(bankURL: bankURL, paymentId: "pay-x", returnScheme: "meridian")
+        print("  ✗ Should have rejected HTTP URL")
+        failed += 1
+      } catch HandoffError.disallowedURL {
+        print("  ✓ HTTP URL correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 32: BankHandoffManager rejects non-allowlisted host
+    print("32. BankHandoffManager rejects non-allowlisted host...")
+    do {
+      let manager = BankHandoffManager(sessionId: "room-test")
+      let bankURL = URL(string: "https://evil.example.com/steal")!
+      do {
+        _ = try await manager.buildHandoffURL(bankURL: bankURL, paymentId: "pay-x", returnScheme: "meridian")
+        print("  ✗ Should have rejected non-allowlisted host")
+        failed += 1
+      } catch HandoffError.disallowedURL {
+        print("  ✓ Non-allowlisted host correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 33: BankHandoffManager handles return URL (round-trip)
+    print("33. BankHandoffManager handles return URL (full round-trip)...")
+    do {
+      let manager = BankHandoffManager(sessionId: "room-test")
+      let bankURL = URL(string: "https://secure.worldpay.com/checkout")!
+      let handoffURL = try await manager.buildHandoffURL(bankURL: bankURL, paymentId: "pay-return", returnScheme: "meridian")
+      // Simulate bank redirecting back with the same returnState.
+      let components = URLComponents(url: handoffURL, resolvingAgainstBaseURL: false)!
+      let returnState = components.queryItems!.first { $0.name == "returnState" }!.value!
+      let returnURL = URL(string: "meridian://payment/return?returnState=\(returnState)")!
+      let payload = try await manager.handleReturnURL(returnURL)
+      if payload.paymentId == "pay-return" {
+        print("  ✓ Return URL validated: paymentId=\(payload.paymentId)")
+        passed += 1
+      } else {
+        print("  ✗ Payload mismatch: \(payload)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 34: BankHandoffManager rejects missing returnState
+    print("34. BankHandoffManager rejects missing returnState param...")
+    do {
+      let manager = BankHandoffManager(sessionId: "room-test")
+      let returnURL = URL(string: "meridian://payment/return?status=ok")!
+      do {
+        _ = try await manager.handleReturnURL(returnURL)
+        print("  ✗ Should have rejected URL with no returnState")
+        failed += 1
+      } catch HandoffError.missingReturnState {
+        print("  ✓ Missing returnState correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 35: BankHandoffManager rejects cross-session return state
+    print("35. BankHandoffManager rejects return state from different session...")
+    do {
+      let managerA = BankHandoffManager(sessionId: "session-A")
+      let managerB = BankHandoffManager(sessionId: "session-B")
+      let bankURL = URL(string: "https://secure.worldpay.com/checkout")!
+      let handoffURL = try await managerA.buildHandoffURL(bankURL: bankURL, paymentId: "pay-x", returnScheme: "meridian")
+      let components = URLComponents(url: handoffURL, resolvingAgainstBaseURL: false)!
+      let returnState = components.queryItems!.first { $0.name == "returnState" }!.value!
+      let returnURL = URL(string: "meridian://payment/return?returnState=\(returnState)")!
+      do {
+        _ = try await managerB.handleReturnURL(returnURL)
+        print("  ✗ Should have rejected cross-session token")
+        failed += 1
+      } catch HandoffError.invalidReturnState {
+        print("  ✓ Cross-session token correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 36: BankHandoffManager rejects replayed return URL
+    print("36. BankHandoffManager rejects replayed return URL...")
+    do {
+      let manager = BankHandoffManager(sessionId: "room-replay")
+      let bankURL = URL(string: "https://checkout.adyen.com/pay")!
+      let handoffURL = try await manager.buildHandoffURL(bankURL: bankURL, paymentId: "pay-rpl", returnScheme: "meridian")
+      let components = URLComponents(url: handoffURL, resolvingAgainstBaseURL: false)!
+      let returnState = components.queryItems!.first { $0.name == "returnState" }!.value!
+      let returnURL = URL(string: "meridian://payment/return?returnState=\(returnState)")!
+      // First call succeeds.
+      _ = try await manager.handleReturnURL(returnURL)
+      // Second call must fail.
+      do {
+        _ = try await manager.handleReturnURL(returnURL)
+        print("  ✗ Should have rejected replayed return URL")
+        failed += 1
+      } catch HandoffError.replayedReturnState {
+        print("  ✓ Replayed return URL correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 37: BankHandoffManager rejects expired return URL
+    print("37. BankHandoffManager rejects expired return URL...")
+    do {
+      let sessionId = "room-expiry"
+      let keyData = Data(SHA256.hash(data: Data(sessionId.utf8)))
+      let key = SymmetricKey(data: keyData)
+      let oldPayload = ReturnStatePayload(
+        paymentId: "pay-exp",
+        issuedAt: Int64(Date().timeIntervalSince1970) - 601,
+        nonce: UUID().uuidString
+      )
+      let token = try ReturnStateToken.sign(payload: oldPayload, signingKey: key)
+      let manager = BankHandoffManager(sessionId: sessionId, tokenTTL: 300)
+      let returnURL = URL(string: "meridian://payment/return?returnState=\(token)")!
+      do {
+        _ = try await manager.handleReturnURL(returnURL)
+        print("  ✗ Should have rejected expired return URL")
+        failed += 1
+      } catch HandoffError.expiredReturnState {
+        print("  ✓ Expired return URL correctly rejected")
+        passed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
+    // CHECK 38: HandoffError descriptions are non-empty
+    print("38. HandoffError descriptions are non-empty...")
+    let errors: [HandoffError] = [
+      .disallowedURL("https://evil.com"),
+      .invalidReturnState("bad sig"),
+      .expiredReturnState,
+      .replayedReturnState,
+      .missingReturnState,
+    ]
+    let allHaveDescriptions = errors.allSatisfy { ($0.errorDescription ?? "").isEmpty == false }
+    if allHaveDescriptions {
+      print("  ✓ All HandoffError cases have non-empty descriptions")
+      passed += 1
+    } else {
+      print("  ✗ One or more HandoffError cases have empty descriptions")
+      failed += 1
+    }
+
+    // CHECK 39: SCA challenge reason is accessible
+    print("39. SCA challenge reason accessors...")
+    let challenges: [SCAChallenge] = [
+      .biometric(reason: "bio-reason"),
+      .pin(reason: "pin-reason"),
+      .any(reason: "any-reason"),
+    ]
+    let allHaveReason = challenges.allSatisfy { !$0.reason.isEmpty }
+    if allHaveReason {
+      print("  ✓ All SCAChallenge cases expose a non-empty reason")
+      passed += 1
+    } else {
+      print("  ✗ One or more SCAChallenge cases returned an empty reason")
+      failed += 1
+    }
+
+    // CHECK 40: Adyen host accepted in BankHandoffManager allowlist
+    print("40. BankHandoffManager accepts Adyen allowlisted host...")
+    do {
+      let manager = BankHandoffManager(sessionId: "adyen-session")
+      let bankURL = URL(string: "https://live.adyen.com/hpp/pay.shtml")!
+      let url = try await manager.buildHandoffURL(bankURL: bankURL, paymentId: "pay-adyen", returnScheme: "meridian")
+      if url.host == "live.adyen.com" && url.absoluteString.contains("returnState=") {
+        print("  ✓ Adyen host accepted; returnState attached")
+        passed += 1
+      } else {
+        print("  ✗ Unexpected URL: \(url)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ Unexpected error: \(error)")
+      failed += 1
+    }
+
     // Summary
+    let total = 40
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

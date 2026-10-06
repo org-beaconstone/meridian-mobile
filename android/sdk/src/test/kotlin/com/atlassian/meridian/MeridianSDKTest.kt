@@ -374,4 +374,296 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - SCA Handler Tests
+
+  @Test
+  fun testSCAAlwaysSucceedStub() = runBlocking {
+    val handler = AlwaysSucceedSCAHandler()
+    val result = handler.authenticate(SCAChallenge.Any("Confirm payment"))
+    assertTrue(result is SCAResult.Success)
+  }
+
+  @Test
+  fun testSCAAlwaysFailStub() = runBlocking {
+    val handler = AlwaysFailSCAHandler("Biometrics unavailable")
+    val result = handler.authenticate(SCAChallenge.Biometric("Confirm payment"))
+    assertTrue(result is SCAResult.Failed)
+    assertEquals("Biometrics unavailable", (result as SCAResult.Failed).reason)
+  }
+
+  @Test
+  fun testSCAAlwaysCancelStub() = runBlocking {
+    val handler = AlwaysCancelSCAHandler()
+    val result = handler.authenticate(SCAChallenge.Pin("Confirm payment"))
+    assertTrue(result is SCAResult.Cancelled)
+  }
+
+  @Test
+  fun testSCAChallengeReasonPropagated() = runBlocking {
+    val challenges = listOf(
+      SCAChallenge.Any("reason-any"),
+      SCAChallenge.Biometric("reason-bio"),
+      SCAChallenge.Pin("reason-pin"),
+    )
+    challenges.forEach { challenge ->
+      assertTrue(challenge.reason.isNotEmpty())
+    }
+  }
+
+  // MARK: - ReturnStateToken Tests
+
+  @Test
+  fun testReturnStateTokenRoundTrip() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    val token = ReturnStateToken.generate("pay-001", key)
+    val payload = ReturnStateToken.verify(token, key)
+    assertEquals("pay-001", payload.paymentId)
+    assertTrue(payload.issuedAt > 0)
+    assertTrue(payload.nonce.isNotEmpty())
+  }
+
+  @Test
+  fun testReturnStateTokenSignatureMismatch() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    val wrongKey = ReturnStateToken.deriveKey("other-session")
+    val token = ReturnStateToken.generate("pay-001", key)
+    try {
+      ReturnStateToken.verify(token, wrongKey)
+      fail("Expected HandoffError.InvalidReturnState")
+    } catch (e: HandoffError.InvalidReturnState) {
+      assertTrue(e.message!!.contains("Signature mismatch"))
+    }
+  }
+
+  @Test
+  fun testReturnStateTokenTamperedPayload() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    val token = ReturnStateToken.generate("pay-001", key)
+    // Flip one char in the payload portion.
+    val dotIndex = token.indexOf('.')
+    val tampered = "X" + token.substring(1, dotIndex) + token.substring(dotIndex)
+    try {
+      ReturnStateToken.verify(tampered, key)
+      fail("Expected HandoffError.InvalidReturnState")
+    } catch (e: HandoffError.InvalidReturnState) {
+      // Expected.
+    }
+  }
+
+  @Test
+  fun testReturnStateTokenMalformedNoDot() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    try {
+      ReturnStateToken.verify("nodothere", key)
+      fail("Expected HandoffError.InvalidReturnState")
+    } catch (e: HandoffError.InvalidReturnState) {
+      assertTrue(e.message!!.contains("Malformed token"))
+    }
+  }
+
+  // MARK: - ReturnStateValidator Tests
+
+  @Test
+  fun testValidatorAcceptsValidToken() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    val token = ReturnStateToken.generate("pay-123", key)
+    val validator = ReturnStateValidator(key, tokenTTL = 300L)
+    val payload = validator.validate(token)
+    assertEquals("pay-123", payload.paymentId)
+  }
+
+  @Test
+  fun testValidatorRejectsExpiredToken() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    // Create a payload with issuedAt set 10 minutes in the past.
+    val oldPayload = ReturnStatePayload(
+      paymentId = "pay-old",
+      issuedAt = System.currentTimeMillis() / 1000L - 601L,
+      nonce = "unique-nonce-expired",
+    )
+    val token = ReturnStateToken.sign(oldPayload, key)
+    val validator = ReturnStateValidator(key, tokenTTL = 300L)
+    try {
+      validator.validate(token)
+      fail("Expected HandoffError.ExpiredReturnState")
+    } catch (e: HandoffError.ExpiredReturnState) {
+      // Expected.
+    }
+  }
+
+  @Test
+  fun testValidatorRejectsReplayedToken() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    val token = ReturnStateToken.generate("pay-replay", key)
+    val validator = ReturnStateValidator(key, tokenTTL = 300L)
+    // First validation succeeds.
+    validator.validate(token)
+    // Second validation with the same token must be rejected.
+    try {
+      validator.validate(token)
+      fail("Expected HandoffError.ReplayedReturnState")
+    } catch (e: HandoffError.ReplayedReturnState) {
+      // Expected.
+    }
+  }
+
+  @Test
+  fun testValidatorAcceptsTwoDistinctTokens() {
+    val key = ReturnStateToken.deriveKey("test-session")
+    val token1 = ReturnStateToken.generate("pay-A", key)
+    val token2 = ReturnStateToken.generate("pay-B", key)
+    val validator = ReturnStateValidator(key, tokenTTL = 300L)
+    val p1 = validator.validate(token1)
+    val p2 = validator.validate(token2)
+    assertEquals("pay-A", p1.paymentId)
+    assertEquals("pay-B", p2.paymentId)
+  }
+
+  // MARK: - BankHandoffManager Tests
+
+  @Test
+  fun testBankHandoffManagerBuildsURL() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    val url = manager.buildHandoffURL(
+      bankURL = "https://secure.worldpay.com/checkout",
+      paymentId = "pay-xyz",
+      returnScheme = "meridian",
+    )
+    assertTrue(url.contains("returnState="))
+    assertTrue(url.contains("returnScheme=meridian"))
+    assertTrue(url.startsWith("https://secure.worldpay.com/checkout"))
+  }
+
+  @Test
+  fun testBankHandoffManagerBuildsURLWithExistingParams() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    val url = manager.buildHandoffURL(
+      bankURL = "https://checkout.adyen.com/pay?merchantId=123",
+      paymentId = "pay-xyz",
+      returnScheme = "meridian",
+    )
+    assertTrue(url.contains("merchantId=123"))
+    assertTrue(url.contains("returnState="))
+  }
+
+  @Test
+  fun testBankHandoffManagerRejectsHttpURL() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    try {
+      manager.buildHandoffURL(
+        bankURL = "http://secure.worldpay.com/checkout",
+        paymentId = "pay-xyz",
+        returnScheme = "meridian",
+      )
+      fail("Expected HandoffError.DisallowedURL")
+    } catch (e: HandoffError.DisallowedURL) {
+      assertTrue(e.message!!.contains("HTTPS"))
+    }
+  }
+
+  @Test
+  fun testBankHandoffManagerRejectsNonAllowlistedHost() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    try {
+      manager.buildHandoffURL(
+        bankURL = "https://evil.example.com/steal",
+        paymentId = "pay-xyz",
+        returnScheme = "meridian",
+      )
+      fail("Expected HandoffError.DisallowedURL")
+    } catch (e: HandoffError.DisallowedURL) {
+      assertTrue(e.message!!.contains("evil.example.com"))
+    }
+  }
+
+  @Test
+  fun testBankHandoffManagerHandlesReturnURL() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    val outbound = manager.buildHandoffURL(
+      bankURL = "https://secure.worldpay.com/checkout",
+      paymentId = "pay-return",
+      returnScheme = "meridian",
+    )
+    // Extract the returnState value from the outbound URL.
+    val returnState = outbound.split("&", "?")
+      .first { it.startsWith("returnState=") }
+      .removePrefix("returnState=")
+    val returnURL = "meridian://payment/return?returnState=$returnState"
+    val payload = manager.handleReturnURL(returnURL)
+    assertEquals("pay-return", payload.paymentId)
+  }
+
+  @Test
+  fun testBankHandoffManagerRejectsMissingReturnState() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    try {
+      manager.handleReturnURL("meridian://payment/return?status=ok")
+      fail("Expected HandoffError.MissingReturnState")
+    } catch (e: HandoffError.MissingReturnState) {
+      // Expected.
+    }
+  }
+
+  @Test
+  fun testBankHandoffManagerRejectsReturnStateFromDifferentSession() {
+    val managerA = BankHandoffManager(sessionId = "session-A")
+    val managerB = BankHandoffManager(sessionId = "session-B")
+    val outbound = managerA.buildHandoffURL(
+      bankURL = "https://secure.worldpay.com/checkout",
+      paymentId = "pay-xyz",
+      returnScheme = "meridian",
+    )
+    val returnState = outbound.split("&", "?")
+      .first { it.startsWith("returnState=") }
+      .removePrefix("returnState=")
+    val returnURL = "meridian://payment/return?returnState=$returnState"
+    try {
+      managerB.handleReturnURL(returnURL)
+      fail("Expected HandoffError.InvalidReturnState")
+    } catch (e: HandoffError.InvalidReturnState) {
+      // Expected – session B cannot validate a token signed by session A.
+    }
+  }
+
+  @Test
+  fun testBankHandoffManagerRejectsReplayedReturnURL() {
+    val manager = BankHandoffManager(sessionId = "room-abc")
+    val outbound = manager.buildHandoffURL(
+      bankURL = "https://secure.worldpay.com/checkout",
+      paymentId = "pay-replay",
+      returnScheme = "meridian",
+    )
+    val returnState = outbound.split("&", "?")
+      .first { it.startsWith("returnState=") }
+      .removePrefix("returnState=")
+    val returnURL = "meridian://payment/return?returnState=$returnState"
+    // First call succeeds.
+    manager.handleReturnURL(returnURL)
+    // Second call must be rejected.
+    try {
+      manager.handleReturnURL(returnURL)
+      fail("Expected HandoffError.ReplayedReturnState")
+    } catch (e: HandoffError.ReplayedReturnState) {
+      // Expected.
+    }
+  }
+
+  @Test
+  fun testBankHandoffManagerRejectsExpiredReturnURL() {
+    val key = ReturnStateToken.deriveKey("room-abc")
+    val oldPayload = ReturnStatePayload(
+      paymentId = "pay-expired",
+      issuedAt = System.currentTimeMillis() / 1000L - 601L,
+      nonce = "unique-nonce-for-expiry-test",
+    )
+    val token = ReturnStateToken.sign(oldPayload, key)
+    val manager = BankHandoffManager(sessionId = "room-abc", tokenTTL = 300L)
+    try {
+      manager.handleReturnURL("meridian://payment/return?returnState=$token")
+      fail("Expected HandoffError.ExpiredReturnState")
+    } catch (e: HandoffError.ExpiredReturnState) {
+      // Expected.
+    }
+  }
 }
