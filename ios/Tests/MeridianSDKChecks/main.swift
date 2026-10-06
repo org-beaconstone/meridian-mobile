@@ -341,10 +341,117 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: SessionState.active label
+    print("21. SessionState active label...")
+    let activeStateLabel = SessionState.active.label
+    if activeStateLabel == "Session active" {
+      print("  ✓ active label = \"\(activeStateLabel)\"")
+      passed += 1
+    } else {
+      print("  ✗ Expected \"Session active\", got: \(activeStateLabel)")
+      failed += 1
+    }
+
+    // CHECK 22: SessionState.expiring label (sub-minute)
+    print("22. SessionState expiring label sub-minute...")
+    let expiringLabel22 = SessionState.expiring(secondsRemaining: 45).label
+    if expiringLabel22 == "Session expires in 0:45" {
+      print("  ✓ expiring(45) = \"\(expiringLabel22)\"")
+      passed += 1
+    } else {
+      print("  ✗ Expected \"Session expires in 0:45\", got: \(expiringLabel22)")
+      failed += 1
+    }
+
+    // CHECK 23: SessionState.expiring label (over a minute)
+    print("23. SessionState expiring label over a minute...")
+    let expiringLabel23 = SessionState.expiring(secondsRemaining: 90).label
+    if expiringLabel23 == "Session expires in 1:30" {
+      print("  ✓ expiring(90) = \"\(expiringLabel23)\"")
+      passed += 1
+    } else {
+      print("  ✗ Expected \"Session expires in 1:30\", got: \(expiringLabel23)")
+      failed += 1
+    }
+
+    // CHECK 24: SessionState.activeElsewhere label
+    print("24. SessionState activeElsewhere label...")
+    let elsewhereLabel = SessionState.activeElsewhere.label
+    if elsewhereLabel == "Session active on another device" {
+      print("  ✓ activeElsewhere label = \"\(elsewhereLabel)\"")
+      passed += 1
+    } else {
+      print("  ✗ Expected \"Session active on another device\", got: \(elsewhereLabel)")
+      failed += 1
+    }
+
+    // CHECK 25: SessionState.signedOut shows recovery guidance
+    print("25. SessionState signedOut showsRecoveryGuidance...")
+    if SessionState.signedOut.showsRecoveryGuidance {
+      print("  ✓ signedOut.showsRecoveryGuidance = true")
+      passed += 1
+    } else {
+      print("  ✗ Expected showsRecoveryGuidance = true for signedOut")
+      failed += 1
+    }
+
+    // CHECK 26: SessionState.unknown shows recovery guidance
+    print("26. SessionState unknown showsRecoveryGuidance...")
+    if SessionState.unknown.showsRecoveryGuidance {
+      print("  ✓ unknown.showsRecoveryGuidance = true")
+      passed += 1
+    } else {
+      print("  ✗ Expected showsRecoveryGuidance = true for unknown")
+      failed += 1
+    }
+
+    // CHECK 27: SessionState.active does not show recovery guidance
+    print("27. SessionState active does not show recovery guidance...")
+    if !SessionState.active.showsRecoveryGuidance {
+      print("  ✓ active.showsRecoveryGuidance = false")
+      passed += 1
+    } else {
+      print("  ✗ Expected showsRecoveryGuidance = false for active")
+      failed += 1
+    }
+
+    // CHECK 28: SessionState.expiring allowsRefresh
+    print("28. SessionState expiring allowsRefresh...")
+    if SessionState.expiring(secondsRemaining: 60).allowsRefresh {
+      print("  ✓ expiring.allowsRefresh = true")
+      passed += 1
+    } else {
+      print("  ✗ Expected allowsRefresh = true for expiring")
+      failed += 1
+    }
+
+    // CHECK 29: Non-expiring states do not allowsRefresh
+    print("29. SessionState signedOut does not allowsRefresh...")
+    if !SessionState.signedOut.allowsRefresh && !SessionState.activeElsewhere.allowsRefresh && !SessionState.unknown.allowsRefresh {
+      print("  ✓ signedOut/activeElsewhere/unknown.allowsRefresh = false")
+      passed += 1
+    } else {
+      print("  ✗ Expected allowsRefresh = false for non-expiring states")
+      failed += 1
+    }
+
+    // CHECK 30: SessionState Equatable
+    print("30. SessionState Equatable conformance...")
+    let s30a = SessionState.expiring(secondsRemaining: 30)
+    let s30b = SessionState.expiring(secondsRemaining: 30)
+    let s30c = SessionState.expiring(secondsRemaining: 60)
+    if s30a == s30b && s30a != s30c && SessionState.active != SessionState.signedOut {
+      print("  ✓ SessionState Equatable works correctly")
+      passed += 1
+    } else {
+      print("  ✗ SessionState Equatable failed")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/30")
+    print("Failed: \(failed)/30")
 
     if failed > 0 {
       exit(1)

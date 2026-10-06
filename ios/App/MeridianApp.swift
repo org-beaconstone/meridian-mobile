@@ -19,6 +19,7 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  @State private var sessionState: SessionState = .active
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -36,6 +37,8 @@ import MeridianSDK
             Text(money(state.balance)).font(.system(size: 38, weight: .medium))
             Text("Shared room: \(room)").font(.caption)
           }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(Color(red:0.078,green:0.173,blue:0.208)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 16))
+          // Session-state banner — persistent above the payment form.
+          SessionBannerView(sessionState: sessionState, onRefresh: { sessionState = .active })
           Text("Make a payment").font(.title2)
           if let catalog {
             Picker("Recipient", selection: $recipient) { ForEach(catalog.recipients, id: \.id) { Text($0.name).tag($0.id) } }.disabled(review || busy)
@@ -63,12 +66,12 @@ import MeridianSDK
   }
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
-    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString
+    generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString; sessionState = .active
     do { client=try MeridianClient(baseURL:endpoint,sessionId:room); await refresh() } catch { message=String(describing:error) }
   }
   private func refresh() async {
     guard let client else {return}; let started=generation
-    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"} }
+    do { let next=try await client.getState(); let definitions=try await client.getCatalog(); if started==generation && !busy {state=next;catalog=definitions;message="Connected to shared Java API"} } catch { if started==generation {message="API unavailable: \(error)"; sessionState = .unknown} }
   }
   private func pay() async {
     guard let client, !busy else {return}; busy=true; generation += 1

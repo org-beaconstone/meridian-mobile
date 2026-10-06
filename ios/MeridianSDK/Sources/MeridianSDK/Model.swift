@@ -1,5 +1,55 @@
 import Foundation
 
+// MARK: - Session State
+
+/// Represents the authentication/session state shown in the payment screen banner.
+public enum SessionState: Equatable {
+  /// Session is valid and healthy – banner is hidden.
+  case active
+  /// Session will expire soon; countdown in seconds is provided.
+  case expiring(secondsRemaining: Int)
+  /// The user's credentials are active on a different device.
+  case activeElsewhere
+  /// The user has been signed out.
+  case signedOut
+  /// Session status could not be determined (e.g. network unreachable).
+  case unknown
+
+  /// Short heading text for the banner.
+  public var label: String {
+    switch self {
+    case .active:
+      return "Session active"
+    case let .expiring(secs):
+      let m = secs / 60
+      let s = secs % 60
+      return "Session expires in \(m):\(String(format: "%02d", s))"
+    case .activeElsewhere:
+      return "Session active on another device"
+    case .signedOut:
+      return "Signed out"
+    case .unknown:
+      return "Session status unknown"
+    }
+  }
+
+  /// Whether the banner should display non-blocking recovery guidance.
+  /// True only for states where the user may have lost their payment context.
+  public var showsRecoveryGuidance: Bool {
+    switch self {
+    case .signedOut, .unknown: return true
+    default: return false
+    }
+  }
+
+  /// Whether a non-blocking refresh action should be offered.
+  /// True only for the expiring state.
+  public var allowsRefresh: Bool {
+    if case .expiring = self { return true }
+    return false
+  }
+}
+
 // MARK: - Domain Types
 
 public enum Category: String, Codable, Hashable, CaseIterable {
