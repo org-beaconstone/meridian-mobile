@@ -374,4 +374,115 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - SessionState Tests
+
+  @Test
+  fun testSessionStateActiveAccessibilityLabel() {
+    assertEquals("Session active", SessionState.Active.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateExpiringLabelMinutesAndSeconds() {
+    val state = SessionState.Expiring(secondsRemaining = 90)
+    assertEquals("Session expiring in 1 minute 30 seconds", state.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateExpiringLabelSecondsOnly() {
+    val state = SessionState.Expiring(secondsRemaining = 45)
+    assertEquals("Session expiring in 45 seconds", state.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateExpiringSingularSecond() {
+    val state = SessionState.Expiring(secondsRemaining = 1)
+    assertEquals("Session expiring in 1 second", state.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateExpiringZeroSeconds() {
+    val state = SessionState.Expiring(secondsRemaining = 0)
+    assertEquals("Session expiring in 0 seconds", state.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateActiveElsewhereAccessibilityLabel() {
+    assertEquals("Session active on another device", SessionState.ActiveElsewhere.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateSignedOutAccessibilityLabel() {
+    assertEquals("Session signed out", SessionState.SignedOut.accessibilityLabel)
+  }
+
+  @Test
+  fun testSessionStateActiveHasNoAction() {
+    assertFalse(SessionState.Active.hasAction)
+    assertNull(SessionState.Active.actionTitle)
+  }
+
+  @Test
+  fun testSessionStateExpiringHasRefreshAction() {
+    val state = SessionState.Expiring(secondsRemaining = 60)
+    assertTrue(state.hasAction)
+    assertEquals("Refresh", state.actionTitle)
+  }
+
+  @Test
+  fun testSessionStateActiveElsewhereHasSignInAction() {
+    assertTrue(SessionState.ActiveElsewhere.hasAction)
+    assertEquals("Sign in again", SessionState.ActiveElsewhere.actionTitle)
+  }
+
+  @Test
+  fun testSessionStateSignedOutHasSignInAction() {
+    assertTrue(SessionState.SignedOut.hasAction)
+    assertEquals("Sign in again", SessionState.SignedOut.actionTitle)
+  }
+
+  @Test
+  fun testSessionStateColorRoles() {
+    assertEquals("positive", SessionState.Active.colorRole)
+    assertEquals("warning", SessionState.Expiring(secondsRemaining = 30).colorRole)
+    assertEquals("information", SessionState.ActiveElsewhere.colorRole)
+    assertEquals("removed", SessionState.SignedOut.colorRole)
+  }
+
+  @Test
+  fun testSessionStateMessageContainsPreservedForRecoveryStates() {
+    assertTrue(SessionState.ActiveElsewhere.message.contains("preserved"))
+    assertTrue(SessionState.SignedOut.message.contains("preserved"))
+  }
+
+  @Test
+  fun testSessionStateExpiringMessageContainsTimeAndRefreshCue() {
+    val msg = SessionState.Expiring(secondsRemaining = 120).message
+    assertTrue(msg.contains("2m"))
+    assertTrue(msg.contains("Refresh"))
+  }
+
+  @Test
+  fun testHandleSessionActionExpiringReturnsActive() {
+    val result = handleSessionAction(SessionState.Expiring(secondsRemaining = 30))
+    assertEquals(SessionState.Active, result)
+  }
+
+  @Test
+  fun testHandleSessionActionSignedOutReturnsActive() {
+    val result = handleSessionAction(SessionState.SignedOut)
+    assertEquals(SessionState.Active, result)
+  }
+
+  @Test
+  fun testHandleSessionActionActiveElsewhereReturnsActive() {
+    val result = handleSessionAction(SessionState.ActiveElsewhere)
+    assertEquals(SessionState.Active, result)
+  }
+
+  @Test
+  fun testHandleSessionActionActiveIsNoOp() {
+    val result = handleSessionAction(SessionState.Active)
+    assertEquals(SessionState.Active, result)
+  }
 }

@@ -341,10 +341,172 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: SessionState.active accessibility label
+    print("21. SessionState.active accessibilityLabel...")
+    let activeLabel = SessionState.active.accessibilityLabel
+    if activeLabel == "Session active" {
+      print("  ✓ active label = \"\(activeLabel)\"")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected label: \(activeLabel)")
+      failed += 1
+    }
+
+    // CHECK 22: SessionState.expiring countdown label – minutes + seconds
+    print("22. SessionState.expiring label (90s)...")
+    let expiringLabel90 = SessionState.expiring(secondsRemaining: 90).accessibilityLabel
+    if expiringLabel90 == "Session expiring in 1 minute 30 seconds" {
+      print("  ✓ expiring(90) label correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected label: \(expiringLabel90)")
+      failed += 1
+    }
+
+    // CHECK 23: SessionState.expiring countdown label – seconds only
+    print("23. SessionState.expiring label (45s)...")
+    let expiringLabel45 = SessionState.expiring(secondsRemaining: 45).accessibilityLabel
+    if expiringLabel45 == "Session expiring in 45 seconds" {
+      print("  ✓ expiring(45) label correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected label: \(expiringLabel45)")
+      failed += 1
+    }
+
+    // CHECK 24: SessionState.expiring singular second
+    print("24. SessionState.expiring label (1s)...")
+    let expiringLabel1 = SessionState.expiring(secondsRemaining: 1).accessibilityLabel
+    if expiringLabel1 == "Session expiring in 1 second" {
+      print("  ✓ expiring(1) label uses singular")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected label: \(expiringLabel1)")
+      failed += 1
+    }
+
+    // CHECK 25: SessionState.activeElsewhere accessibility label
+    print("25. SessionState.activeElsewhere accessibilityLabel...")
+    let elsewhereLabel = SessionState.activeElsewhere.accessibilityLabel
+    if elsewhereLabel == "Session active on another device" {
+      print("  ✓ activeElsewhere label correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected label: \(elsewhereLabel)")
+      failed += 1
+    }
+
+    // CHECK 26: SessionState.signedOut accessibility label
+    print("26. SessionState.signedOut accessibilityLabel...")
+    let signedOutLabel = SessionState.signedOut.accessibilityLabel
+    if signedOutLabel == "Session signed out" {
+      print("  ✓ signedOut label correct")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected label: \(signedOutLabel)")
+      failed += 1
+    }
+
+    // CHECK 27: hasAction – active has no action
+    print("27. SessionState.active hasAction = false...")
+    if !SessionState.active.hasAction && SessionState.active.actionTitle == nil {
+      print("  ✓ active has no action")
+      passed += 1
+    } else {
+      print("  ✗ active should have no action")
+      failed += 1
+    }
+
+    // CHECK 28: hasAction – expiring has Refresh action
+    print("28. SessionState.expiring hasAction = true, actionTitle = \"Refresh\"...")
+    let expState = SessionState.expiring(secondsRemaining: 30)
+    if expState.hasAction && expState.actionTitle == "Refresh" {
+      print("  ✓ expiring action = Refresh")
+      passed += 1
+    } else {
+      print("  ✗ expiring action mismatch")
+      failed += 1
+    }
+
+    // CHECK 29: hasAction – activeElsewhere has sign-in action
+    print("29. SessionState.activeElsewhere actionTitle...")
+    if SessionState.activeElsewhere.hasAction && SessionState.activeElsewhere.actionTitle == "Sign in again" {
+      print("  ✓ activeElsewhere action = Sign in again")
+      passed += 1
+    } else {
+      print("  ✗ activeElsewhere action mismatch")
+      failed += 1
+    }
+
+    // CHECK 30: hasAction – signedOut has sign-in action
+    print("30. SessionState.signedOut actionTitle...")
+    if SessionState.signedOut.hasAction && SessionState.signedOut.actionTitle == "Sign in again" {
+      print("  ✓ signedOut action = Sign in again")
+      passed += 1
+    } else {
+      print("  ✗ signedOut action mismatch")
+      failed += 1
+    }
+
+    // CHECK 31: expiring message contains time string
+    print("31. SessionState.expiring message contains time...")
+    let expMsg = SessionState.expiring(secondsRemaining: 120).message
+    if expMsg.contains("2m") && expMsg.contains("Refresh") {
+      print("  ✓ expiring message contains time and refresh cue")
+      passed += 1
+    } else {
+      print("  ✗ Unexpected message: \(expMsg)")
+      failed += 1
+    }
+
+    // CHECK 32: signedOut message preserves payment context
+    print("32. SessionState.signedOut message preserves payment context...")
+    let soMsg = SessionState.signedOut.message
+    if soMsg.contains("preserved") {
+      print("  ✓ signedOut message mentions preserved context")
+      passed += 1
+    } else {
+      print("  ✗ Missing 'preserved' in message: \(soMsg)")
+      failed += 1
+    }
+
+    // CHECK 33: activeElsewhere message preserves payment context
+    print("33. SessionState.activeElsewhere message preserves payment context...")
+    let aeMsg = SessionState.activeElsewhere.message
+    if aeMsg.contains("preserved") {
+      print("  ✓ activeElsewhere message mentions preserved context")
+      passed += 1
+    } else {
+      print("  ✗ Missing 'preserved' in message: \(aeMsg)")
+      failed += 1
+    }
+
+    // CHECK 34: SessionState Equatable – same states are equal
+    print("34. SessionState Equatable – same states are equal...")
+    if SessionState.expiring(secondsRemaining: 60) == SessionState.expiring(secondsRemaining: 60) &&
+       SessionState.active == SessionState.active {
+      print("  ✓ Equal session states match")
+      passed += 1
+    } else {
+      print("  ✗ Equatable conformance broken")
+      failed += 1
+    }
+
+    // CHECK 35: SessionState Equatable – different states are not equal
+    print("35. SessionState Equatable – different states are not equal...")
+    if SessionState.active != SessionState.signedOut &&
+       SessionState.expiring(secondsRemaining: 30) != SessionState.expiring(secondsRemaining: 60) {
+      print("  ✓ Different session states do not match")
+      passed += 1
+    } else {
+      print("  ✗ Equatable conformance broken")
+      failed += 1
+    }
+
     // Summary
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/35")
+    print("Failed: \(failed)/35")
 
     if failed > 0 {
       exit(1)

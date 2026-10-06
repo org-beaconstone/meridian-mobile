@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import './index.css';
+import { SessionBanner } from './SessionBanner';
+import { type SessionState, handleSessionAction } from './domain/session';
 
 type Method = 'card' | 'bank';
 type Category = 'Shopping' | 'Food & drink' | 'Transport' | 'Bills' | 'Lifestyle';
@@ -90,6 +92,8 @@ export default function App() {
   const [receipt, setReceipt] = useState<Transaction | null>(null);
   const [budgetCategory, setBudgetCategory] = useState<Category>('Shopping');
   const [budgetAmount, setBudgetAmount] = useState('1000');
+  // Session banner – defaults to active; drive from real auth events in production.
+  const [sessionState, setSessionState] = useState<SessionState>({ kind: 'active' });
   const epoch = useRef(0),
     revision = useRef(0),
     mutating = useRef(false),
@@ -300,6 +304,13 @@ export default function App() {
                 <section className="mobile-card">
                   <h1>{step === 'done' ? 'Taken care of.' : 'Make a payment'}</h1>
                   <p>Fictional money. Shared rehearsal account.</p>
+                  {/* Session banner – non-blocking; payment fields remain interactive below */}
+                  {step !== 'done' && (
+                    <SessionBanner
+                      state={sessionState}
+                      onAction={() => setSessionState(handleSessionAction(sessionState))}
+                    />
+                  )}
                   {step === 'details' && (
                     <form
                       onSubmit={(e) => {
@@ -410,6 +421,21 @@ export default function App() {
               {page === 'Settings' && (
                 <section className="mobile-card">
                   <h1>Rehearsal controls</h1>
+                  <label htmlFor="mobile-session-state">Session state (payment banner)</label>
+                  <select
+                    id="mobile-session-state"
+                    value={sessionState.kind}
+                    onChange={(e) => {
+                      const kind = e.target.value as SessionState['kind'];
+                      if (kind === 'expiring') setSessionState({ kind, secondsRemaining: 90 });
+                      else setSessionState({ kind } as SessionState);
+                    }}
+                  >
+                    <option value="active">Active</option>
+                    <option value="expiring">Expiring (90 s)</option>
+                    <option value="active-elsewhere">Active elsewhere</option>
+                    <option value="signed-out">Signed out</option>
+                  </select>
                   <label htmlFor="mobile-room">Shared room</label>
                   <input
                     id="mobile-room"

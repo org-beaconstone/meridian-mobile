@@ -19,6 +19,8 @@ import MeridianSDK
   @State private var busy = false
   @State private var message = "Connect to the Spring Boot API to start."
   @State private var generation = 0
+  // Session banner state – defaults to active; real auth integration would drive this.
+  @State private var sessionState: SessionState = .active
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
@@ -36,6 +38,17 @@ import MeridianSDK
             Text(money(state.balance)).font(.system(size: 38, weight: .medium))
             Text("Shared room: \(room)").font(.caption)
           }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(Color(red:0.078,green:0.173,blue:0.208)).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 16))
+
+          // Session state banner – shown on the payment / authentication screen.
+          // Non-blocking: payment fields remain fully interactive below the banner.
+          SessionBannerView(state: sessionState) { handleSessionAction() }
+            .accessibilityIdentifier("session-banner")
+
+          // Developer-only session simulator (appears only in DEBUG builds).
+          #if DEBUG
+          sessionSimulatorControls
+          #endif
+
           Text("Make a payment").font(.title2)
           if let catalog {
             Picker("Recipient", selection: $recipient) { ForEach(catalog.recipients, id: \.id) { Text($0.name).tag($0.id) } }.disabled(review || busy)
@@ -61,6 +74,40 @@ import MeridianSDK
       while !Task.isCancelled { try? await Task.sleep(for: .seconds(2)); if !busy { await refresh() } }
     }
   }
+
+  #if DEBUG
+  /// Picker that lets developers cycle through all session states during rehearsal.
+  @ViewBuilder private var sessionSimulatorControls: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("Session simulator").font(.caption).foregroundStyle(.secondary)
+      Picker("Session state", selection: $sessionState) {
+        Text("Active").tag(SessionState.active)
+        Text("Expiring 90s").tag(SessionState.expiring(secondsRemaining: 90))
+        Text("Active elsewhere").tag(SessionState.activeElsewhere)
+        Text("Signed out").tag(SessionState.signedOut)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+    }
+  }
+  #endif
+
+  /// Called when the banner's action button is tapped.
+  /// In a real integration this would trigger a token refresh or re-authentication flow.
+  private func handleSessionAction() {
+    switch sessionState {
+    case .expiring:
+      // Simulate a successful token refresh – payment context is preserved.
+      sessionState = .active
+      message = "Session refreshed. Your payment details are preserved."
+    case .activeElsewhere, .signedOut:
+      // Prompt re-authentication without clearing the payment form.
+      message = "Opening sign-in. Your payment details will be waiting."
+    case .active:
+      break
+    }
+  }
+
   private func connect() async {
     guard room.range(of:"^[A-Za-z0-9_-]{3,64}$",options:.regularExpression) != nil else { message="Invalid room"; return }
     generation += 1; state=nil; catalog=nil; review=false; key=UUID().uuidString

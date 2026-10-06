@@ -405,6 +405,84 @@ legend {
   font-size: 11px;
   margin-top: 20px !important;
 }
+
+/* ============================================================
+   Session banner – payment / authentication screen
+   Four visual states: positive · warning · information · removed
+   ============================================================ */
+.session-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border-width: 1px;
+  border-style: solid;
+  margin-bottom: 18px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.session-banner__icon {
+  flex-shrink: 0;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.session-banner__message {
+  flex: 1;
+}
+.session-banner__action {
+  flex-shrink: 0;
+  background: none;
+  border: 0;
+  padding: 0;
+  min-height: 44px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  align-self: center;
+}
+
+/* positive – session active */
+.session-banner--positive {
+  background: #e7f2dd;
+  border-color: #aac895;
+  color: #38502f;
+}
+.session-banner--positive .session-banner__action {
+  color: #38502f;
+}
+
+/* warning – session expiring */
+.session-banner--warning {
+  background: #fff8df;
+  border-color: #d4a017;
+  color: #7a5a00;
+}
+.session-banner--warning .session-banner__action {
+  color: #7a5a00;
+}
+
+/* information – active elsewhere */
+.session-banner--information {
+  background: #e8f0ff;
+  border-color: #9abbf8;
+  color: #1f3f81;
+}
+.session-banner--information .session-banner__action {
+  color: #1f3f81;
+}
+
+/* removed – signed out */
+.session-banner--removed {
+  background: #ffedeb;
+  border-color: #ecc6be;
+  color: #8d2517;
+}
+.session-banner--removed .session-banner__action {
+  color: #8d2517;
+}
 @media (max-width: 480px) {
   .rehearsal-background {
     padding: 0;
