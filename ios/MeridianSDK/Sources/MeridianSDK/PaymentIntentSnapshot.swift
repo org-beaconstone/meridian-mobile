@@ -326,7 +326,7 @@ public final class KeychainPaymentIntentStore: PaymentIntentSnapshotStore, @unch
       kSecReturnAttributes as String: true,
       kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
     ]
-    return try lock.withLock {
+    return try lock.performLocked {
       var result: CFTypeRef?
       let status = SecItemCopyMatching(query as CFDictionary, &result)
       if status == errSecItemNotFound { return [] }
@@ -354,7 +354,7 @@ public final class KeychainPaymentIntentStore: PaymentIntentSnapshotStore, @unch
       paymentIntentId: snapshot.paymentIntentId
     )
     let data = try JSONEncoder().encode(snapshot)
-    try lock.withLock {
+    try lock.performLocked {
       let found = try copyStatus(account: account)
       if found == errSecSuccess {
         let update: [String: Any] = [
@@ -386,7 +386,7 @@ public final class KeychainPaymentIntentStore: PaymentIntentSnapshotStore, @unch
       customerAccountId: customerAccountId,
       paymentIntentId: paymentIntentId
     )
-    try lock.withLock {
+    try lock.performLocked {
       let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
       guard status == errSecSuccess || status == errSecItemNotFound else {
         throw PaymentIntentError.storage("Keychain delete failed (\(status))")
@@ -395,7 +395,7 @@ public final class KeychainPaymentIntentStore: PaymentIntentSnapshotStore, @unch
   }
 
   public func lastCustomerAccountId() throws -> String? {
-    try lock.withLock {
+    try lock.performLocked {
       var result: CFTypeRef?
       let status = SecItemCopyMatching(baseQuery(account: PaymentIntentStorageKeys.lastAccountKey, returnData: true) as CFDictionary, &result)
       if status == errSecItemNotFound { return nil }
@@ -417,7 +417,7 @@ public final class KeychainPaymentIntentStore: PaymentIntentSnapshotStore, @unch
       throw PaymentIntentError.invalidAccount
     }
     let data = Data(customerAccountId.utf8)
-    try lock.withLock {
+    try lock.performLocked {
       let found = try copyStatus(account: PaymentIntentStorageKeys.lastAccountKey)
       if found == errSecSuccess {
         let update: [String: Any] = [
@@ -478,7 +478,7 @@ public final class KeychainPaymentIntentStore: PaymentIntentSnapshotStore, @unch
 }
 
 private extension NSLock {
-  func withLock<T>(_ body: () throws -> T) rethrows -> T {
+  func performLocked<T>(_ body: () throws -> T) rethrows -> T {
     lock()
     defer { unlock() }
     return try body()
@@ -502,7 +502,7 @@ public final class PaymentIntentLedger {
   }
 
   public func rememberCustomerAccount(_ customerAccountId: String) throws {
-    try lock.withLock {
+    try lock.performLocked {
       guard PaymentIntentIds.isValidCustomerAccountId(customerAccountId) else {
         throw PaymentIntentError.invalidAccount
       }
@@ -511,11 +511,11 @@ public final class PaymentIntentLedger {
   }
 
   public func lastCustomerAccountId() throws -> String? {
-    try lock.withLock { try store.lastCustomerAccountId() }
+    try lock.performLocked { try store.lastCustomerAccountId() }
   }
 
   public func purgeExpired(customerAccountId: String) throws {
-    try lock.withLock {
+    try lock.performLocked {
       let now = nowMillis()
       for snapshot in try store.load(customerAccountId: customerAccountId) where snapshot.customerAccountId == customerAccountId {
         guard snapshot.status.isTerminal, let terminalAt = snapshot.terminalAtEpochMillis else { continue }
@@ -527,7 +527,7 @@ public final class PaymentIntentLedger {
   }
 
   public func snapshots(customerAccountId: String) throws -> [PaymentIntentSnapshot] {
-    try lock.withLock {
+    try lock.performLocked {
       try purgeExpired(customerAccountId: customerAccountId)
       return try store.load(customerAccountId: customerAccountId)
         .filter { $0.customerAccountId == customerAccountId }
@@ -540,7 +540,7 @@ public final class PaymentIntentLedger {
   }
 
   public func snapshot(customerAccountId: String, paymentIntentId: String) throws -> PaymentIntentSnapshot {
-    try lock.withLock {
+    try lock.performLocked {
       guard let found = try store.load(customerAccountId: customerAccountId).first(where: {
         $0.paymentIntentId == paymentIntentId && $0.customerAccountId == customerAccountId
       }) else {
@@ -558,7 +558,7 @@ public final class PaymentIntentLedger {
     note: String,
     scenario: Scenario
   ) throws -> PreparedPaymentIntent {
-    try lock.withLock {
+    try lock.performLocked {
       try validate(customerAccountId: customerAccountId, recipientId: recipientId, amountMinor: amountMinor, note: note)
       try purgeExpired(customerAccountId: customerAccountId)
       let hash = PaymentIntentHash.businessPayloadHash(
@@ -612,7 +612,7 @@ public final class PaymentIntentLedger {
   }
 
   public func markSubmitted(customerAccountId: String, paymentIntentId: String) throws -> PaymentIntentSnapshot {
-    try lock.withLock {
+    try lock.performLocked {
       var snapshot = try snapshot(customerAccountId: customerAccountId, paymentIntentId: paymentIntentId)
       if snapshot.status.isTerminal {
         throw PaymentIntentError.terminal(snapshot.paymentIntentId)
@@ -630,7 +630,7 @@ public final class PaymentIntentLedger {
     customerAccountId: String,
     paymentIntentId: String
   ) throws -> PaymentIntentSnapshot {
-    try lock.withLock {
+    try lock.performLocked {
       var snapshot = try snapshot(customerAccountId: customerAccountId, paymentIntentId: paymentIntentId)
       if snapshot.status.isTerminal { return snapshot }
       let status = Self.status(for: response)
@@ -644,7 +644,7 @@ public final class PaymentIntentLedger {
   }
 
   public func markUncertain(customerAccountId: String, paymentIntentId: String) throws -> PaymentIntentSnapshot {
-    try lock.withLock {
+    try lock.performLocked {
       var snapshot = try snapshot(customerAccountId: customerAccountId, paymentIntentId: paymentIntentId)
       if snapshot.status.isTerminal {
         throw PaymentIntentError.terminal(snapshot.paymentIntentId)
@@ -658,7 +658,7 @@ public final class PaymentIntentLedger {
   }
 
   public func cancel(customerAccountId: String, paymentIntentId: String) throws -> PaymentIntentSnapshot {
-    try lock.withLock {
+    try lock.performLocked {
       var snapshot = try snapshot(customerAccountId: customerAccountId, paymentIntentId: paymentIntentId)
       if snapshot.status.isTerminal { return snapshot }
       let now = nowMillis()
@@ -724,7 +724,7 @@ public final class PaymentIntentLedger {
 }
 
 private extension NSRecursiveLock {
-  func withLock<T>(_ body: () throws -> T) rethrows -> T {
+  func performLocked<T>(_ body: () throws -> T) rethrows -> T {
     lock()
     defer { unlock() }
     return try body()
