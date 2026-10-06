@@ -16,7 +16,10 @@ targets:
         SWIFT_VERSION: '5.0'
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Meridian
+        INFOPLIST_KEY_NSFaceIDUsageDescription: Confirm this rehearsal payment in Meridian.
         INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+    entitlements:
+      path: App/Meridian.entitlements
     dependencies:
       - package: MeridianSDK
         product: MeridianSDK
