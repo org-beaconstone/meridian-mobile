@@ -3,6 +3,64 @@ package com.atlassian.meridian
 import com.fasterxml.jackson.annotation.JsonProperty
 import java.io.Serializable
 
+// MARK: - Session State
+
+/**
+ * Represents the authentication/session state shown in the payment screen banner.
+ *
+ * The banner is hidden when the state is [Active]. All other states render a
+ * colour-coded strip with a heading, optional recovery guidance, and — for the
+ * [Expiring] state — a non-blocking Refresh action.
+ *
+ * Accessibility: the entire banner exposes a single `contentDescription` for
+ * TalkBack that combines the heading, guidance, and button hint.
+ * Dynamic text scaling is supported through the use of sp-based text styles.
+ */
+sealed class SessionState {
+  /** Session is valid and healthy – banner is hidden. */
+  object Active : SessionState()
+
+  /** Session will expire soon; [secondsRemaining] is the countdown. */
+  data class Expiring(val secondsRemaining: Int) : SessionState()
+
+  /** The user's credentials are active on a different device. */
+  object ActiveElsewhere : SessionState()
+
+  /** The user has been signed out. */
+  object SignedOut : SessionState()
+
+  /** Session status could not be determined (e.g. network unreachable). */
+  object Unknown : SessionState()
+
+  /** Short heading text for the banner. */
+  val label: String
+    get() = when (this) {
+      is Active -> "Session active"
+      is Expiring -> {
+        val m = secondsRemaining / 60
+        val s = secondsRemaining % 60
+        "Session expires in $m:${s.toString().padStart(2, '0')}"
+      }
+      is ActiveElsewhere -> "Session active on another device"
+      is SignedOut -> "Signed out"
+      is Unknown -> "Session status unknown"
+    }
+
+  /**
+   * Whether the banner should display non-blocking recovery guidance.
+   * True only for states where the user may have lost their payment context.
+   */
+  val showsRecoveryGuidance: Boolean
+    get() = this is SignedOut || this is Unknown
+
+  /**
+   * Whether a non-blocking Refresh action should be offered.
+   * True only for the expiring state.
+   */
+  val allowsRefresh: Boolean
+    get() = this is Expiring
+}
+
 // MARK: - Domain Enums
 
 enum class Category(val displayName: String) {

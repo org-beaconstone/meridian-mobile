@@ -374,4 +374,85 @@ class MeridianSDKTest {
       server.stop(0)
     }
   }
+
+  // MARK: - SessionState Tests
+
+  @Test
+  fun testSessionStateActiveLabel() {
+    assertEquals("Session active", SessionState.Active.label)
+  }
+
+  @Test
+  fun testSessionStateExpiringLabelSubMinute() {
+    assertEquals("Session expires in 0:45", SessionState.Expiring(45).label)
+  }
+
+  @Test
+  fun testSessionStateExpiringLabelOverMinute() {
+    assertEquals("Session expires in 1:30", SessionState.Expiring(90).label)
+  }
+
+  @Test
+  fun testSessionStateExpiringLabelZeroPadsSeconds() {
+    assertEquals("Session expires in 2:05", SessionState.Expiring(125).label)
+  }
+
+  @Test
+  fun testSessionStateActiveElsewhereLabel() {
+    assertEquals("Session active on another device", SessionState.ActiveElsewhere.label)
+  }
+
+  @Test
+  fun testSessionStateSignedOutLabel() {
+    assertEquals("Signed out", SessionState.SignedOut.label)
+  }
+
+  @Test
+  fun testSessionStateUnknownLabel() {
+    assertEquals("Session status unknown", SessionState.Unknown.label)
+  }
+
+  @Test
+  fun testSessionStateShowsRecoveryGuidanceForSignedOut() {
+    assertTrue(SessionState.SignedOut.showsRecoveryGuidance)
+  }
+
+  @Test
+  fun testSessionStateShowsRecoveryGuidanceForUnknown() {
+    assertTrue(SessionState.Unknown.showsRecoveryGuidance)
+  }
+
+  @Test
+  fun testSessionStateDoesNotShowRecoveryGuidanceForActive() {
+    assertFalse(SessionState.Active.showsRecoveryGuidance)
+  }
+
+  @Test
+  fun testSessionStateDoesNotShowRecoveryGuidanceForExpiring() {
+    assertFalse(SessionState.Expiring(30).showsRecoveryGuidance)
+  }
+
+  @Test
+  fun testSessionStateDoesNotShowRecoveryGuidanceForActiveElsewhere() {
+    assertFalse(SessionState.ActiveElsewhere.showsRecoveryGuidance)
+  }
+
+  @Test
+  fun testSessionStateAllowsRefreshForExpiring() {
+    assertTrue(SessionState.Expiring(60).allowsRefresh)
+  }
+
+  @Test
+  fun testSessionStateDoesNotAllowRefreshForNonExpiring() {
+    assertFalse(SessionState.Active.allowsRefresh)
+    assertFalse(SessionState.SignedOut.allowsRefresh)
+    assertFalse(SessionState.ActiveElsewhere.allowsRefresh)
+    assertFalse(SessionState.Unknown.allowsRefresh)
+  }
+
+  @Test
+  fun testSessionStateExpiringEquality() {
+    assertEquals(SessionState.Expiring(30), SessionState.Expiring(30))
+    assertNotEquals(SessionState.Expiring(30), SessionState.Expiring(60))
+  }
 }

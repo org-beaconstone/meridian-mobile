@@ -37,14 +37,15 @@ class MainActivity : ComponentActivity() {
   var paymentKey by remember { mutableStateOf(UUID.randomUUID().toString()) }
   var message by remember { mutableStateOf("Fictional payment rehearsal. Connect to the Java API.") }
   var revision by remember { mutableStateOf(0) }
+  var sessionState by remember { mutableStateOf<SessionState>(SessionState.Active) }
   LaunchedEffect(client) {
     val current=client
     while(current!=null) {
       val started=revision
       if(!busy) try {
         val fresh=current.getState(); val definitions=current.getCatalog()
-        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API"}
-      } catch(e:Exception) {if(current===client)message="API unavailable: ${e.message}"}
+        if(current===client && started==revision && !busy) {state=fresh;catalog=definitions;message="Connected to shared Java API";sessionState=SessionState.Active}
+      } catch(e:Exception) {if(current===client){message="API unavailable: ${e.message}";sessionState=SessionState.Unknown}}
       delay(2000)
     }
   }
@@ -55,13 +56,18 @@ class MainActivity : ComponentActivity() {
     OutlinedTextField(room,{room=it},label={Text("Shared rehearsal room")},enabled=!busy)
     Button(onClick={
       if(!Regex("[A-Za-z0-9_-]{3,64}").matches(room)){message="Invalid room"}
-      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString()}catch(e:Exception){message=e.message?:"Invalid configuration"}
+      else try {client=MeridianClient(base,room);state=null;catalog=null;review=false;revision++;paymentKey=UUID.randomUUID().toString();sessionState=SessionState.Active}catch(e:Exception){message=e.message?:"Invalid configuration"}
     },enabled=!busy){Text("Connect")}
     Text(message)
     state?.let { current ->
       Card(backgroundColor=Color(0xFF142C35),contentColor=Color.White,modifier=Modifier.fillMaxWidth()) {
         Column(Modifier.padding(22.dp)){Text("Everyday account");Text(money(current.balance),style=MaterialTheme.typography.h3);Text("Room: $room")}
       }
+      // Session-state banner — persistent above the payment form.
+      SessionBanner(
+        sessionState = sessionState,
+        onRefresh = { sessionState = SessionState.Active },
+      )
       Text("Make a payment",style=MaterialTheme.typography.h6)
       catalog?.recipients?.forEach { person ->
         Row {RadioButton(selected=recipient==person.id,onClick={recipient=person.id},enabled=!review&&!busy);Text(person.name,Modifier.padding(top=12.dp))}
