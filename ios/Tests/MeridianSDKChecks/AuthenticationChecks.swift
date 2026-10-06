@@ -1,7 +1,8 @@
 import Foundation
 @testable import MeridianSDK
 
-func runAuthenticationChecks(passed: inout Int, failed: inout Int) {
+enum AuthenticationChecks {
+static func run(passed: inout Int, failed: inout Int) {
   func check(_ name: String, _ ok: Bool) {
     if ok {
       print("  ✓ \(name)")
@@ -108,7 +109,7 @@ func runAuthenticationChecks(passed: inout Int, failed: inout Int) {
   let attempt = PaymentAttempt(idempotencyKey: original, method: .card)
   let blocked = !attempt.submitIfReady { _ in }
   let (mismatched, mismatch) = attempt.confirmingPin(pin: "1234", repeated: "9999")
-  let (short, shortError) = attempt.confirmingPin(pin: "12", repeated: "12")
+  let (_, shortError) = attempt.confirmingPin(pin: "12", repeated: "12")
   let denied = attempt.confirmingBiometric(succeeded: false)
   let (confirmed, pinError) = attempt.confirmingPin(pin: "1234", repeated: "1234")
   var pinKey = ""
@@ -143,16 +144,16 @@ func runAuthenticationChecks(passed: inout Int, failed: inout Int) {
   )
 }
 
-private func returnURL(_ token: String) -> String {
+private static func returnURL(_ token: String) -> String {
   "https://app.meridian-rehearsal.test/bank/return?state=\(token)"
 }
 
-private func refused(_ check: UrlCheck) -> Bool {
+private static func refused(_ check: UrlCheck) -> Bool {
   if case .refused = check { return true }
   return false
 }
 
-private func safeFailure(_ decision: ReturnDecision, key: String, outcome: ReturnOutcome) -> Bool {
+private static func safeFailure(_ decision: ReturnDecision, key: String, outcome: ReturnOutcome) -> Bool {
   let attempt = PaymentAttempt(idempotencyKey: key, method: .bank).applying(decision)
   return decision.outcome == outcome
     && decision.idempotencyKey == key
@@ -160,4 +161,5 @@ private func safeFailure(_ decision: ReturnDecision, key: String, outcome: Retur
     && !decision.createsPayment
     && !attempt.readyToSubmit
     && !attempt.submitIfReady { _ in }
+}
 }

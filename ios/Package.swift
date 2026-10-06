@@ -6,7 +6,7 @@ let package = Package(
   targets: [
     .target(name: "MeridianSDK", path: "MeridianSDK/Sources/MeridianSDK"),
     .executableTarget(name: "MeridianSDKChecks", dependencies: ["MeridianSDK"], path: "Tests/MeridianSDKChecks"),
-    .executableTarget(name: "MeridianDesktop", dependencies: ["MeridianSDK"], path: "App"),
+    .executableTarget(name: "MeridianDesktop", dependencies: ["MeridianSDK"], path: "App", exclude: ["Meridian.entitlements"]),
     .executableTarget(name: "MeridianLiveChecks", dependencies: ["MeridianSDK"], path: "LiveChecks")
   ], swiftLanguageModes: [.v5]
 )

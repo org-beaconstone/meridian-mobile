@@ -341,7 +341,7 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    runAuthenticationChecks(passed: &passed, failed: &failed)
+    AuthenticationChecks.run(passed: &passed, failed: &failed)
 
     // Summary
     let total = passed + failed

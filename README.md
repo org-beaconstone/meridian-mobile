@@ -23,7 +23,7 @@ swift run MeridianDesktop
 MERIDIAN_TEST_API=http://127.0.0.1:8080/api/v1 swift run MeridianLiveChecks
 ```
 
-An earlier macOS run verified the Swift package, the SwiftUI desktop executable, and the Java transport checks (payment, duplicate-key retry, pending response, and reset). The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated. This SCA change adds checks to that executable (32 assertions in total) and was not re-run on macOS or on an iOS device. Universal-link association was not verified on a device.
+An earlier macOS run verified the Swift package, the SwiftUI desktop executable, and the Java transport checks (payment, duplicate-key retry, pending response, and reset). The desktop UI uses the same Swift source intended for iOS. Native desktop interactions were not UI-automated. This SCA change was checked with Swift 6.0.3 on Linux: `swift run MeridianSDKChecks` passed 32 assertions. The SwiftUI desktop target and the iOS project were not rebuilt in that run, and universal-link association was not verified on a device.
 
 For an iOS project, install Xcode and XcodeGen, then `cd ios && xcodegen generate`. `project.yml` builds `App/MeridianApp.swift` with the local SDK package. No iOS simulator/device build was run on the authoring machine because full Xcode was unavailable. Local network HTTP is for the rehearsal only; use HTTPS for any shared hosted endpoint.
 
