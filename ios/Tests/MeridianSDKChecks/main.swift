@@ -341,13 +341,347 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
-    // Summary
+    func expect(_ title: String, _ ok: Bool, _ detail: String = "") {
+      if ok {
+        print("  ✓ \(title)")
+        passed += 1
+      } else {
+        print("  ✗ \(title) \(detail)")
+        failed += 1
+      }
+    }
+
+    func sampleLedger(now: Int64 = 5_000, retention: Int64 = PaymentIntentRetention.terminalWindowMillis) -> (InMemoryPaymentIntentStore, PaymentIntentLedger, (Int64) -> Void) {
+      let clock = ClockBox(now)
+      let store = InMemoryPaymentIntentStore()
+      let ledger = PaymentIntentLedger(store: store, nowMillis: { clock.now }, retentionMillis: retention)
+      return (store, ledger, { clock.now = $0 })
+    }
+
+    print("21. business payload hash vector...")
+    let canonical = PaymentIntentHash.canonicalBusinessPayload(
+      customerAccountId: "acct-demo",
+      recipientId: "northline-studio",
+      amountMinor: 2599,
+      method: "card",
+      note: "Studio invoice",
+      scenario: "success"
+    )
+    expect(
+      "canonical payload and hash",
+      canonical == "{\"v\":1,\"customerAccountId\":\"acct-demo\",\"recipientId\":\"northline-studio\",\"amountMinor\":2599,\"method\":\"card\",\"note\":\"Studio invoice\",\"scenario\":\"success\"}"
+        && PaymentIntentHash.sha256Hex(canonical) == "ae1c0e96711da9a13695fd7439b2b60ff0a3bf9c3f336729fe5cb3eb98ae642e",
+      canonical
+    )
+
+    print("22. escaped note hash...")
+    let escaped = PaymentIntentHash.canonicalBusinessPayload(
+      customerAccountId: "acct-demo",
+      recipientId: "northline-studio",
+      amountMinor: 100,
+      method: "bank",
+      note: "line\nquote\"",
+      scenario: "pending"
+    )
+    expect(
+      "escaped note hash",
+      escaped == "{\"v\":1,\"customerAccountId\":\"acct-demo\",\"recipientId\":\"northline-studio\",\"amountMinor\":100,\"method\":\"bank\",\"note\":\"line\\nquote\\\"\",\"scenario\":\"pending\"}"
+        && PaymentIntentHash.sha256Hex(escaped) == "882dc93278f448b32d5782b4312660ebc3f80f7aed5fed70ae82d1495f5f72fd"
+    )
+
+    print("23. return state hash...")
+    expect(
+      "sha256(abc)",
+      PaymentIntentHash.returnStateHash("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+
+    print("24. restart resumes the same idempotency key...")
+    do {
+      let (store, ledger, _) = sampleLedger()
+      let prepared = try ledger.begin(
+        customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599,
+        method: .card, note: "Studio invoice", scenario: .success
+      )
+      _ = try ledger.markSubmitted(customerAccountId: "acct-demo", paymentIntentId: prepared.snapshot.paymentIntentId)
+      _ = try ledger.record(
+        response: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Payment pending confirmation", code: "PAYMENT_PENDING", paymentId: "pay-1"),
+        customerAccountId: "acct-demo",
+        paymentIntentId: prepared.snapshot.paymentIntentId
+      )
+      _ = try ledger.begin(customerAccountId: "other-acct", recipientId: "northline-studio", amountMinor: 100, method: .bank, note: "other", scenario: .success)
+      let restarted = PaymentIntentLedger(store: store)
+      let active = try restarted.activeIntents(customerAccountId: "acct-demo")
+      let hidden = try restarted.activeIntents(customerAccountId: "other-acct")
+      expect(
+        "resumed intent keeps id and idempotency key",
+        active.count == 1
+          && active[0].paymentIntentId == prepared.snapshot.paymentIntentId
+          && active[0].idempotencyKey == prepared.snapshot.idempotencyKey
+          && active[0].returnStateHash == prepared.snapshot.returnStateHash
+          && hidden.allSatisfy { $0.paymentIntentId != prepared.snapshot.paymentIntentId }
+          && (try restarted.lastCustomerAccountId()) == "other-acct"
+      )
+    } catch {
+      expect("resumed intent keeps id and idempotency key", false, String(describing: error))
+    }
+
+    print("25. terminal retention window...")
+    do {
+      let (store, ledger, setNow) = sampleLedger(now: 1_000, retention: 1_000)
+      let prepared = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 500, method: .card, note: "", scenario: .success)
+      _ = try ledger.markSubmitted(customerAccountId: "acct-demo", paymentIntentId: prepared.snapshot.paymentIntentId)
+      let done = try ledger.record(
+        response: PaymentResponse(ok: true, state: nil, transaction: nil, error: nil, code: nil, paymentId: "pay-9"),
+        customerAccountId: "acct-demo",
+        paymentIntentId: prepared.snapshot.paymentIntentId
+      )
+      setNow(1_999)
+      let restarted = PaymentIntentLedger(store: store, nowMillis: { 1_999 }, retentionMillis: 1_000)
+      let kept = try restarted.snapshots(customerAccountId: "acct-demo")
+      let idle = try restarted.activeIntents(customerAccountId: "acct-demo")
+      let expiredLedger = PaymentIntentLedger(store: store, nowMillis: { 2_000 }, retentionMillis: 1_000)
+      let gone = try expiredLedger.snapshots(customerAccountId: "acct-demo")
+      expect(
+        "terminal snapshot expires at the retention boundary",
+        done.status == .completed && done.terminalAtEpochMillis == 1_000 && idle.isEmpty && kept.count == 1 && gone.isEmpty
+      )
+    } catch {
+      expect("terminal snapshot expires at the retention boundary", false, String(describing: error))
+    }
+
+    print("26. active intents are not expired by time...")
+    do {
+      let (_, ledger, setNow) = sampleLedger(now: 0, retention: 1_000)
+      let kept = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 500, method: .card, note: "", scenario: .success)
+      let other = try ledger.begin(customerAccountId: "other-acct", recipientId: "northline-studio", amountMinor: 500, method: .card, note: "", scenario: .success)
+      _ = try ledger.markSubmitted(customerAccountId: "other-acct", paymentIntentId: other.snapshot.paymentIntentId)
+      _ = try ledger.record(
+        response: PaymentResponse(ok: true, state: nil, transaction: nil, error: nil, code: nil, paymentId: nil),
+        customerAccountId: "other-acct",
+        paymentIntentId: other.snapshot.paymentIntentId
+      )
+      setNow(50_000)
+      let active = try ledger.activeIntents(customerAccountId: "acct-demo")
+      let otherLeft = try ledger.snapshots(customerAccountId: "other-acct")
+      expect(
+        "only the other account's terminal snapshot is purged",
+        active.count == 1 && active[0].paymentIntentId == kept.snapshot.paymentIntentId && otherLeft.isEmpty
+      )
+    } catch {
+      expect("only the other account's terminal snapshot is purged", false, String(describing: error))
+    }
+
+    print("27. uncertain retry keeps the idempotency key...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let prepared = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .bank, note: "rent", scenario: .success)
+      _ = try ledger.markSubmitted(customerAccountId: "acct-demo", paymentIntentId: prepared.snapshot.paymentIntentId)
+      let uncertain = try ledger.markUncertain(customerAccountId: "acct-demo", paymentIntentId: prepared.snapshot.paymentIntentId)
+      let active = try ledger.activeIntents(customerAccountId: "acct-demo")
+      expect(
+        "unknown status stays active with the same key",
+        uncertain.status == .unknown && uncertain.idempotencyKey == prepared.snapshot.idempotencyKey
+          && uncertain.terminalAtEpochMillis == nil && active.count == 1
+      )
+    } catch {
+      expect("unknown status stays active with the same key", false, String(describing: error))
+    }
+
+    print("28. same payload reuses the intent...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let first = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      let second = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      let active = try ledger.activeIntents(customerAccountId: "acct-demo")
+      expect(
+        "second begin reuses the snapshot",
+        second.returnState == nil && second.snapshot.paymentIntentId == first.snapshot.paymentIntentId
+          && second.snapshot.idempotencyKey == first.snapshot.idempotencyKey && active.count == 1
+      )
+    } catch {
+      expect("second begin reuses the snapshot", false, String(describing: error))
+    }
+
+    print("29. in-flight intent blocks a different payload...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let prepared = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      _ = try ledger.markSubmitted(customerAccountId: "acct-demo", paymentIntentId: prepared.snapshot.paymentIntentId)
+      _ = try ledger.record(
+        response: PaymentResponse(ok: false, state: nil, transaction: nil, error: nil, code: "PAYMENT_PENDING", paymentId: nil),
+        customerAccountId: "acct-demo",
+        paymentIntentId: prepared.snapshot.paymentIntentId
+      )
+      do {
+        _ = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 100, method: .card, note: "Studio invoice", scenario: .success)
+        expect("different payload is rejected", false)
+      } catch PaymentIntentError.activeIntentInProgress(let id) {
+        let active = try ledger.activeIntents(customerAccountId: "acct-demo")
+        expect("different payload is rejected", id == prepared.snapshot.paymentIntentId && active[0].idempotencyKey == prepared.snapshot.idempotencyKey)
+      } catch {
+        expect("different payload is rejected", false, String(describing: error))
+      }
+    } catch {
+      expect("different payload is rejected", false, String(describing: error))
+    }
+
+    print("30. created intent is replaced...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let created = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      let replacement = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 100, method: .bank, note: "other", scenario: .success)
+      let active = try ledger.activeIntents(customerAccountId: "acct-demo")
+      let cancelled = try ledger.snapshots(customerAccountId: "acct-demo").first { $0.paymentIntentId == created.snapshot.paymentIntentId }
+      expect(
+        "new payload cancels the unsent intent",
+        replacement.snapshot.paymentIntentId != created.snapshot.paymentIntentId
+          && replacement.snapshot.idempotencyKey != created.snapshot.idempotencyKey
+          && active.count == 1 && cancelled?.status == .cancelled
+      )
+    } catch {
+      expect("new payload cancels the unsent intent", false, String(describing: error))
+    }
+
+    print("31. return state verification...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let prepared = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      if let token = prepared.returnState {
+        expect(
+          "hash matches the token and rejects a different one",
+          ledger.verifyReturnState(prepared.snapshot, returnState: token)
+            && !ledger.verifyReturnState(prepared.snapshot, returnState: "different-return-state")
+            && prepared.snapshot.returnStateHash != token
+        )
+      } else {
+        expect("hash matches the token and rejects a different one", false, "missing return state")
+      }
+    } catch {
+      expect("hash matches the token and rejects a different one", false, String(describing: error))
+    }
+
+    print("32. snapshot JSON round trip...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let prepared = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      let data = try JSONEncoder().encode(prepared.snapshot)
+      let restored = try JSONDecoder().decode(PaymentIntentSnapshot.self, from: data)
+      expect(
+        "acceptance fields survive encoding",
+        restored == prepared.snapshot
+          && restored.paymentIntentId == prepared.snapshot.paymentIntentId
+          && restored.idempotencyKey == prepared.snapshot.idempotencyKey
+          && restored.businessPayloadHash == prepared.snapshot.businessPayloadHash
+          && restored.status == .created
+          && restored.returnStateHash == prepared.snapshot.returnStateHash
+      )
+    } catch {
+      expect("acceptance fields survive encoding", false, String(describing: error))
+    }
+
+    print("33. decline allows a new intent...")
+    do {
+      let (_, ledger, _) = sampleLedger()
+      let prepared = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 2599, method: .card, note: "Studio invoice", scenario: .success)
+      _ = try ledger.markSubmitted(customerAccountId: "acct-demo", paymentIntentId: prepared.snapshot.paymentIntentId)
+      let declined = try ledger.record(
+        response: PaymentResponse(ok: false, state: nil, transaction: nil, error: "Insufficient balance", code: "INSUFFICIENT_BALANCE", paymentId: nil),
+        customerAccountId: "acct-demo",
+        paymentIntentId: prepared.snapshot.paymentIntentId
+      )
+      let next = try ledger.begin(customerAccountId: "acct-demo", recipientId: "northline-studio", amountMinor: 100, method: .card, note: "Studio invoice", scenario: .success)
+      let active = try ledger.activeIntents(customerAccountId: "acct-demo")
+      expect(
+        "declined intent is terminal and a new key can be created",
+        declined.status == .declined && declined.status.isTerminal && active.count == 1
+          && active[0].status == .created && next.snapshot.idempotencyKey != prepared.snapshot.idempotencyKey
+      )
+    } catch {
+      expect("declined intent is terminal and a new key can be created", false, String(describing: error))
+    }
+
+    print("34. storage key is account scoped...")
+    do {
+      let key = try PaymentIntentStorageKeys.snapshotKey(customerAccountId: "acct-demo", paymentIntentId: "pi_storage_key")
+      expect(
+        "key prefix isolates the account",
+        key == "acct-demo|pi_storage_key"
+          && PaymentIntentStorageKeys.belongsToAccount(key, customerAccountId: "acct-demo")
+          && !PaymentIntentStorageKeys.belongsToAccount(key, customerAccountId: "acct")
+          && !PaymentIntentStorageKeys.belongsToAccount(key, customerAccountId: "other-acct")
+      )
+    } catch {
+      expect("key prefix isolates the account", false, String(describing: error))
+    }
+
+    print("35. invalid customer account is rejected...")
+    let (_, invalidLedger, _) = sampleLedger()
+    do {
+      _ = try invalidLedger.begin(customerAccountId: "bad account", recipientId: "northline-studio", amountMinor: 100, method: .card, note: "", scenario: .success)
+      expect("invalid account rejected", false)
+    } catch PaymentIntentError.invalidAccount {
+      expect("invalid account rejected", true)
+    } catch {
+      expect("invalid account rejected", false, String(describing: error))
+    }
+
+    print("36. keychain round trip is account scoped...")
+    do {
+      let store = KeychainPaymentIntentStore()
+      let first = sampleSnapshot(account: "cust-keychain-a", intentId: "pi_keychain_a", note: "alpha")
+      let second = sampleSnapshot(account: "cust-keychain-b", intentId: "pi_keychain_b", note: "beta")
+      try store.delete(customerAccountId: "cust-keychain-a", paymentIntentId: "pi_keychain_a")
+      try store.delete(customerAccountId: "cust-keychain-b", paymentIntentId: "pi_keychain_b")
+      try store.save(first)
+      try store.save(second)
+      try store.rememberCustomerAccountId("cust-keychain-a")
+      let reopened = KeychainPaymentIntentStore()
+      let loaded = try reopened.load(customerAccountId: "cust-keychain-a")
+      let other = try reopened.load(customerAccountId: "cust-keychain-b")
+      try reopened.delete(customerAccountId: "cust-keychain-a", paymentIntentId: "pi_keychain_a")
+      let afterDelete = try reopened.load(customerAccountId: "cust-keychain-a")
+      let otherAfter = try reopened.load(customerAccountId: "cust-keychain-b")
+      try reopened.delete(customerAccountId: "cust-keychain-b", paymentIntentId: "pi_keychain_b")
+      expect(
+        "keychain keeps each account separate across a new store",
+        loaded == [first] && other == [second] && afterDelete.isEmpty && otherAfter == [second]
+          && (try reopened.lastCustomerAccountId()) == "cust-keychain-a"
+      )
+    } catch {
+      expect("keychain keeps each account separate across a new store", false, String(describing: error))
+    }
+
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)
     }
   }
 }
+
+private final class ClockBox {
+  var now: Int64
+  init(_ now: Int64) { self.now = now }
+}
+
+private func sampleSnapshot(account: String, intentId: String, note: String) -> PaymentIntentSnapshot {
+  PaymentIntentSnapshot(
+    paymentIntentId: intentId,
+    idempotencyKey: "idem-\(intentId)",
+    businessPayloadHash: "abc123",
+    status: .pending,
+    returnStateHash: PaymentIntentHash.returnStateHash("return-\(intentId)"),
+    customerAccountId: account,
+    recipientId: "northline-studio",
+    amountMinor: 2599,
+    method: .card,
+    note: note,
+    scenario: .success,
+    createdAtEpochMillis: 10,
+    updatedAtEpochMillis: 20
+  )
+}
+
