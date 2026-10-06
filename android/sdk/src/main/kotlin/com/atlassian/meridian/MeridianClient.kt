@@ -29,14 +29,16 @@ class MeridianClient(
 
   // MARK: - Internal Request Method
 
-  private suspend fun <T> request(
+  private data class RawResponse(val statusCode: Int, val body: String)
+
+  private suspend fun rawResponse(
     method: String,
     path: String,
     body: Any? = null,
     additionalHeaders: Map<String, String> = emptyMap(),
-    responseType: Class<T>,
-  ): T = withContext(Dispatchers.IO) {
-    val fullUrl = "$baseUrlNormalized$path"
+    absoluteUrl: String? = null,
+  ): RawResponse = withContext(Dispatchers.IO) {
+    val fullUrl = absoluteUrl ?: "$baseUrlNormalized$path"
     val url = URL(fullUrl)
 
     val connection = url.openConnection() as HttpURLConnection
@@ -62,48 +64,61 @@ class MeridianClient(
         }
       }
 
-      // Read response
       val statusCode = connection.responseCode
       val responseStream = if (statusCode >= 400) {
         connection.errorStream
       } else {
         connection.inputStream
       }
-
       val responseBody = responseStream?.bufferedReader()?.use { it.readText() } ?: ""
+      RawResponse(statusCode, responseBody)
+    } finally {
+      connection.disconnect()
+    }
+  }
 
-      // Check HTTP status and handle errors
-      when {
-        statusCode >= 200 && statusCode < 300 -> {
-          // Success
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
-          }
+  private suspend fun <T> request(
+    method: String,
+    path: String,
+    body: Any? = null,
+    additionalHeaders: Map<String, String> = emptyMap(),
+    responseType: Class<T>,
+    absoluteUrl: String? = null,
+    parseApplicationStatuses: Boolean = true,
+  ): T {
+    val raw = rawResponse(method, path, body, additionalHeaders, absoluteUrl)
+    val statusCode = raw.statusCode
+    val responseBody = raw.body
+    val applicationStatus = parseApplicationStatuses &&
+      (statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503)
+
+    // Check HTTP status and handle errors
+    when {
+      statusCode >= 200 && statusCode < 300 -> {
+        try {
+          return mapper.readValue(responseBody, responseType)
+        } catch (e: Exception) {
+          throw MeridianError.DecodingError("Failed to parse response: ${e.message}", e)
         }
+      }
 
-        statusCode == 202 || statusCode == 400 || statusCode == 409 || statusCode == 422 || statusCode == 503 -> {
-          // These are expected error statuses, parse the response
-          try {
-            mapper.readValue(responseBody, responseType)
-          } catch (e: Exception) {
-            throw MeridianError.HttpError(
-              statusCode,
-              responseBody.ifEmpty { "Unknown error" }
-            )
-          }
-        }
-
-        else -> {
+      applicationStatus -> {
+        try {
+          return mapper.readValue(responseBody, responseType)
+        } catch (e: Exception) {
           throw MeridianError.HttpError(
             statusCode,
             responseBody.ifEmpty { "Unknown error" }
           )
         }
       }
-    } finally {
-      connection.disconnect()
+
+      else -> {
+        throw MeridianError.HttpError(
+          statusCode,
+          responseBody.ifEmpty { "Unknown error" }
+        )
+      }
     }
   }
 
@@ -120,6 +135,37 @@ class MeridianClient(
    */
   suspend fun getCatalog(): CatalogResponse =
     request("GET", "/catalog", responseType = CatalogResponse::class.java)
+
+  /**
+   * Absolute URL for GET /api/v2/payment-methods.
+   * The rehearsal client base remains /api/v1; this sibling path does not replace it.
+   */
+  fun paymentMethodsUrl(accountScope: String, corridor: String, currency: String = "GBP"): String =
+    buildPaymentMethodsUrl(baseUrlNormalized, accountScope, corridor, currency)
+
+  /**
+   * GET /api/v2/payment-methods. Keeps the user-selected rehearsal session.
+   * A non-success HTTP status is an error. This call does not choose a payment provider.
+   */
+  suspend fun fetchPaymentMethods(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP",
+  ): PaymentMethodsCatalog {
+    val url = paymentMethodsUrl(accountScope, corridor, currency)
+    val raw = rawResponse(method = "GET", path = "", absoluteUrl = url)
+    if (raw.statusCode < 200 || raw.statusCode >= 300) {
+      throw MeridianError.HttpError(raw.statusCode, raw.body.ifEmpty { "Unknown error" })
+    }
+    val catalog = try {
+      parsePaymentMethodsCatalog(raw.body)
+    } catch (error: MeridianError) {
+      throw error
+    } catch (error: Exception) {
+      throw MeridianError.DecodingError("Failed to parse payment method catalog: ${error.message}", error)
+    }
+    return catalog.forRequest(accountScope, corridor, currency)
+  }
 
   /**
    * GET /state - Fetch current bank state

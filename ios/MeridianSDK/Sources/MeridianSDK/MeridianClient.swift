@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -98,6 +101,46 @@ public actor MeridianClient {
   /// GET /catalog - Fetch recipients and providers
   public func getCatalog() async throws -> CatalogResponse {
     return try await request(method: "GET", path: "/catalog")
+  }
+
+  /// Absolute URL for GET /api/v2/payment-methods. The rehearsal base stays /api/v1.
+  public func paymentMethodsURL(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP"
+  ) throws -> URL {
+    try buildPaymentMethodsURL(
+      baseURL: baseURL.absoluteString,
+      accountScope: accountScope,
+      corridor: corridor,
+      currency: currency
+    )
+  }
+
+  /// GET /api/v2/payment-methods. Keeps the user-selected rehearsal session.
+  /// Non-success HTTP statuses fail. This call does not select a payment provider.
+  public func fetchPaymentMethods(
+    accountScope: String,
+    corridor: String,
+    currency: String = "GBP"
+  ) async throws -> PaymentMethodsCatalog {
+    let url = try paymentMethodsURL(accountScope: accountScope, corridor: corridor, currency: currency)
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 15
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(sessionId, forHTTPHeaderField: "X-Rehearsal-Session")
+
+    let (data, response) = try await session.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw MeridianError.networkError("Invalid response type")
+    }
+    guard (200...299).contains(httpResponse.statusCode) else {
+      let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw MeridianError.httpError(statusCode: httpResponse.statusCode, message: errorMsg)
+    }
+    let catalog = try parsePaymentMethodsCatalog(data: data)
+    return try catalog.forRequest(accountScope: accountScope, corridor: corridor, currency: currency)
   }
 
   /// GET /state - Fetch current bank state
