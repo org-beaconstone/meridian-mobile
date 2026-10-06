@@ -1,0 +1,167 @@
+{
+  "contractVersion": 1,
+  "consumer": "meridian-mobile",
+  "provider": "meridian-api",
+  "description": "Consumer contract for catalog and payment intent schemas. Legacy amounts are integer GBP pence. Multi-currency amounts are objects. GBP submissions stay on the integer amountMinor wire field.",
+  "cases": [
+    {
+      "id": "money-legacy-integer",
+      "type": "money",
+      "value": 2599,
+      "expect": { "ok": true, "currency": "GBP", "minor": 2599, "exponent": 2, "display": "£25.99", "gbpPence": 2599 }
+    },
+    {
+      "id": "money-legacy-zero",
+      "type": "money",
+      "value": 0,
+      "expect": { "ok": false, "code": "INVALID_AMOUNT" }
+    },
+    {
+      "id": "money-decimal-string",
+      "type": "money",
+      "value": "25.99",
+      "expect": { "ok": false, "code": "MALFORMED_AMOUNT" }
+    },
+    {
+      "id": "money-eur-object",
+      "type": "money",
+      "value": { "currency": "EUR", "minor": 2599, "exponent": 2, "corridor": "EU" },
+      "expect": { "ok": true, "currency": "EUR", "minor": 2599, "exponent": 2, "display": "€25.99", "gbpPence": null }
+    },
+    {
+      "id": "money-gbp-object",
+      "type": "money",
+      "value": { "currency": "GBP", "minor": 1050, "exponent": 2 },
+      "expect": { "ok": true, "currency": "GBP", "minor": 1050, "exponent": 2, "display": "£10.50", "gbpPence": 1050 }
+    },
+    {
+      "id": "money-gbp-over-cap",
+      "type": "money",
+      "value": { "currency": "GBP", "minor": 1000001, "exponent": 2 },
+      "expect": { "ok": false, "code": "INVALID_AMOUNT" }
+    },
+    {
+      "id": "money-lowercase-currency",
+      "type": "money",
+      "value": { "currency": "gbp", "minor": 100, "exponent": 2 },
+      "expect": { "ok": false, "code": "MALFORMED_AMOUNT" }
+    },
+    {
+      "id": "catalog-legacy-live",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B" },
+          { "id": "octavia-energy", "name": "Octavia Energy", "initials": "OE", "detail": "Electricity & gas supplier", "category": "Bills", "color": "#4ECDC4" },
+          { "id": "maya-chen", "name": "Maya Chen", "initials": "MC", "detail": "Yoga & wellness classes", "category": "Lifestyle", "color": "#95E1D3" },
+          { "id": "birch-bloom", "name": "Birch & Bloom", "initials": "BB", "detail": "Organic café & bistro", "category": "Food & drink", "color": "#FFD93D" },
+          { "id": "london-transit", "name": "London Transit", "initials": "LT", "detail": "Public transport & taxis", "category": "Transport", "color": "#6BCB77" }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "demoDate": "2026-09-18",
+        "recipientCount": 5,
+        "providerIds": ["adyen", "worldpay"],
+        "prices": [
+          { "id": "northline-studio", "absent": true },
+          { "id": "birch-bloom", "absent": true }
+        ]
+      }
+    },
+    {
+      "id": "catalog-legacy-integer-price",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B", "price": 2599 }
+        ],
+        "providers": [
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] },
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] }
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "recipientCount": 1,
+        "providerIds": ["adyen", "worldpay"],
+        "prices": [
+          { "id": "northline-studio", "currency": "GBP", "minor": 2599, "exponent": 2, "display": "£25.99", "gbpPence": 2599 }
+        ]
+      }
+    },
+    {
+      "id": "catalog-multi-currency",
+      "type": "catalog",
+      "payload": {
+        "demoDate": "2026-09-18",
+        "currencyMode": "multi",
+        "recipients": [
+          { "id": "northline-studio", "name": "Northline Studio", "initials": "NS", "detail": "Design tools & materials", "category": "Shopping", "color": "#FF6B6B", "corridor": "EU", "price": { "currency": "EUR", "minor": 2599, "exponent": 2 } },
+          { "id": "octavia-energy", "name": "Octavia Energy", "initials": "OE", "detail": "Electricity & gas supplier", "category": "Bills", "color": "#4ECDC4", "price": { "currency": "GBP", "minor": 80000, "exponent": 2 } }
+        ],
+        "providers": [
+          { "id": "worldpay", "name": "Worldpay", "description": "Bank transfer processor", "methods": ["bank"] },
+          { "id": "adyen", "name": "Adyen", "description": "Card payment processor", "methods": ["card"] }
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "recipientCount": 2,
+        "providerIds": ["worldpay", "adyen"],
+        "prices": [
+          { "id": "northline-studio", "currency": "EUR", "minor": 2599, "exponent": 2, "display": "€25.99", "gbpPence": null },
+          { "id": "octavia-energy", "currency": "GBP", "minor": 80000, "exponent": 2, "display": "£800.00", "gbpPence": 80000 }
+        ]
+      }
+    },
+    {
+      "id": "intent-legacy-integer",
+      "type": "payment-intent",
+      "payload": { "recipientId": "northline-studio", "amountMinor": 2599, "method": "card", "note": "Design tools", "scenario": "success" },
+      "expect": { "ok": true, "currency": "GBP", "minor": 2599, "exponent": 2, "display": "£25.99", "gbpPence": 2599, "method": "card", "note": "Design tools", "scenario": "success", "submittable": true, "wireAmountMinor": 2599 }
+    },
+    {
+      "id": "intent-multi-gbp",
+      "type": "payment-intent",
+      "payload": { "recipientId": "northline-studio", "money": { "currency": "GBP", "minor": 1000, "exponent": 2 }, "method": "bank", "note": "Rent", "scenario": "pending" },
+      "expect": { "ok": true, "currency": "GBP", "minor": 1000, "exponent": 2, "display": "£10.00", "gbpPence": 1000, "method": "bank", "note": "Rent", "scenario": "pending", "submittable": true, "wireAmountMinor": 1000 }
+    },
+    {
+      "id": "intent-multi-eur",
+      "type": "payment-intent",
+      "payload": { "recipientId": "northline-studio", "money": { "currency": "EUR", "minor": 2599, "exponent": 2 }, "method": "card", "note": "EU sample", "scenario": "success" },
+      "expect": { "ok": true, "currency": "EUR", "minor": 2599, "exponent": 2, "display": "€25.99", "gbpPence": null, "method": "card", "note": "EU sample", "scenario": "success", "submittable": false, "wireAmountMinor": null }
+    },
+    {
+      "id": "intent-both-fields-match",
+      "type": "payment-intent",
+      "payload": { "recipientId": "birch-bloom", "amountMinor": 3500, "money": { "currency": "GBP", "minor": 3500, "exponent": 2 }, "method": "bank", "scenario": "declined", "futureFlag": true },
+      "expect": { "ok": true, "currency": "GBP", "minor": 3500, "exponent": 2, "gbpPence": 3500, "method": "bank", "note": "", "scenario": "declined", "submittable": true, "wireAmountMinor": 3500 }
+    },
+    {
+      "id": "intent-conflicting-amount",
+      "type": "payment-intent",
+      "payload": { "recipientId": "northline-studio", "amountMinor": 2599, "money": { "currency": "GBP", "minor": 100, "exponent": 2 }, "method": "card", "note": "Design tools", "scenario": "success" },
+      "expect": { "ok": false, "code": "CONFLICTING_AMOUNT" }
+    },
+    {
+      "id": "intent-missing-amount",
+      "type": "payment-intent",
+      "payload": { "recipientId": "northline-studio", "method": "card", "note": "Design tools", "scenario": "success" },
+      "expect": { "ok": false, "code": "MISSING_AMOUNT" }
+    },
+    {
+      "id": "intent-defaults",
+      "type": "payment-intent",
+      "payload": { "recipientId": "london-transit", "amountMinor": 6000, "method": "card" },
+      "expect": { "ok": true, "currency": "GBP", "minor": 6000, "exponent": 2, "method": "card", "note": "", "scenario": "success", "submittable": true, "wireAmountMinor": 6000 }
+    }
+  ]
+}
