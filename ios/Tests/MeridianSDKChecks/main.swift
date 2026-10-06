@@ -157,8 +157,8 @@ struct MeridianSDKChecks {
         BankState.self,
         from: bankStateJson.data(using: .utf8)!
       )
-      if state.version == 1 && state.balance == 1_248_050 {
-        print("  ✓ BankState decoded: v=\(state.version), balance=\(state.balance)")
+      if state.version == 1 && state.balance == Money.gbpPence(1_248_050) {
+        print("  ✓ BankState decoded: v=\(state.version), balance=\(state.balance.minorUnits) \(state.balance.currencyCode)")
         passed += 1
       } else {
         print("  ✗ Fields mismatch")
@@ -341,10 +341,151 @@ struct MeridianSDKChecks {
       failed += 1
     }
 
+    // CHECK 21: legacy integer decodes as GBP pence
+    print("21. legacy integer money...")
+    do {
+      let money = try JSONDecoder().decode(Money.self, from: Data("3500".utf8))
+      if money == Money.gbpPence(3500) && money.minorUnitExponent == 2 && money.currencyCode == "GBP" {
+        print("  ✓ legacy 3500 is GBP 3500 exponent 2")
+        passed += 1
+      } else {
+        print("  ✗ unexpected legacy money \(money)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 22: ISO-4217 object and legacy amount field
+    print("22. multi-currency JSON...")
+    do {
+      let eur = try JSONDecoder().decode(
+        Money.self,
+        from: Data(#"{"currencyCode":"EUR","minorUnits":1999,"minorUnitExponent":2}"#.utf8)
+      )
+      let fromAmount = try JSONDecoder().decode(
+        Money.self,
+        from: Data(#"{"amount":1999,"currencyCode":"EUR"}"#.utf8)
+      )
+      let encoded = try JSONEncoder().encode(eur)
+      let roundTrip = try JSONDecoder().decode(Money.self, from: encoded)
+      if eur == fromAmount && roundTrip == eur && eur.minorUnits == 1999 {
+        print("  ✓ EUR object, legacy amount field, and round trip")
+        passed += 1
+      } else {
+        print("  ✗ multi-currency decode mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 23: conversion precision beyond binary floating point
+    print("23. conversion precision...")
+    do {
+      let small = try Money.parseMajor("0.10", currencyCode: "GBP")
+      let classic = try Money.parseMajor("0.29", currencyCode: "EUR")
+      let price = try Money.parseMajor("19.99", currencyCode: "EUR")
+      let wide = try Money.parseMajor("90071992547409.91", currencyCode: "GBP")
+      let padded = try Money.parseMajor("10.5", currencyCode: "GBP")
+      let sum = try price.adding(try Money.parseMajor("0.01", currencyCode: "EUR"))
+      if small.minorUnits == 10
+        && classic.minorUnits == 29
+        && price.minorUnits == 1999
+        && price.majorDecimal() == "19.99"
+        && wide.minorUnits == 9_007_199_254_740_991
+        && wide.majorDecimal() == "90071992547409.91"
+        && padded.minorUnits == 1050
+        && sum.minorUnits == 2000
+      {
+        print("  ✓ minor units stay exact")
+        passed += 1
+      } else {
+        print("  ✗ precision mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 24: overflow protection
+    print("24. overflow protection...")
+    do {
+      var overflowed = false
+      do {
+        _ = try Money.parseMajor("92233720368547758.08", currencyCode: "GBP")
+      } catch MoneyError.overflow {
+        overflowed = true
+      }
+      let atLimit = try Money.parseMajor("92233720368547758.07", currencyCode: "GBP")
+      var addOverflow = false
+      do { _ = try atLimit.adding(Money.gbpPence(1)) } catch MoneyError.overflow { addOverflow = true }
+      var mismatch = false
+      do { _ = try Money.gbpPence(1).adding(try Money(currencyCode: "EUR", minorUnits: 1, minorUnitExponent: 2)) } catch MoneyError.currencyMismatch { mismatch = true }
+      var badExponent = false
+      do { _ = try Money(currencyCode: "EUR", minorUnits: 1, minorUnitExponent: 0) } catch MoneyError.exponentMismatch { badExponent = true }
+      var notGbp = false
+      do { _ = try Money(currencyCode: "EUR", minorUnits: 100, minorUnitExponent: 2).requireLegacyGbpPence() } catch MoneyError.notLegacyGbp { notGbp = true }
+      if overflowed && atLimit.minorUnits == Int64.max && addOverflow && mismatch && badExponent && notGbp {
+        print("  ✓ overflow, exponent, and legacy GBP guards")
+        passed += 1
+      } else {
+        print("  ✗ guard mismatch")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 25: EUR and GBP locale formatting
+    print("25. EUR and GBP formatting...")
+    do {
+      let pounds = Money.gbpPence(1_248_050)
+      let euros = try Money(currencyCode: "EUR", minorUnits: 1_248_050, minorUnitExponent: 2)
+      let en = Locale(identifier: "en_GB")
+      let de = Locale(identifier: "de_DE")
+      let gbpEn = pounds.formatted(locale: en)
+      let eurEn = euros.formatted(locale: en)
+      let eurDe = euros.formatted(locale: de)
+      let gbpDe = pounds.formatted(locale: de)
+      let penny = Money.gbpPence(1).formatted(locale: en)
+      if gbpEn == "£12,480.50"
+        && eurEn == "€12,480.50"
+        && eurDe == "12.480,50\u{00A0}€"
+        && gbpDe == "12.480,50\u{00A0}£"
+        && penny == "£0.01"
+      {
+        print("  ✓ locale formats")
+        passed += 1
+      } else {
+        print("  ✗ gbpEn=\(gbpEn) eurEn=\(eurEn) eurDe=\(eurDe) gbpDe=\(gbpDe) penny=\(penny)")
+        failed += 1
+      }
+    } catch {
+      print("  ✗ \(error)")
+      failed += 1
+    }
+
+    // CHECK 26: non-integral JSON is rejected
+    print("26. non-integral JSON...")
+    do {
+      _ = try JSONDecoder().decode(Money.self, from: Data("10.5".utf8))
+      print("  ✗ accepted a fractional minor-unit value")
+      failed += 1
+    } catch {
+      print("  ✓ fractional JSON rejected")
+      passed += 1
+    }
+
     // Summary
+    let total = passed + failed
     print("\n=== Results ===")
-    print("Passed: \(passed)/20")
-    print("Failed: \(failed)/20")
+    print("Passed: \(passed)/\(total)")
+    print("Failed: \(failed)/\(total)")
 
     if failed > 0 {
       exit(1)

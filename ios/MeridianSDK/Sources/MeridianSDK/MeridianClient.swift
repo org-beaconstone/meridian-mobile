@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public actor MeridianClient {
   private let baseURL: URL
@@ -134,6 +137,25 @@ public actor MeridianClient {
       path: "/payments",
       body: payload,
       additionalHeaders: ["Idempotency-Key": idempotencyKey]
+    )
+  }
+
+  /// POST /payments using a Money value. Only GBP exponent 2 is sent, as integer pence.
+  public func submitPayment(
+    recipientId: String,
+    amount: Money,
+    method: PaymentMethod,
+    note: String = "",
+    scenario: Scenario = .success,
+    idempotencyKey: String
+  ) async throws -> PaymentResponse {
+    try await submitPayment(
+      recipientId: recipientId,
+      amountMinor: amount.requireLegacyGbpPence(),
+      method: method,
+      note: note,
+      scenario: scenario,
+      idempotencyKey: idempotencyKey
     )
   }
 

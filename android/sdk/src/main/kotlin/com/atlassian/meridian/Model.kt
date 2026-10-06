@@ -52,7 +52,7 @@ data class Transaction(
   val recipientId: String,
   val name: String,
   val category: String,
-  val amount: Int, // integer GBP pence, positive (outgoing)
+  val amount: Money, // legacy JSON integers decode as GBP pence
   val date: String, // ISO 8601
   val provider: String,
   val method: String,
@@ -62,12 +62,12 @@ data class Transaction(
 
 data class Budget(
   val category: String,
-  val limit: Int, // integer GBP pence
+  val limit: Money, // legacy JSON integers decode as GBP pence
 ) : Serializable
 
 data class BankState(
   val version: Int,
-  val balance: Int, // integer GBP pence
+  val balance: Money, // legacy JSON integers decode as GBP pence
   val transactions: List<Transaction>,
   val budgets: List<Budget>,
 ) : Serializable
@@ -155,8 +155,8 @@ sealed class MeridianError(message: String?, cause: Throwable? = null) : Excepti
 // MARK: - Amount Formatting
 
 fun money(pence: Int): String {
-  val pounds = pence / 100.0
-  return "£%.2f".format(pounds)
+  val body = Money.gbpPence(pence).majorDecimal().removePrefix("-")
+  return if (pence < 0) "-£$body" else "£$body"
 }
 
 /**

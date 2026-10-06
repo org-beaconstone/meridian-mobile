@@ -66,7 +66,7 @@ public struct Transaction: Codable, Hashable {
   public let recipientId: String
   public let name: String
   public let category: Category
-  public let amount: Int // integer GBP pence, positive (outgoing)
+  public let amount: Money // legacy JSON integers decode as GBP pence
   public let date: String // ISO 8601
   public let provider: ProviderId
   public let method: PaymentMethod
@@ -79,7 +79,7 @@ public struct Transaction: Codable, Hashable {
     recipientId: String,
     name: String,
     category: Category,
-    amount: Int,
+    amount: Money,
     date: String,
     provider: ProviderId,
     method: PaymentMethod,
@@ -102,9 +102,9 @@ public struct Transaction: Codable, Hashable {
 
 public struct Budget: Codable, Hashable {
   public let category: Category
-  public let limit: Int // integer GBP pence
+  public let limit: Money // legacy JSON integers decode as GBP pence
 
-  public init(category: Category, limit: Int) {
+  public init(category: Category, limit: Money) {
     self.category = category
     self.limit = limit
   }
@@ -112,13 +112,13 @@ public struct Budget: Codable, Hashable {
 
 public struct BankState: Codable, Hashable {
   public let version: Int
-  public let balance: Int // integer GBP pence
+  public let balance: Money // legacy JSON integers decode as GBP pence
   public let transactions: [Transaction]
   public let budgets: [Budget]
 
   public init(
     version: Int,
-    balance: Int,
+    balance: Money,
     transactions: [Transaction],
     budgets: [Budget]
   ) {
@@ -270,11 +270,8 @@ public enum MeridianError: LocalizedError {
 // MARK: - Amount Formatting
 
 public func money(_ pence: Int) -> String {
-  let pounds = Double(pence) / 100.0
-  let formatter = NumberFormatter()
-  formatter.numberStyle = .currency
-  formatter.locale = Locale(identifier: "en_GB")
-  return formatter.string(from: NSNumber(value: pounds)) ?? "£\(String(format: "%.2f", pounds))"
+  let body = Money.gbpPence(pence).majorDecimal().replacingOccurrences(of: "-", with: "")
+  return pence < 0 ? "-£\(body)" : "£\(body)"
 }
 
 /// Parse amount string to integer pence

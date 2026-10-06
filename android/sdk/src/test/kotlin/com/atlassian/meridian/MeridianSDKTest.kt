@@ -1,13 +1,11 @@
 package com.atlassian.meridian
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
 
 class MeridianSDKTest {
-  private val mapper = ObjectMapper().registerKotlinModule()
+  private val mapper = newMeridianMapper()
 
   // MARK: - Amount Parsing Tests
 
@@ -133,12 +131,12 @@ class MeridianSDKTest {
     val state = mapper.readValue(json, BankState::class.java)
 
     assertEquals(1, state.version)
-    assertEquals(1_248_050, state.balance)
+    assertEquals(Money.gbpPence(1_248_050), state.balance)
     assertEquals(1, state.transactions.size)
     assertEquals("txn-001", state.transactions[0].id)
-    assertEquals(3500, state.transactions[0].amount)
+    assertEquals(Money.gbpPence(3500), state.transactions[0].amount)
     assertEquals(1, state.budgets.size)
-    assertEquals(100_000, state.budgets[0].limit)
+    assertEquals(Money.gbpPence(100_000), state.budgets[0].limit)
   }
 
   @Test
@@ -173,7 +171,7 @@ class MeridianSDKTest {
     assertTrue(response.ok)
     assertNotNull(response.state)
     assertNotNull(response.transaction)
-    assertEquals(5000, response.transaction?.amount)
+    assertEquals(Money.gbpPence(5000), response.transaction?.amount)
   }
 
   @Test
